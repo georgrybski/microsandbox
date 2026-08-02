@@ -27,6 +27,8 @@ fn build_agentd(workspace_root: &Path, out_dir: &Path) {
 
     #[cfg(feature = "prebuilt")]
     {
+        println!("cargo:rerun-if-env-changed=MSB_AGENTD_PATH");
+
         let dest = out_dir.join(AGENTD_BINARY);
 
         // Local development recipes rebuild build/agentd before compiling msb.
@@ -34,6 +36,11 @@ fn build_agentd(workspace_root: &Path, out_dir: &Path) {
         // cannot silently lag behind the freshly built guest agent.
         if local.is_file() {
             copy_agentd(&local, &dest);
+            return;
+        }
+
+        // A caller-supplied agentd stages the binary instead of using the cache or downloading.
+        if apply_msb_agentd_path(out_dir) {
             return;
         }
 
@@ -79,7 +86,31 @@ fn build_agentd(workspace_root: &Path, out_dir: &Path) {
     }
 }
 
+#[cfg(feature = "prebuilt")]
+fn apply_msb_agentd_path(out_dir: &Path) -> bool {
+    let Some(staged) = std::env::var_os("MSB_AGENTD_PATH").map(PathBuf::from) else {
+        return false;
+    };
+    if !staged.is_file() {
+        panic!(
+            "MSB_AGENTD_PATH does not point to an agentd file: {}",
+            staged.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", staged.display());
+    copy_agentd(&staged, &out_dir.join(AGENTD_BINARY));
+    true
+}
+
 fn copy_agentd(local: &Path, dest: &Path) {
+    // Remove any previous copy first: fs::copy preserves a read-only source
+    // mode, which would make the next overwrite fail with EACCES.
+    match std::fs::remove_file(dest) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("failed to replace {}: {e}", dest.display()),
+    }
     std::fs::copy(local, dest).expect("failed to copy agentd to OUT_DIR");
 }
 
