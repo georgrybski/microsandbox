@@ -251,7 +251,6 @@ pub(crate) fn do_write(
     let written = r.read_to(&f, size as usize, offset)?;
 
     #[cfg(target_os = "linux")]
-    #[cfg(target_os = "linux")]
     if written > 0 && write_masked {
         fs.tag_inode(inode);
     }
