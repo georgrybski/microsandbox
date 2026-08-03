@@ -261,6 +261,9 @@ impl MountPolicyProgram {
                 continue;
             }
             let frozen_out = frozen_by.is_some();
+            // rule_index reflects the rule's position within its original
+            // allow/deny bucket (pre-authority-sort), not its post-sort order;
+            // it identifies the rule for explanation, not the evaluation order.
             let rule_index = self.protect.len()
                 + if bucket == WriteRuleEffect::Deny {
                     self.writes.allow.len() + index
