@@ -108,10 +108,10 @@ pub(crate) fn do_open(
 
     #[cfg(target_os = "linux")]
     if masked_policy_path {
-        let Some(_path) = inode::lexical_inode_path(fs, inode) else {
+        if inode::lexical_inode_path(fs, inode).is_none() {
             unsafe { libc::close(fd) };
             return Err(platform::enoent());
-        };
+        }
         let stored = fs.tags().and_then(|tags| {
             inode::current_anchor_alias_for_policy(fs, inode)
                 .and_then(|alias| tags.get_identity(alias.parent, &alias.name))
