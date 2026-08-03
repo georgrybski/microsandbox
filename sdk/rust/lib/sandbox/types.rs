@@ -68,6 +68,7 @@ pub struct MountBuilder {
     stat_virtualization: Option<StatVirtualization>,
     host_permissions: Option<HostPermissions>,
     follow_root_symlinks: bool,
+    mount_policy: Option<PathBuf>,
     error: Option<crate::MicrosandboxError>,
 }
 
@@ -214,6 +215,7 @@ impl MountBuilder {
             stat_virtualization: None,
             host_permissions: None,
             follow_root_symlinks: false,
+            mount_policy: None,
             error: None,
         }
     }
@@ -304,6 +306,12 @@ impl MountBuilder {
     /// server rejects writes) and guest (kernel returns `EROFS`).
     pub fn readonly(mut self) -> Self {
         self.options.readonly = true;
+        self
+    }
+
+    /// Set the compiled mount path-policy program JSON path (spec 22 §12).
+    pub fn mount_policy(mut self, path: impl Into<PathBuf>) -> Self {
+        self.mount_policy = Some(path.into());
         self
     }
 
@@ -511,6 +519,7 @@ impl MountBuilder {
                     host_permissions,
                     follow_root_symlinks: self.follow_root_symlinks,
                     quota_mib: self.quota_mib,
+                    mount_policy: self.mount_policy,
                 }
             }
             MountKind::Named { name, create } => {

@@ -326,6 +326,9 @@ pub enum VolumeMount {
         /// contents. `None` applies the protective default at spawn time; set a
         /// value to override it.
         quota_mib: Option<u32>,
+        /// Optional path to a compiled mount path-policy program JSON file (spec 22 §12), confined
+        /// to the approved host state directory at load time. `None` means no masking.
+        mount_policy: Option<PathBuf>,
     },
 
     /// Mount a named volume into the guest.
@@ -1281,8 +1284,9 @@ impl Serialize for VolumeMount {
                 host_permissions,
                 follow_root_symlinks,
                 quota_mib,
+                mount_policy,
             } => {
-                let mut map = serializer.serialize_map(Some(8))?;
+                let mut map = serializer.serialize_map(Some(9))?;
                 map.serialize_entry("type", "Bind")?;
                 map.serialize_entry("host", host)?;
                 map.serialize_entry("guest", guest)?;
@@ -1291,6 +1295,7 @@ impl Serialize for VolumeMount {
                 map.serialize_entry("host_permissions", host_permissions)?;
                 map.serialize_entry("follow_root_symlinks", follow_root_symlinks)?;
                 map.serialize_entry("quota_mib", quota_mib)?;
+                map.serialize_entry("mount_policy", mount_policy)?;
                 map.end()
             }
             Self::Named {
@@ -1372,6 +1377,8 @@ impl<'de> Deserialize<'de> for VolumeMount {
                 follow_root_symlinks: bool,
                 #[serde(default)]
                 quota_mib: Option<u32>,
+                #[serde(default)]
+                mount_policy: Option<PathBuf>,
             },
             Named {
                 name: String,
@@ -1420,6 +1427,7 @@ impl<'de> Deserialize<'de> for VolumeMount {
                 host_permissions,
                 follow_root_symlinks,
                 quota_mib,
+                mount_policy,
             } => Self::Bind {
                 host,
                 guest,
@@ -1428,6 +1436,7 @@ impl<'de> Deserialize<'de> for VolumeMount {
                 host_permissions,
                 follow_root_symlinks,
                 quota_mib,
+                mount_policy,
             },
             VolumeMountHelper::Named {
                 name,
@@ -1485,6 +1494,7 @@ impl fmt::Debug for VolumeMount {
                 host_permissions,
                 follow_root_symlinks,
                 quota_mib,
+                mount_policy,
             } => f
                 .debug_struct("Bind")
                 .field("host", host)
@@ -1494,6 +1504,7 @@ impl fmt::Debug for VolumeMount {
                 .field("host_permissions", host_permissions)
                 .field("follow_root_symlinks", follow_root_symlinks)
                 .field("quota_mib", quota_mib)
+                .field("mount_policy", mount_policy)
                 .finish(),
             Self::Named {
                 name,
@@ -2445,5 +2456,28 @@ mod tests {
             assert_eq!(parsed, expected);
             assert_eq!(parsed.as_str(), input);
         }
+    }
+
+    #[test]
+    fn bind_mount_policy_is_optional_for_old_json() {
+        let mount: VolumeMount = serde_json::from_str(
+            r#"{"type":"Bind","host":"/host","guest":"/data","options":null}"#,
+        )
+        .unwrap();
+        match mount {
+            VolumeMount::Bind { mount_policy, .. } => assert_eq!(mount_policy, None),
+            _ => panic!("expected bind mount"),
+        }
+    }
+
+    #[test]
+    fn bind_mount_policy_roundtrips_and_is_debuggable() {
+        let mount: VolumeMount = serde_json::from_str(
+            r#"{"type":"Bind","host":"/host","guest":"/data","mount_policy":"/some/path.json"}"#,
+        )
+        .unwrap();
+        assert!(format!("{mount:?}").contains("mount_policy"));
+        let value = serde_json::to_value(&mount).unwrap();
+        assert_eq!(value["mount_policy"], "/some/path.json");
     }
 }

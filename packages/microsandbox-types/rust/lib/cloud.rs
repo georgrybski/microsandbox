@@ -626,6 +626,7 @@ impl From<CloudVolumeMount> for VolumeMount {
                 // the protective no-follow behavior.
                 follow_root_symlinks: false,
                 quota_mib,
+                mount_policy: None,
             },
             CloudVolumeMount::Named {
                 name,
@@ -679,6 +680,7 @@ impl From<VolumeMount> for CloudVolumeMount {
                 host_permissions,
                 follow_root_symlinks: _,
                 quota_mib,
+                mount_policy: _,
             } => CloudVolumeMount::Bind {
                 host,
                 guest,

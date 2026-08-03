@@ -1954,6 +1954,7 @@ fn push_dir_mount_arg(
     host_permissions: HostPermissions,
     follow_root_symlinks: bool,
     quota_mib: Option<u32>,
+    mount_policy: Option<&Path>,
 ) {
     let tag = guest_mount_tag(guest);
     let mut arg = format!("{tag}:{host_display}");
@@ -1966,6 +1967,9 @@ fn push_dir_mount_arg(
     );
     if let Some(mib) = quota_mib {
         opts.push(format!("quota={mib}"));
+    }
+    if let Some(path) = mount_policy {
+        opts.push(format!("policy={}", path.display()));
     }
     append_option_block(&mut arg, opts);
     mounts.push(arg);
@@ -1991,12 +1995,16 @@ fn push_file_mount_arg(
     options: MountOptions,
     stat_virtualization: StatVirtualization,
     host_permissions: HostPermissions,
+    mount_policy: Option<&Path>,
 ) {
     let mut arg = format!("{tag}:{}", file_mount_dir.display());
     let mut opts = mount_option_tokens(options);
     // The staging directory is canonicalized at creation, so it is symlink-free
     // and stays under the default no-follow root protection — no opt-out here.
     append_policy_options(&mut opts, stat_virtualization, host_permissions, false);
+    if let Some(path) = mount_policy {
+        opts.push(format!("policy={}", path.display()));
+    }
     append_option_block(&mut arg, opts);
     mounts.push(arg);
 }
@@ -2347,6 +2355,7 @@ fn sandbox_cli_args(
                 host_permissions,
                 follow_root_symlinks,
                 quota_mib,
+                mount_policy,
             } => {
                 if let Some((file_mount_dir, filename, tag)) = staged_file_mounts.get(guest) {
                     push_file_mount_arg(
@@ -2356,6 +2365,7 @@ fn sandbox_cli_args(
                         *options,
                         *stat_virtualization,
                         *host_permissions,
+                        mount_policy.as_deref(),
                     );
                     push_file_mounts_spec(&mut file_mounts_val, tag, filename, guest, *options);
                 } else {
@@ -2371,6 +2381,7 @@ fn sandbox_cli_args(
                         *host_permissions,
                         *follow_root_symlinks,
                         Some(quota),
+                        mount_policy.as_deref(),
                     );
                     push_dir_mounts_spec(&mut dir_mounts_val, guest, *options);
                 }
@@ -2426,6 +2437,7 @@ fn sandbox_cli_args(
                             *host_permissions,
                             *follow_root_symlinks,
                             *quota_mib,
+                            None,
                         );
                         push_dir_mounts_spec(&mut dir_mounts_val, guest, *options);
                     }
