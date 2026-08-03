@@ -198,6 +198,20 @@ fn json_round_trip_preserves_wire_and_decisions() {
     assert!(serde_json::from_value::<MountPolicyProgram>(unknown).is_err());
 }
 
+#[test]
+fn case_insensitive_pattern_matches_different_case() {
+    let json = r#"{
+        "version": 1,
+        "rules": [{"effect":"mask","pattern":"**/.ENV","overridable":true,"origin":{"layer":"test","file":"test.json","scope_kind":"workload"}}],
+        "protect": [],
+        "writes": {"allow": [], "deny": []},
+        "case_sensitivity": "insensitive"
+    }"#;
+    let policy: MountPolicyProgram = serde_json::from_str(json).unwrap();
+    assert_eq!(decide(&policy, ".env"), Decision::Masked);
+    assert_eq!(decide(&policy, "subdir/.env"), Decision::Masked);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn lookup_masks_policy_path_and_none_is_byte_identical_off() {

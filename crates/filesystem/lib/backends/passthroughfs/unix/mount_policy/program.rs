@@ -3,7 +3,7 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::fmt;
 
-use super::{LexicalPath, PathPolicyRule, RuleEffect, RuleOrigin};
+use super::{LexicalPath, PathPolicyRule, PatternError, RuleEffect, RuleOrigin};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -12,8 +12,9 @@ use super::{LexicalPath, PathPolicyRule, RuleEffect, RuleOrigin};
 /// Visibility decision for a path under a mount path policy.
 ///
 /// `Visible` paths are exposed to the guest; `Masked` paths are hidden and
-/// their alias tags are honored; `TraversalOnly` paths are hidden themselves
-/// but a descendant may be unmasked by a later rule.
+/// their alias tags are honored; `TraversalOnly` paths are shown in directory
+/// listings so guests can discover unmasked descendants, but their masked
+/// contents are still filtered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Decision {
@@ -116,6 +117,20 @@ struct MountPolicyProgramWire {
 //--------------------------------------------------------------------------------------------------
 
 impl MountPolicyProgram {
+    fn recompile_patterns(&mut self) -> Result<(), PatternError> {
+        let case_insensitive = self.case_sensitivity == CaseSensitivity::Insensitive;
+        for rule in self
+            .rules
+            .iter_mut()
+            .chain(self.protect.iter_mut())
+            .chain(self.writes.allow.iter_mut())
+            .chain(self.writes.deny.iter_mut())
+        {
+            rule.pattern.set_case_insensitive(case_insensitive)?;
+        }
+        Ok(())
+    }
+
     /// Evaluate the visibility decision for a lexical path.
     ///
     /// Protected paths always mask. Otherwise rules are applied in order; the
@@ -364,13 +379,17 @@ impl<'de> Deserialize<'de> for MountPolicyProgram {
     {
         let wire = MountPolicyProgramWire::deserialize(deserializer)?;
         match wire.version {
-            Some(1) => Ok(Self {
-                version: 1,
-                rules: wire.rules,
-                protect: wire.protect,
-                writes: wire.writes,
-                case_sensitivity: wire.case_sensitivity,
-            }),
+            Some(1) => {
+                let mut program = Self {
+                    version: 1,
+                    rules: wire.rules,
+                    protect: wire.protect,
+                    writes: wire.writes,
+                    case_sensitivity: wire.case_sensitivity,
+                };
+                program.recompile_patterns().map_err(de::Error::custom)?;
+                Ok(program)
+            }
             Some(version) => Err(de::Error::custom(format!(
                 "unsupported mount policy program version {version}; supported version is 1"
             ))),

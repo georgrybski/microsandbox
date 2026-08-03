@@ -58,7 +58,7 @@ impl Pattern {
     /// Returns a [`PatternError`] (see [`PatternErrorKind`]) if the pattern is
     /// empty, absolute, contains `..` or a NUL byte, or is not a valid glob.
     pub fn compile(raw: &str, origin: &RuleOrigin) -> Result<Self, PatternError> {
-        Self::compile_inner(raw).map_err(|kind| PatternError {
+        Self::compile_inner(raw, false).map_err(|kind| PatternError {
             kind,
             origin: Some(origin.clone()),
         })
@@ -70,7 +70,17 @@ impl Pattern {
     ///
     /// Returns a [`PatternError`] for the same reasons as [`Pattern::compile`].
     pub fn parse(raw: &str) -> Result<Self, PatternError> {
-        Self::compile_inner(raw).map_err(|kind| PatternError { kind, origin: None })
+        Self::compile_inner(raw, false).map_err(|kind| PatternError { kind, origin: None })
+    }
+
+    /// Recompile this pattern's matchers with the requested case sensitivity.
+    pub fn set_case_insensitive(&mut self, case_insensitive: bool) -> Result<(), PatternError> {
+        let compiled = Self::compile_inner(&self.raw, case_insensitive)
+            .map_err(|kind| PatternError { kind, origin: None })?;
+        self.matcher = compiled.matcher;
+        self.stem = compiled.stem;
+        self.dir_only = compiled.dir_only;
+        Ok(())
     }
 
     /// Return the raw authored pattern string.
@@ -83,7 +93,7 @@ impl Pattern {
         self.dir_only
     }
 
-    fn compile_inner(raw: &str) -> Result<Self, PatternErrorKind> {
+    fn compile_inner(raw: &str, case_insensitive: bool) -> Result<Self, PatternErrorKind> {
         if raw.is_empty() {
             return Err(PatternErrorKind::Empty);
         }
@@ -103,6 +113,7 @@ impl Pattern {
         }
         let matcher = GlobBuilder::new(body)
             .literal_separator(true)
+            .case_insensitive(case_insensitive)
             .build()
             .map_err(|source| PatternErrorKind::InvalidGlob {
                 pattern: raw.to_string(),
@@ -115,6 +126,7 @@ impl Pattern {
             .map(|stem| {
                 GlobBuilder::new(stem)
                     .literal_separator(true)
+                    .case_insensitive(case_insensitive)
                     .build()
                     .map(|glob| glob.compile_matcher())
                     .map_err(|source| PatternErrorKind::InvalidGlob {
