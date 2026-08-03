@@ -22,8 +22,11 @@ pub struct LexicalPath {
 /// Errors returned when a [`LexicalPath`] cannot be constructed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LexicalPathError {
+    /// Path starts with `/`.
     Absolute(String),
+    /// Path contains a `..` component.
     ParentEscape(String),
+    /// Child name is empty, `.`, `..`, or contains `/`.
     InvalidChildName(String),
 }
 

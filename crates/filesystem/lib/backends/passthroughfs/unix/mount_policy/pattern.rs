@@ -32,11 +32,21 @@ pub struct LiteralPrefix {
 /// Why a [`Pattern`] failed to compile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatternErrorKind {
+    /// Pattern is empty.
     Empty,
+    /// Pattern starts with `/`.
     Absolute(String),
+    /// Pattern contains a NUL byte.
     NulByte(String),
+    /// Pattern contains a `..` component.
     ParentEscape(String),
-    InvalidGlob { pattern: String, message: String },
+    /// Pattern is not a valid glob; `pattern` is the raw string and `message` is the globset error message.
+    InvalidGlob {
+        /// Raw pattern string.
+        pattern: String,
+        /// Globset error message.
+        message: String,
+    },
 }
 
 /// Error returned when a [`Pattern`] cannot be compiled, with optional provenance.

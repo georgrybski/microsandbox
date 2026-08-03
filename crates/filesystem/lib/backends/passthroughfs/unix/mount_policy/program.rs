@@ -18,8 +18,11 @@ use super::{LexicalPath, PathPolicyRule, PatternError, RuleEffect, RuleOrigin};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Decision {
+    /// Path is exposed to the guest.
     Visible,
+    /// Path is hidden from the guest; alias tags are honored.
     Masked,
+    /// Directory is shown in readdir so guests can discover unmasked descendants, but masked contents are filtered.
     TraversalOnly,
 }
 
@@ -27,7 +30,9 @@ pub enum Decision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WriteDecision {
+    /// Write is permitted.
     Allow,
+    /// Write is blocked.
     Deny,
 }
 
@@ -35,15 +40,20 @@ pub enum WriteDecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WriteRuleEffect {
+    /// Rule permits writes.
     Allow,
+    /// Rule blocks writes.
     Deny,
+    /// Rule protects the path (denies writes, masks reads).
     Protect,
 }
 
 /// A compiled set of allow/deny rules used for write admission.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CompiledRuleSet {
+    /// Rules that permit writes at matching paths.
     pub allow: Vec<PathPolicyRule>,
+    /// Rules that block writes at matching paths.
     pub deny: Vec<PathPolicyRule>,
 }
 /// Alias for the write-admission rule set of a mount policy program.
@@ -54,27 +64,39 @@ pub type WritePolicy = CompiledRuleSet;
 #[serde(rename_all = "lowercase")]
 pub enum CaseSensitivity {
     #[default]
+    /// Pattern matching is case-sensitive (default).
     Sensitive,
+    /// Pattern matching is case-insensitive.
     Insensitive,
 }
 
 /// A single rule that matched during a [`MountPolicyProgram::decide`] evaluation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuleMatch {
+    /// Index of the matched rule within its rule bucket.
     pub rule_index: usize,
+    /// The visibility effect of the matched rule.
     pub effect: RuleEffect,
+    /// Whether the rule is non-overridable (freezes further matches).
     pub terminal: bool,
+    /// Provenance of the matched rule.
     pub origin: RuleOrigin,
+    /// Whether this rule was shadowed by an earlier terminal rule.
     pub frozen_out: bool,
 }
 
 /// A single rule that matched during a [`MountPolicyProgram::decide_write`] evaluation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WriteRuleMatch {
+    /// Index of the matched write rule within its bucket.
     pub rule_index: usize,
+    /// The write effect of the matched rule.
     pub effect: WriteRuleEffect,
+    /// Whether the rule is non-overridable.
     pub terminal: bool,
+    /// Provenance of the matched write rule.
     pub origin: RuleOrigin,
+    /// Whether this rule was shadowed by an earlier terminal rule.
     pub frozen_out: bool,
 }
 
@@ -82,9 +104,13 @@ pub struct WriteRuleMatch {
 /// provenance of any terminal freeze.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Explained<T, M = RuleMatch> {
+    /// The final decision for the evaluated path.
     pub decision: T,
+    /// All rules that matched during evaluation, in order.
     pub matches: Vec<M>,
+    /// Provenance of the terminal rule that froze evaluation, if any.
     pub frozen_by: Option<RuleOrigin>,
+    /// Whether the decision was fail-closed due to a non-UTF-8 path.
     pub fail_closed_non_utf8: bool,
 }
 
@@ -95,10 +121,15 @@ pub struct Explained<T, M = RuleMatch> {
 /// non-UTF-8 paths.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MountPolicyProgram {
+    /// Wire format version (currently 1).
     pub version: u32,
+    /// Ordered mask/unmask visibility rules.
     pub rules: Vec<PathPolicyRule>,
+    /// Protected paths that always mask and deny writes.
     pub protect: Vec<PathPolicyRule>,
+    /// Compiled write-admission rule set.
     pub writes: WritePolicy,
+    /// Case sensitivity applied to pattern matching.
     pub case_sensitivity: CaseSensitivity,
 }
 

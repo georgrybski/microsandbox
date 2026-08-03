@@ -11,7 +11,6 @@ mod file_ops;
 mod host_mode;
 pub(crate) mod inode;
 mod metadata;
-#[allow(missing_docs)]
 pub mod mount_policy;
 mod remove_ops;
 mod special;
