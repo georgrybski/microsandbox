@@ -1512,6 +1512,7 @@ mod tests {
                 stat_virtualization: StatVirtualization::Strict,
                 host_permissions: HostPermissions::Private,
                 quota_mib: None,
+                mount_policy: None,
             },
             VolumeMount::DiskImage {
                 host: PathBuf::from(r"C:\Users\Stephen\data.raw"),
@@ -1549,6 +1550,7 @@ mod tests {
             host_permissions: HostPermissions::Mirror,
             follow_root_symlinks: false,
             quota_mib: None,
+            mount_policy: None,
         };
 
         let err = validate_volume_mounts(&[mount]).unwrap_err();
@@ -1569,6 +1571,7 @@ mod tests {
             host_permissions: HostPermissions::Private,
             follow_root_symlinks: false,
             quota_mib: None,
+            mount_policy: None,
         };
 
         let value = serde_json::to_value(&mount).unwrap();
