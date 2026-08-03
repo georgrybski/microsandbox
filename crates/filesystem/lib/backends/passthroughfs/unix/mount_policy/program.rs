@@ -12,9 +12,9 @@ use super::{LexicalPath, PathPolicyRule, PatternError, RuleEffect, RuleOrigin};
 /// Visibility decision for a path under a mount path policy.
 ///
 /// `Visible` paths are exposed to the guest; `Masked` paths are hidden and
-/// their alias tags are honored; `TraversalOnly` paths are shown in directory
-/// listings so guests can discover unmasked descendants, but their masked
-/// contents are still filtered.
+/// their alias tags are honored; `TraversalOnly` directories are included in
+/// readdir results so guests can discover unmasked descendants, while their
+/// masked contents remain filtered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Decision {
