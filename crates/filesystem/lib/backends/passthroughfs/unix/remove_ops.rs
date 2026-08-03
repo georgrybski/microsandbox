@@ -536,14 +536,23 @@ fn remove_admission(fs: &PassthroughFs, parent: u64, name: &CStr) -> io::Result<
     if policy.is_protected(&path) {
         return Err(platform::enoent());
     }
-    if !matches!(
+    let masked = matches!(
         policy.decide(&path).decision,
         super::mount_policy::Decision::Masked
-    ) {
-        return Ok(false);
-    }
-    if !fs.tagged_visible(parent, name.to_bytes()) {
+    );
+    // Masked-untagged paths are invisible: ENOENT takes precedence over write-deny.
+    if masked && !fs.tagged_visible(parent, name.to_bytes()) {
         return Err(platform::enoent());
+    }
+    // writes.deny is a global write ACL: blocks deletion for visible and tagged-masked paths.
+    if matches!(
+        policy.decide_write(&path).decision,
+        super::mount_policy::WriteDecision::Deny
+    ) {
+        return Err(platform::eacces());
+    }
+    if !masked {
+        return Ok(false);
     }
     Ok(true)
 }
@@ -559,16 +568,32 @@ fn rmdir_admission(fs: &PassthroughFs, parent: u64, name: &CStr) -> io::Result<b
     if policy.is_protected(&path) {
         return Err(platform::enoent());
     }
-    if !matches!(
+    let masked = matches!(
         policy.decide(&path).decision,
         super::mount_policy::Decision::Masked
-    ) {
+    );
+    if !masked {
+        // Visible directory: writes.deny blocks rmdir.
+        if matches!(
+            policy.decide_write(&path).decision,
+            super::mount_policy::WriteDecision::Deny
+        ) {
+            return Err(platform::eacces());
+        }
         return Ok(false);
     }
     if fs.tagged_visible(parent, name.to_bytes()) {
+        // Tagged-masked: deny beats tag visibility for writes.
+        if matches!(
+            policy.decide_write(&path).decision,
+            super::mount_policy::WriteDecision::Deny
+        ) {
+            return Err(platform::eacces());
+        }
         return Ok(true);
     }
-    // An untagged masked directory is still eligible for the fail-closed
+    // Untagged masked directory: writes.deny is irrelevant because the path is
+    // invisible to the guest. It is eligible for the fail-closed
     // cascade only when the policy masks descendants too. A plain masked
     // directory must remain indistinguishable from a missing name.
     if matches!(

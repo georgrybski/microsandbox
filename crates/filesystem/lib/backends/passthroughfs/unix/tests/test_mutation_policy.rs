@@ -372,6 +372,108 @@ fn write_rule_deny_blocks_create_no_host_file() {
 }
 
 #[test]
+fn unlink_visible_write_denied_is_eacces() {
+    let sb = sandbox(program(&[], &[], &[], &[], &["blocked.txt"]));
+    sb.host_create_file("blocked.txt", b"x");
+    TestSandbox::assert_errno(
+        sb.fs
+            .unlink(sb.ctx(), ROOT_INODE, &TestSandbox::cstr("blocked.txt")),
+        LINUX_EACCES,
+    );
+    assert!(sb.root.join("blocked.txt").exists());
+}
+
+#[test]
+fn rmdir_visible_write_denied_is_eacces() {
+    let sb = sandbox(program(&[], &[], &[], &[], &["blockeddir"]));
+    sb.host_create_dir("blockeddir");
+    TestSandbox::assert_errno(
+        sb.fs
+            .rmdir(sb.ctx(), ROOT_INODE, &TestSandbox::cstr("blockeddir")),
+        LINUX_EACCES,
+    );
+    assert!(sb.root.join("blockeddir").is_dir());
+}
+
+#[test]
+fn unlink_masked_untagged_write_denied_is_enoent_precedence() {
+    let sb = sandbox(program(&[".env"], &[], &[], &[], &[".env"]));
+    sb.host_create_file(".env", b"x");
+    TestSandbox::assert_errno(
+        sb.fs
+            .unlink(sb.ctx(), ROOT_INODE, &TestSandbox::cstr(".env")),
+        LINUX_ENOENT,
+    );
+    assert!(sb.root.join(".env").exists());
+}
+
+#[test]
+fn unlink_tagged_masked_write_denied_is_eacces() {
+    let mut sb = sandbox(program(&[".env"], &[], &[], &[], &[]));
+    sb.fuse_create_root(".env").unwrap();
+    sb.fs.cfg.mask_policy = Some(Arc::new(program(&[".env"], &[], &[], &[], &[".env"])));
+    TestSandbox::assert_errno(
+        sb.fs
+            .unlink(sb.ctx(), ROOT_INODE, &TestSandbox::cstr(".env")),
+        LINUX_EACCES,
+    );
+    assert!(sb.root.join(".env").exists());
+}
+
+#[test]
+fn rmdir_tagged_masked_write_denied_is_eacces() {
+    let mut sb = sandbox(program(&["d"], &[], &[], &[], &[]));
+    sb.fuse_mkdir_root("d").unwrap();
+    sb.fs.tag_child(ROOT_INODE, b"d");
+    sb.fs.cfg.mask_policy = Some(Arc::new(program(&["d"], &[], &[], &[], &["d"])));
+    TestSandbox::assert_errno(
+        sb.fs.rmdir(sb.ctx(), ROOT_INODE, &TestSandbox::cstr("d")),
+        LINUX_EACCES,
+    );
+}
+
+#[test]
+fn open_visible_write_denied_is_eacces() {
+    let mut sb = sandbox(program(&[], &[], &[], &[], &["blocked.txt"]));
+    sb.host_create_file("blocked.txt", b"x");
+    let inode = host_inode(&mut sb, "blocked.txt");
+    TestSandbox::assert_errno(sb.fuse_open(inode, libc::O_WRONLY as u32), LINUX_EACCES);
+    TestSandbox::assert_errno(sb.fuse_open(inode, libc::O_RDWR as u32), LINUX_EACCES);
+    assert!(sb.fuse_open(inode, libc::O_RDONLY as u32).is_ok());
+}
+
+#[test]
+fn write_tagged_masked_write_denied_is_eacces() {
+    let mut sb = sandbox(program(&[".env"], &[], &[], &[], &[]));
+    let (entry, handle) = sb.fuse_create_root(".env").unwrap();
+    sb.fs.cfg.mask_policy = Some(Arc::new(program(&[".env"], &[], &[], &[], &[".env"])));
+    TestSandbox::assert_errno(sb.fuse_write(entry.inode, handle, b"more", 0), LINUX_EACCES);
+    TestSandbox::assert_errno(
+        sb.fuse_open(entry.inode, libc::O_WRONLY as u32),
+        LINUX_EACCES,
+    );
+}
+
+#[test]
+fn write_visible_not_denied_succeeds() {
+    let mut sb = sandbox(program(&[], &[], &[], &[], &["blocked.txt"]));
+    sb.host_create_file("ok.txt", b"old");
+    let inode = host_inode(&mut sb, "ok.txt");
+    let handle = sb.fuse_open(inode, libc::O_RDWR as u32).unwrap();
+    sb.fuse_write(inode, handle, b"new", 0).unwrap();
+}
+
+#[test]
+fn read_visible_write_denied_succeeds() {
+    let mut sb = sandbox(program(&[], &[], &[], &[], &["blocked.txt"]));
+    sb.host_create_file("blocked.txt", b"content");
+    let inode = host_inode(&mut sb, "blocked.txt");
+    let handle = sb.fuse_open(inode, libc::O_RDONLY as u32).unwrap();
+    let data = sb.fuse_read(inode, handle, 4096, 0).unwrap();
+    assert_eq!(&data[..], b"content");
+}
+
+#[test]
 fn leak_freedom_denied_ops() {
     let mut sb = sandbox(program(
         &["masked", "rename-me"],

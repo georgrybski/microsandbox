@@ -56,6 +56,15 @@ pub(crate) fn do_open(
             if policy.is_protected(&path) {
                 return Err(platform::eacces());
             }
+            // writes.deny is a global write ACL: evaluate for all paths.
+            if write_intent
+                && matches!(
+                    policy.decide_write(&path).decision,
+                    super::mount_policy::WriteDecision::Deny
+                )
+            {
+                return Err(platform::eacces());
+            }
             if matches!(
                 policy.decide(&path).decision,
                 super::mount_policy::Decision::Masked
@@ -63,14 +72,6 @@ pub(crate) fn do_open(
                 masked = true;
                 if !write_intent && !fs.tagged_visible_for_inode(inode) {
                     return Err(platform::enoent());
-                }
-                if write_intent
-                    && matches!(
-                        policy.decide_write(&path).decision,
-                        super::mount_policy::WriteDecision::Deny
-                    )
-                {
-                    return Err(platform::eacces());
                 }
             }
         }
@@ -229,20 +230,17 @@ pub(crate) fn do_write(
         if policy.is_protected(&path) {
             return Err(platform::eacces());
         }
+        // writes.deny is a global write ACL: evaluate for all paths.
         if matches!(
+            policy.decide_write(&path).decision,
+            super::mount_policy::WriteDecision::Deny
+        ) {
+            return Err(platform::eacces());
+        }
+        matches!(
             policy.decide(&path).decision,
             super::mount_policy::Decision::Masked
-        ) {
-            if matches!(
-                policy.decide_write(&path).decision,
-                super::mount_policy::WriteDecision::Deny
-            ) {
-                return Err(platform::eacces());
-            }
-            true
-        } else {
-            false
-        }
+        )
     } else {
         false
     };
