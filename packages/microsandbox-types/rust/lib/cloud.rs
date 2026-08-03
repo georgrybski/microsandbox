@@ -670,6 +670,9 @@ impl From<CloudVolumeMount> for VolumeMount {
 }
 
 impl From<VolumeMount> for CloudVolumeMount {
+    /// Intentionally drops `follow_root_symlinks` and `mount_policy`: the cloud
+    /// wire format does not carry host-side mount policy or symlink resolution,
+    /// which are re-derived on the host when the mount is rehydrated.
     fn from(m: VolumeMount) -> Self {
         match m {
             VolumeMount::Bind {
