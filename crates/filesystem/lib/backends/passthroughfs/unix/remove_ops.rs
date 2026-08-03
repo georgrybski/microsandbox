@@ -43,6 +43,9 @@ pub(crate) fn do_unlink(
         return Err(platform::eacces());
     }
 
+    #[cfg(target_os = "linux")]
+    let tagged_masked = remove_admission(fs, parent, name)?;
+
     let parent_fd = inode::get_inode_fd(fs, parent)?;
 
     #[cfg(target_os = "linux")]
@@ -115,6 +118,11 @@ pub(crate) fn do_unlink(
         }
     }
 
+    #[cfg(target_os = "linux")]
+    if tagged_masked && let Some(tags) = fs.tags() {
+        tags.evict(parent, name.to_bytes());
+    }
+
     // Store the fd in InodeData so open_inode_fd can use it.
     #[cfg(target_os = "macos")]
     if let Some(fd) = pre_unlink_fd {
@@ -156,6 +164,9 @@ pub(crate) fn do_rmdir(
         return Err(platform::eacces());
     }
 
+    #[cfg(target_os = "linux")]
+    let tagged_masked = rmdir_admission(fs, parent, name)?;
+
     let parent_fd = inode::get_inode_fd(fs, parent)?;
 
     #[cfg(target_os = "linux")]
@@ -184,11 +195,38 @@ pub(crate) fn do_rmdir(
 
     let ret = unsafe { libc::unlinkat(parent_fd.raw(), name.as_ptr(), libc::AT_REMOVEDIR) };
     if ret < 0 {
+        let initial_errno = io::Error::last_os_error().raw_os_error();
         #[cfg(target_os = "linux")]
-        if let Some(fd) = pre_rmdir_fd {
-            unsafe { libc::close(fd) };
+        if initial_errno == Some(libc::ENOTEMPTY)
+            && let Some(policy) = fs.mask_policy()
+            && let Some(path) = inode::lexical_child_path(fs, parent, name.to_bytes())
+            && let Ok(lexical) = super::mount_policy::LexicalPath::new(&path)
+            && matches!(
+                policy.decide(&lexical).decision,
+                super::mount_policy::Decision::Masked
+                    | super::mount_policy::Decision::TraversalOnly
+            )
+            && cascade_remove(fs, &path, &lexical, 0)
+        {
+            let retry =
+                unsafe { libc::unlinkat(parent_fd.raw(), name.as_ptr(), libc::AT_REMOVEDIR) };
+            if retry == 0 {
+                // Continue through the ordinary successful-rmdir cleanup below.
+            } else {
+                if let Some(fd) = pre_rmdir_fd {
+                    unsafe { libc::close(fd) };
+                }
+                return Err(io::Error::from_raw_os_error(libc::ENOTEMPTY));
+            }
+        } else {
+            #[cfg(target_os = "linux")]
+            if let Some(fd) = pre_rmdir_fd {
+                unsafe { libc::close(fd) };
+            }
+            return Err(io::Error::from_raw_os_error(
+                initial_errno.unwrap_or(libc::EIO),
+            ));
         }
-        return Err(platform::linux_error(io::Error::last_os_error()));
     }
 
     #[cfg(target_os = "linux")]
@@ -210,7 +248,68 @@ pub(crate) fn do_rmdir(
             unsafe { libc::close(fd) };
         }
     }
+    #[cfg(target_os = "linux")]
+    if tagged_masked && let Some(tags) = fs.tags() {
+        tags.evict(parent, name.to_bytes());
+    }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn cascade_remove(
+    fs: &PassthroughFs,
+    lexical_path: &str,
+    lexical: &super::mount_policy::LexicalPath,
+    depth: usize,
+) -> bool {
+    if depth > 64 {
+        return false;
+    }
+    let Some(policy) = fs.mask_policy() else {
+        return false;
+    };
+    let host_path = fs.cfg.root_dir.join(lexical_path);
+    let Ok(entries) = std::fs::read_dir(&host_path) else {
+        return false;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { return false };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        let child_path = format!("{lexical_path}/{name}");
+        let Ok(child) = super::mount_policy::LexicalPath::new(&child_path) else {
+            return false;
+        };
+        if policy.is_protected(&child) {
+            return false;
+        }
+        match policy.decide(&child).decision {
+            super::mount_policy::Decision::Visible => return false,
+            super::mount_policy::Decision::Masked if fs.tagged_visible(0, name.as_bytes()) => {
+                return false;
+            }
+            super::mount_policy::Decision::Masked
+            | super::mount_policy::Decision::TraversalOnly => {
+                let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                    return false;
+                };
+                if meta.file_type().is_dir() {
+                    if !cascade_remove(fs, &child_path, &child, depth + 1) {
+                        return false;
+                    }
+                    if std::fs::remove_dir(entry.path()).is_err() {
+                        return false;
+                    }
+                } else if std::fs::remove_file(entry.path()).is_err() {
+                    return false;
+                }
+            }
+        }
+    }
+    let _ = lexical;
+    true
 }
 
 /// Rename a file or directory.
@@ -234,6 +333,11 @@ pub(crate) fn do_rename(
         || fs.is_reserved_init_name(newdir, newname.to_bytes())
     {
         return Err(platform::eacces());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        rename_admission(fs, olddir, oldname, newdir, newname)?;
     }
 
     let old_fd = inode::get_inode_fd(fs, olddir)?;
@@ -324,6 +428,10 @@ pub(crate) fn do_rename(
                 }
                 unsafe { libc::close(fd) };
             }
+            if let Some(tags) = fs.tags() {
+                tags.evict(olddir, oldname.to_bytes());
+                tags.evict(newdir, newname.to_bytes());
+            }
         } else {
             if let Some(source) = source_data.as_ref() {
                 let _ = inode::remove_alias_locked(&mut inodes, source, &old_alias);
@@ -346,6 +454,10 @@ pub(crate) fn do_rename(
                 } else {
                     unsafe { libc::close(fd) };
                 }
+            }
+            if let Some(tags) = fs.tags() {
+                tags.evict(olddir, oldname.to_bytes());
+                tags.evict(newdir, newname.to_bytes());
             }
         }
     }
@@ -393,5 +505,106 @@ pub(crate) fn do_rename(
         }
     }
 
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn remove_admission(fs: &PassthroughFs, parent: u64, name: &CStr) -> io::Result<bool> {
+    let Some(policy) = fs.mask_policy() else {
+        return Ok(false);
+    };
+    let path =
+        inode::lexical_child_path(fs, parent, name.to_bytes()).ok_or_else(platform::enoent)?;
+    let path = super::mount_policy::LexicalPath::new(&path).map_err(|_| platform::enoent())?;
+    if policy.is_protected(&path) {
+        return Err(platform::enoent());
+    }
+    if !matches!(
+        policy.decide(&path).decision,
+        super::mount_policy::Decision::Masked
+    ) {
+        return Ok(false);
+    }
+    if !fs.tagged_visible(parent, name.to_bytes()) {
+        return Err(platform::enoent());
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn rmdir_admission(fs: &PassthroughFs, parent: u64, name: &CStr) -> io::Result<bool> {
+    let Some(policy) = fs.mask_policy() else {
+        return Ok(false);
+    };
+    let path =
+        inode::lexical_child_path(fs, parent, name.to_bytes()).ok_or_else(platform::enoent)?;
+    let path = super::mount_policy::LexicalPath::new(&path).map_err(|_| platform::enoent())?;
+    if policy.is_protected(&path) {
+        return Err(platform::enoent());
+    }
+    if !matches!(
+        policy.decide(&path).decision,
+        super::mount_policy::Decision::Masked
+    ) {
+        return Ok(false);
+    }
+    if fs.tagged_visible(parent, name.to_bytes()) {
+        return Ok(true);
+    }
+    // An untagged masked directory is still eligible for the fail-closed
+    // cascade only when the policy masks descendants too. A plain masked
+    // directory must remain indistinguishable from a missing name.
+    if matches!(
+        policy
+            .decide_child(&path, "__mount_policy_probe__")
+            .decision,
+        super::mount_policy::Decision::Masked | super::mount_policy::Decision::TraversalOnly
+    ) {
+        let host_path = fs.cfg.root_dir.join(path.as_str().unwrap_or_default());
+        if std::fs::read_dir(host_path)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true)
+        {
+            return Err(platform::enoent());
+        }
+        return Ok(false);
+    }
+    Err(platform::enoent())
+}
+
+#[cfg(target_os = "linux")]
+fn rename_admission(
+    fs: &PassthroughFs,
+    olddir: u64,
+    oldname: &CStr,
+    newdir: u64,
+    newname: &CStr,
+) -> io::Result<()> {
+    let Some(policy) = fs.mask_policy() else {
+        return Ok(());
+    };
+    let src =
+        inode::lexical_child_path(fs, olddir, oldname.to_bytes()).ok_or_else(platform::enoent)?;
+    let dst =
+        inode::lexical_child_path(fs, newdir, newname.to_bytes()).ok_or_else(platform::enoent)?;
+    let src = super::mount_policy::LexicalPath::new(&src).map_err(|_| platform::enoent())?;
+    let dst = super::mount_policy::LexicalPath::new(&dst).map_err(|_| platform::enoent())?;
+    if policy.is_protected(&src)
+        || (matches!(
+            policy.decide(&src).decision,
+            super::mount_policy::Decision::Masked
+        ) && !fs.tagged_visible(olddir, oldname.to_bytes()))
+    {
+        return Err(platform::enoent());
+    }
+    if policy.is_protected(&dst) {
+        return Err(platform::enoent());
+    }
+    if matches!(
+        policy.decide_write(&dst).decision,
+        super::mount_policy::WriteDecision::Deny
+    ) {
+        return Err(platform::eacces());
+    }
     Ok(())
 }

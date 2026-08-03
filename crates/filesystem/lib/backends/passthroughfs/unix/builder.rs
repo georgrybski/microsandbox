@@ -221,6 +221,11 @@ impl PassthroughFsBuilder {
         let quota = cfg
             .quota_bytes
             .map(|limit| super::super::quota::DirQuota::new(cfg.root_dir.clone(), limit));
+        #[cfg(target_os = "linux")]
+        let tags = cfg
+            .mask_policy
+            .as_ref()
+            .map(|_| super::tag_store::TagStore::new());
 
         Ok(PassthroughFs {
             cfg,
@@ -237,6 +242,8 @@ impl PassthroughFsBuilder {
             #[cfg(target_os = "linux")]
             proc_self_fd,
             quota,
+            #[cfg(target_os = "linux")]
+            tags,
         })
     }
 }

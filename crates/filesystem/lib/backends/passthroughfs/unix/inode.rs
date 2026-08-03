@@ -227,10 +227,14 @@ pub(crate) fn do_lookup(fs: &PassthroughFs, parent: u64, name: &CStr) -> io::Res
         };
         let lexical =
             super::mount_policy::LexicalPath::new(&path).map_err(|_| platform::enoent())?;
+        if policy.is_protected(&lexical) {
+            return Err(platform::enoent());
+        }
         if matches!(
             policy.decide(&lexical).decision,
             super::mount_policy::Decision::Masked
-        ) {
+        ) && !fs.tagged_visible(parent, name.to_bytes())
+        {
             return Err(platform::enoent());
         }
     }
@@ -323,6 +327,32 @@ fn do_lookup_linux(
     let st = platform::statx_to_stat64(&stx);
     let mnt_id = stx.stx_mnt_id;
     let alt_key = InodeAltKey::new(st.st_ino, st.st_dev, mnt_id);
+    if let Some(policy) = fs.mask_policy() {
+        let path = lexical_child_path(fs, parent, name.to_bytes());
+        if let Some(path) = path
+            && let Ok(lexical) = super::mount_policy::LexicalPath::new(&path)
+            && !policy.is_protected(&lexical)
+            && matches!(
+                policy.decide(&lexical).decision,
+                super::mount_policy::Decision::Masked
+            )
+        {
+            let Some(stored) = fs
+                .tags()
+                .and_then(|tags| tags.get_identity(parent, name.to_bytes()))
+            else {
+                unsafe { libc::close(fd) };
+                return Err(platform::enoent());
+            };
+            if stored != alt_key {
+                if let Some(tags) = fs.tags() {
+                    tags.evict(parent, name.to_bytes());
+                }
+                unsafe { libc::close(fd) };
+                return Err(platform::enoent());
+            }
+        }
+    }
     let alias = NamespaceAlias::new(parent, name.to_bytes());
     let patched = crate::backends::shared::stat_override::patched_stat(
         fd,
@@ -511,7 +541,7 @@ fn open_macos_path_for_stat(path: *const libc::c_char) -> io::Result<i32> {
 /// when the count reaches zero.
 pub(crate) fn forget_one(fs: &PassthroughFs, inode: u64, count: u64) {
     let mut inodes = fs.inodes.write().unwrap();
-    forget_one_locked(&mut inodes, inode, count);
+    forget_one_locked(fs, &mut inodes, inode, count);
 }
 
 /// Decrement the reference count under an already-held write lock.
@@ -523,6 +553,7 @@ pub(crate) fn forget_one(fs: &PassthroughFs, inode: u64, count: u64) {
 /// the refcount between our load and compare_exchange. `saturating_sub` prevents
 /// underflow if the kernel sends a forget count larger than the current refcount.
 pub(crate) fn forget_one_locked(
+    fs: &PassthroughFs,
     inodes: &mut MultikeyBTreeMap<u64, InodeAltKey, Arc<InodeData>>,
     inode: u64,
     count: u64,
@@ -538,7 +569,10 @@ pub(crate) fn forget_one_locked(
             {
                 if new == 0 {
                     #[cfg(target_os = "linux")]
-                    maybe_remove_inode_locked(inodes, inode);
+                    {
+                        evict_inode_tags(fs, &data, inode);
+                        maybe_remove_inode_locked(inodes, inode);
+                    }
 
                     #[cfg(target_os = "macos")]
                     {
@@ -649,7 +683,7 @@ fn inode_alt_key(data: &InodeData) -> InodeAltKey {
 }
 
 #[cfg(target_os = "linux")]
-fn current_anchor_alias(data: &InodeData) -> Option<NamespaceAlias> {
+pub(crate) fn current_anchor_alias(data: &InodeData) -> Option<NamespaceAlias> {
     let parent = data.anchor_parent.load(Ordering::Acquire);
     if parent == 0 {
         return None;
@@ -659,6 +693,18 @@ fn current_anchor_alias(data: &InodeData) -> Option<NamespaceAlias> {
         parent,
         name: data.anchor_name.read().unwrap().clone(),
     })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn current_anchor_alias_for_policy(
+    fs: &PassthroughFs,
+    inode: u64,
+) -> Option<NamespaceAlias> {
+    fs.inodes
+        .read()
+        .unwrap()
+        .get(&inode)
+        .and_then(|data| current_anchor_alias(data))
 }
 
 #[cfg(target_os = "linux")]
@@ -947,6 +993,16 @@ fn maybe_remove_inode_locked(
 
     if anchor_parent != 0 {
         decrement_anchor_children_locked(inodes, anchor_parent);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn evict_inode_tags(fs: &PassthroughFs, data: &InodeData, inode: u64) {
+    if let Some(tags) = fs.tags() {
+        if let Some(alias) = current_anchor_alias(data) {
+            tags.evict(alias.parent, &alias.name);
+        }
+        tags.evict_parent(inode);
     }
 }
 

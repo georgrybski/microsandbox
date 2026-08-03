@@ -314,10 +314,14 @@ fn build_snapshot(
             let Ok(path) = super::mount_policy::LexicalPath::new(&path) else {
                 return false;
             };
-            !matches!(
-                policy.decide(&path).decision,
-                super::mount_policy::Decision::Masked
-            )
+            if policy.is_protected(&path) {
+                return false;
+            }
+            match policy.decide(&path).decision {
+                super::mount_policy::Decision::Masked => fs.tagged_visible(dir_inode, &entry.name),
+                super::mount_policy::Decision::TraversalOnly
+                | super::mount_policy::Decision::Visible => true,
+            }
         });
     }
 

@@ -45,6 +45,41 @@ pub(crate) fn do_open(
         return Ok((Some(init_binary::INIT_HANDLE), OpenOptions::KEEP_CACHE));
     }
 
+    #[cfg(target_os = "linux")]
+    let (masked_policy_path, write_intent) = {
+        let write_intent = open_flags_mutate(flags as i32);
+        let mut masked = false;
+        if let Some(policy) = fs.mask_policy()
+            && let Some(path) = inode::lexical_inode_path(fs, inode)
+            && let Ok(path) = super::mount_policy::LexicalPath::new(&path)
+        {
+            if policy.is_protected(&path) {
+                return Err(platform::eacces());
+            }
+            if matches!(
+                policy.decide(&path).decision,
+                super::mount_policy::Decision::Masked
+            ) {
+                masked = true;
+                if !write_intent && !fs.tagged_visible_for_inode(inode) {
+                    return Err(platform::enoent());
+                }
+                if write_intent
+                    && matches!(
+                        policy.decide_write(&path).decision,
+                        super::mount_policy::WriteDecision::Deny
+                    )
+                {
+                    return Err(platform::eacces());
+                }
+            }
+        }
+        (masked, write_intent)
+    };
+
+    #[cfg(target_os = "macos")]
+    let write_intent = open_flags_mutate(flags as i32);
+
     let mut open_flags = inode::translate_open_flags(flags as i32);
     if fs.cfg.readonly() && open_flags_mutate(open_flags) {
         return Err(platform::erofs());
@@ -69,6 +104,45 @@ pub(crate) fn do_open(
 
     // open_inode_fd adds O_CLOEXEC itself and rejects real host symlinks.
     let fd = inode::open_inode_fd(fs, inode, open_flags)?;
+
+    #[cfg(target_os = "linux")]
+    if masked_policy_path {
+        let Some(_path) = inode::lexical_inode_path(fs, inode) else {
+            unsafe { libc::close(fd) };
+            return Err(platform::enoent());
+        };
+        let stored = fs.tags().and_then(|tags| {
+            inode::current_anchor_alias_for_policy(fs, inode)
+                .and_then(|alias| tags.get_identity(alias.parent, &alias.name))
+        });
+        if stored.is_none() && !write_intent {
+            unsafe { libc::close(fd) };
+            return Err(platform::enoent());
+        }
+        if let Some(stored) = stored {
+            let actual = match inode::linux_alt_key_from_fd(fd) {
+                Ok(actual) => actual,
+                Err(err) => {
+                    unsafe { libc::close(fd) };
+                    return Err(err);
+                }
+            };
+            if actual != stored {
+                if let Some(alias) = inode::current_anchor_alias_for_policy(fs, inode)
+                    && let Some(tags) = fs.tags()
+                {
+                    tags.evict(alias.parent, &alias.name);
+                }
+                unsafe { libc::close(fd) };
+                return Err(platform::enoent());
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    if masked_policy_path && write_intent {
+        fs.tag_inode(inode);
+    }
 
     // Clear SUID/SGID on open+truncate (HANDLE_KILLPRIV_V2).
     if kill_priv && (open_flags & libc::O_TRUNC != 0) {
@@ -147,11 +221,42 @@ pub(crate) fn do_write(
     let f = data.file.read().unwrap();
 
     let fd = f.as_raw_fd();
+    #[cfg(target_os = "linux")]
+    let write_masked = if let Some(policy) = fs.mask_policy()
+        && let Some(path) = inode::lexical_inode_path(fs, inode)
+        && let Ok(path) = super::mount_policy::LexicalPath::new(&path)
+    {
+        if policy.is_protected(&path) {
+            return Err(platform::eacces());
+        }
+        if matches!(
+            policy.decide(&path).decision,
+            super::mount_policy::Decision::Masked
+        ) {
+            if matches!(
+                policy.decide_write(&path).decision,
+                super::mount_policy::WriteDecision::Deny
+            ) {
+                return Err(platform::eacces());
+            }
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
     // Charge the quota for any growth past EOF before writing, so an
     // over-budget write is refused with ENOSPC rather than hitting the disk.
     fs.quota_charge_to(fd, offset.saturating_add(size as u64))?;
 
     let written = r.read_to(&f, size as usize, offset)?;
+
+    #[cfg(target_os = "linux")]
+    #[cfg(target_os = "linux")]
+    if written > 0 && write_masked {
+        fs.tag_inode(inode);
+    }
 
     if kill_priv {
         if fs.cfg.xattr_enabled() {

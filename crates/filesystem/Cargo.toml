@@ -13,6 +13,7 @@ path = "lib/lib.rs"
 [dependencies]
 globset.workspace = true
 libc.workspace = true
+lru.workspace = true
 microsandbox-utils.workspace = true
 msb_krun.workspace = true
 serde.workspace = true
