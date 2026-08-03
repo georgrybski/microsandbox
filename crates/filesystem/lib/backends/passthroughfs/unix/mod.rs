@@ -313,7 +313,7 @@ impl PassthroughFs {
             .quota_bytes
             .map(|limit| super::quota::DirQuota::new(cfg.root_dir.clone(), limit));
         #[cfg(target_os = "linux")]
-        let tags = cfg.mask_policy.as_ref().map(|_| tag_store::TagStore::new());
+        let tags = cfg.new_tag_store();
 
         Ok(Self {
             cfg,
@@ -539,6 +539,14 @@ impl PassthroughConfig {
     /// False for [`StatVirtualization::Off`].
     pub(crate) fn xattr_enabled(&self) -> bool {
         !matches!(self.stat_virtualization, StatVirtualization::Off)
+    }
+
+    /// Build a [`tag_store::TagStore`] when a mask policy is configured, else `None`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn new_tag_store(&self) -> Option<tag_store::TagStore> {
+        self.mask_policy
+            .as_ref()
+            .map(|_| tag_store::TagStore::new())
     }
 
     /// Whether xattr support is required at mount time (eager probe + hard errors).
