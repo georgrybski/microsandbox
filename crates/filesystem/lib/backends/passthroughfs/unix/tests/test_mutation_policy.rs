@@ -523,3 +523,68 @@ fn identity_revalidation_evicts_on_host_replace() {
     sb.host_create_file(".env", b"replacement");
     TestSandbox::assert_errno(sb.lookup_root(".env"), LINUX_ENOENT);
 }
+
+#[test]
+fn fallocate_write_denied_is_eacces() {
+    let mut sb = sandbox(program(&[], &[], &[], &[], &["blocked.txt"]));
+    sb.host_create_file("blocked.txt", b"x");
+    let inode = host_inode(&mut sb, "blocked.txt");
+    let handle = sb.fuse_open(inode, libc::O_RDONLY as u32).unwrap();
+    TestSandbox::assert_errno(
+        sb.fs.fallocate(sb.ctx(), inode, handle, 0, 0, 100),
+        LINUX_EACCES,
+    );
+}
+
+#[test]
+fn setattr_write_denied_is_eacces() {
+    let mut sb = sandbox(program(&[], &[], &[], &[], &["blocked.txt"]));
+    sb.host_create_file("blocked.txt", b"x");
+    let inode = host_inode(&mut sb, "blocked.txt");
+    let mut attr: stat64 = unsafe { std::mem::zeroed() };
+    attr.st_mode = 0o755;
+    TestSandbox::assert_errno(
+        sb.fs
+            .setattr(sb.ctx(), inode, attr, None, SetattrValid::MODE),
+        LINUX_EACCES,
+    );
+}
+
+#[test]
+fn ftruncate_write_denied_is_eacces() {
+    let mut sb = sandbox(program(&[], &[], &[], &[], &["blocked.txt"]));
+    sb.host_create_file("blocked.txt", b"x");
+    let inode = host_inode(&mut sb, "blocked.txt");
+    let mut attr: stat64 = unsafe { std::mem::zeroed() };
+    attr.st_size = 100;
+    TestSandbox::assert_errno(
+        sb.fs
+            .setattr(sb.ctx(), inode, attr, None, SetattrValid::SIZE),
+        LINUX_EACCES,
+    );
+}
+
+#[test]
+fn copy_file_range_write_denied_dest_is_eacces() {
+    let mut sb = sandbox(program(&[], &[], &[], &[], &["dst.txt"]));
+    sb.host_create_file("src.txt", b"data");
+    sb.host_create_file("dst.txt", b"");
+    let src_inode = host_inode(&mut sb, "src.txt");
+    let dst_inode = host_inode(&mut sb, "dst.txt");
+    let src_handle = sb.fuse_open(src_inode, libc::O_RDONLY as u32).unwrap();
+    let dst_handle = sb.fuse_open(dst_inode, libc::O_RDONLY as u32).unwrap();
+    TestSandbox::assert_errno(
+        sb.fs.copyfilerange(
+            sb.ctx(),
+            src_inode,
+            src_handle,
+            0,
+            dst_inode,
+            dst_handle,
+            0,
+            4,
+            0,
+        ),
+        LINUX_EACCES,
+    );
+}

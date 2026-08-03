@@ -59,6 +59,30 @@ pub(crate) fn do_setattr(
         return Err(platform::erofs());
     }
 
+    #[cfg(target_os = "linux")]
+    if setattr_mutates(valid)
+        && let Some(policy) = fs.mask_policy()
+        && let Some(path) = inode::lexical_inode_path(fs, ino)
+        && let Ok(path) = super::mount_policy::LexicalPath::new(&path)
+    {
+        if policy.is_protected(&path) {
+            return Err(platform::eacces());
+        }
+        if matches!(
+            policy.decide_write(&path).decision,
+            super::mount_policy::WriteDecision::Deny
+        ) {
+            return Err(platform::eacces());
+        }
+        if matches!(
+            policy.decide(&path).decision,
+            super::mount_policy::Decision::Masked
+        ) && !fs.tagged_visible_for_inode(ino)
+        {
+            return Err(platform::enoent());
+        }
+    }
+
     // With xattr-overlay disabled, the only honest answer to a uid/gid change
     // is to reject it — the host process cannot chown(2) without CAP_CHOWN.
     if !fs.cfg.xattr_enabled() && valid.intersects(SetattrValid::UID | SetattrValid::GID) {
