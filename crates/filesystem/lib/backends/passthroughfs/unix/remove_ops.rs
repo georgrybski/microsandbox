@@ -20,6 +20,43 @@ use std::os::fd::RawFd;
 // Functions
 //--------------------------------------------------------------------------------------------------
 
+/// Check whether the directory opened at `fd` contains any entries (fd-relative).
+#[cfg(target_os = "linux")]
+fn dir_is_empty_linux(fd: RawFd) -> bool {
+    // SAFETY: `fd` is a valid open directory fd. `fdopendir` takes ownership; the fd is
+    // closed by `closedir` on success or by `close` on failure.
+    let dir = unsafe { libc::fdopendir(fd) };
+    if dir.is_null() {
+        // SAFETY: `fdopendir` failed, so the fd is still owned by us and is closed once here.
+        unsafe { libc::close(fd) };
+        return true;
+    }
+    loop {
+        // SAFETY: `dir` is a valid DIR* from `fdopendir`; setting errno is thread-local.
+        unsafe { *libc::__errno_location() = 0 };
+        // SAFETY: `dir` is a valid DIR* from `fdopendir`; the returned pointer is valid until
+        // the next call on this DIR* and is not freed here.
+        let ent = unsafe { libc::readdir(dir) };
+        if ent.is_null() {
+            break;
+        }
+        // SAFETY: `ent` is the valid dirent returned by `readdir`; its d_name is NUL-terminated
+        // and valid until the next call on this DIR*.
+        let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+        let bytes = name.to_bytes();
+        if bytes != b"." && bytes != b".." {
+            // SAFETY: `dir` is valid and owns the fd from `fdopendir`; `closedir` releases it
+            // once, and the DIR* is not used again.
+            unsafe { libc::closedir(dir) };
+            return false;
+        }
+    }
+    // SAFETY: `dir` is valid and owns the fd from `fdopendir`; `closedir` releases it once, and
+    // the DIR* is not used again.
+    unsafe { libc::closedir(dir) };
+    true
+}
+
 /// Linux `RENAME_EXCHANGE` flag: atomically swap source and destination.
 #[cfg(target_os = "linux")]
 const RENAME_EXCHANGE: u32 = 2;
@@ -338,7 +375,7 @@ fn cascade_remove(
     // lookup so no raw host path is consulted.
     let dir_synthetic_inode = dir_synthetic_inode.or_else(|| {
         inode::linux_alt_key_from_fd(dir_fd)
-            .ok()
+            .ok() // best-effort identity lookup; failure skips tag eviction safely
             .and_then(|alt_key| {
                 fs.inodes
                     .read()
@@ -380,10 +417,22 @@ fn cascade_remove_fd(
     }
 
     loop {
+        // Set errno to 0 before readdir so a NULL return can be distinguished from
+        // end-of-directory (errno remains 0) versus an actual error (errno is set).
+        // SAFETY: errno is thread-local and `__errno_location` returns a valid writable pointer.
+        unsafe { *libc::__errno_location() = 0 };
         // SAFETY: `dir` is a valid DIR* from `fdopendir`; the returned dirent pointer is
         // valid until the next readdir/closedir call on this DIR* and is not freed here.
         let ent = unsafe { libc::readdir(dir) };
         if ent.is_null() {
+            // SAFETY: errno is thread-local and `__errno_location` returns a valid readable
+            // pointer.
+            if unsafe { *libc::__errno_location() } != 0 {
+                // SAFETY: `dir` is valid and owns the fd from `fdopendir`; `closedir` releases
+                // it once, and the DIR* is not used again.
+                unsafe { libc::closedir(dir) };
+                return false;
+            }
             break;
         }
         // SAFETY: `ent` is the valid dirent returned by `readdir`; its d_name pointer is
@@ -465,16 +514,15 @@ fn cascade_remove_fd(
                         unsafe { libc::closedir(dir) };
                         return false;
                     }
-                    let child_synth =
-                        inode::linux_alt_key_from_fd(child_fd)
-                            .ok()
-                            .and_then(|alt_key| {
-                                fs.inodes
-                                    .read()
-                                    .unwrap()
-                                    .get_alt(&alt_key)
-                                    .map(|data| data.inode)
-                            });
+                    let child_synth = inode::linux_alt_key_from_fd(child_fd)
+                        .ok() // best-effort identity lookup; failure skips tag eviction safely
+                        .and_then(|alt_key| {
+                            fs.inodes
+                                .read()
+                                .unwrap()
+                                .get_alt(&alt_key)
+                                .map(|data| data.inode)
+                        });
                     // The recursive call consumes child_fd via closedir.
                     if !cascade_remove_fd(fs, child_fd, &child, depth + 1, child_synth, policy) {
                         // SAFETY: `dir` is valid and owns the fd from `fdopendir`; `closedir`
@@ -828,11 +876,23 @@ fn rmdir_admission(fs: &PassthroughFs, parent: u64, name: &CStr) -> io::Result<b
         policy.decide_child(&path, MOUNT_POLICY_PROBE_NAME).decision,
         super::mount_policy::Decision::Masked | super::mount_policy::Decision::TraversalOnly
     ) {
-        let host_path = fs.cfg.root_dir.join(path.as_str().unwrap_or_default());
-        if std::fs::read_dir(host_path)
-            .map(|mut entries| entries.next().is_none())
-            .unwrap_or(true)
-        {
+        // Check emptiness fd-relative to avoid constructing a raw host path.
+        let parent_fd = inode::get_inode_fd(fs, parent)?;
+        // SAFETY: `parent_fd` is a valid directory fd and `name` is a validated NUL-terminated
+        // name; libc does not retain the pointer after `openat` returns.
+        let child_fd = unsafe {
+            libc::openat(
+                parent_fd.raw(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+            )
+        };
+        if child_fd < 0 {
+            // Could not open the directory — treat as missing (ENOENT).
+            return Err(platform::enoent());
+        }
+        // `dir_is_empty_linux` takes ownership of child_fd and closes it internally.
+        if dir_is_empty_linux(child_fd) {
             return Err(platform::enoent());
         }
         return Ok(false);

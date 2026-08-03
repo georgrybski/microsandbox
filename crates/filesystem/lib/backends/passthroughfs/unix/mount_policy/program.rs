@@ -244,8 +244,10 @@ impl MountPolicyProgram {
 
     /// Evaluate the write-admission decision for a lexical path.
     ///
-    /// Protected paths deny. Otherwise the write allow/deny rules are applied in
-    /// order; the last non-frozen rule wins. Non-UTF-8 paths deny fail-closed.
+    /// Protected paths deny. Otherwise the write allow/deny rules are sorted by
+    /// authority scope (and allow before deny within a scope), then applied in
+    /// that order; the last non-frozen rule wins. Non-UTF-8 paths deny
+    /// fail-closed.
     pub fn decide_write(&self, path: &LexicalPath) -> Explained<WriteDecision, WriteRuleMatch> {
         let Some(text) = path.as_str() else {
             return Explained {
