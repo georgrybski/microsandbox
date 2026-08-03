@@ -477,7 +477,10 @@ impl PassthroughFs {
         let Some(alias) = inode::current_anchor_alias_for_policy(self, inode) else {
             return;
         };
-        let Ok(fd) = inode::open_inode_fd(self, inode, libc::O_PATH | libc::O_NOFOLLOW) else {
+        // O_NOFOLLOW is intentionally omitted: open_inode_fd reopens via
+        // /proc/self/fd/N (which would ELOOP with O_NOFOLLOW) and rejects real
+        // host symlinks itself via fstat. See inode::open_inode_fd.
+        let Ok(fd) = inode::open_inode_fd(self, inode, libc::O_PATH) else {
             return;
         };
         let Ok(key) = inode::linux_alt_key_from_fd(fd) else {
