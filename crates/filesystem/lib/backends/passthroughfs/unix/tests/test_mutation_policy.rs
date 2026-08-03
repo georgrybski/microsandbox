@@ -305,6 +305,37 @@ fn rename_overwrite_invalidates_target_tag() {
     TestSandbox::assert_errno(sb.lookup_root(".env"), LINUX_ENOENT);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn rename_exchange_identical_identity_evicts_tags() {
+    let sb = sandbox(program(&[".env", ".env2"], &[], &[], &[], &[]));
+    let (entry, _handle) = sb.fuse_create_root(".env").unwrap();
+    sb.fs
+        .link(
+            sb.ctx(),
+            entry.inode,
+            ROOT_INODE,
+            &TestSandbox::cstr(".env2"),
+        )
+        .unwrap();
+    assert!(sb.fs.tagged_visible(ROOT_INODE, b".env"));
+
+    sb.fs
+        .rename(
+            sb.ctx(),
+            ROOT_INODE,
+            &TestSandbox::cstr(".env"),
+            ROOT_INODE,
+            &TestSandbox::cstr(".env2"),
+            2,
+        )
+        .unwrap();
+    assert!(!sb.fs.tagged_visible(ROOT_INODE, b".env"));
+    assert!(!sb.fs.tagged_visible(ROOT_INODE, b".env2"));
+    TestSandbox::assert_errno(sb.lookup_root(".env"), LINUX_ENOENT);
+    TestSandbox::assert_errno(sb.lookup_root(".env2"), LINUX_ENOENT);
+}
+
 #[test]
 fn protect_is_untouchable_and_never_tagged() {
     let mut sb = sandbox(program(&[], &[], &[".workestrate"], &[], &[]));

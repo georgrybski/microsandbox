@@ -425,6 +425,10 @@ pub(crate) fn do_rename(
             if let Some((fd, target_key)) = target_probe.as_ref()
                 && *target_key == source_key
             {
+                if let Some(tags) = fs.tags() {
+                    tags.evict(olddir, oldname.to_bytes());
+                    tags.evict(newdir, newname.to_bytes());
+                }
                 unsafe { libc::close(*fd) };
                 return Ok(());
             }
