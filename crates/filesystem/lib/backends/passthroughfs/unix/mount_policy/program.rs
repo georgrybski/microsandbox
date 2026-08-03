@@ -9,6 +9,11 @@ use super::{LexicalPath, PathPolicyRule, RuleEffect, RuleOrigin};
 // Types
 //--------------------------------------------------------------------------------------------------
 
+/// Visibility decision for a path under a mount path policy.
+///
+/// `Visible` paths are exposed to the guest; `Masked` paths are hidden and
+/// their alias tags are honored; `TraversalOnly` paths are hidden themselves
+/// but a descendant may be unmasked by a later rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Decision {
@@ -17,6 +22,7 @@ pub enum Decision {
     TraversalOnly,
 }
 
+/// Write-admission decision for a path under a mount path policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WriteDecision {
@@ -24,6 +30,7 @@ pub enum WriteDecision {
     Deny,
 }
 
+/// Effect of a write-policy rule on a path's write admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WriteRuleEffect {
@@ -32,13 +39,16 @@ pub enum WriteRuleEffect {
     Protect,
 }
 
+/// A compiled set of allow/deny rules used for write admission.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CompiledRuleSet {
     pub allow: Vec<PathPolicyRule>,
     pub deny: Vec<PathPolicyRule>,
 }
+/// Alias for the write-admission rule set of a mount policy program.
 pub type WritePolicy = CompiledRuleSet;
 
+/// Case sensitivity for pattern matching in a mount path policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CaseSensitivity {
@@ -47,6 +57,7 @@ pub enum CaseSensitivity {
     Insensitive,
 }
 
+/// A single rule that matched during a [`MountPolicyProgram::decide`] evaluation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuleMatch {
     pub rule_index: usize,
@@ -56,6 +67,7 @@ pub struct RuleMatch {
     pub frozen_out: bool,
 }
 
+/// A single rule that matched during a [`MountPolicyProgram::decide_write`] evaluation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WriteRuleMatch {
     pub rule_index: usize,
@@ -65,6 +77,8 @@ pub struct WriteRuleMatch {
     pub frozen_out: bool,
 }
 
+/// The result of a policy evaluation: the decision plus the matched rules and
+/// provenance of any terminal freeze.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Explained<T, M = RuleMatch> {
     pub decision: T,
@@ -73,6 +87,11 @@ pub struct Explained<T, M = RuleMatch> {
     pub fail_closed_non_utf8: bool,
 }
 
+/// A compiled mount path-policy program (spec 22 §§4, 7, 10, 12, 13).
+///
+/// Holds the ordered mask/unmask rules, protected paths, write-admission
+/// policy, and case sensitivity. Evaluation is pure and fail-closed for
+/// non-UTF-8 paths.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MountPolicyProgram {
     pub version: u32,
@@ -97,6 +116,12 @@ struct MountPolicyProgramWire {
 //--------------------------------------------------------------------------------------------------
 
 impl MountPolicyProgram {
+    /// Evaluate the visibility decision for a lexical path.
+    ///
+    /// Protected paths always mask. Otherwise rules are applied in order; the
+    /// last non-frozen rule wins, and a masked directory whose descendant may be
+    /// unmasked becomes [`Decision::TraversalOnly`]. Non-UTF-8 paths mask
+    /// fail-closed.
     pub fn decide(&self, path: &LexicalPath) -> Explained<Decision> {
         let Some(text) = path.as_str() else {
             return Explained {
@@ -171,6 +196,10 @@ impl MountPolicyProgram {
         }
     }
 
+    /// Evaluate the write-admission decision for a lexical path.
+    ///
+    /// Protected paths deny. Otherwise the write allow/deny rules are applied in
+    /// order; the last non-frozen rule wins. Non-UTF-8 paths deny fail-closed.
     pub fn decide_write(&self, path: &LexicalPath) -> Explained<WriteDecision, WriteRuleMatch> {
         let Some(text) = path.as_str() else {
             return Explained {
@@ -263,6 +292,7 @@ impl MountPolicyProgram {
         }
     }
 
+    /// Whether any protect rule matches the given path.
     pub fn is_protected(&self, path: &LexicalPath) -> bool {
         self.protect.iter().any(|rule| {
             path.as_str()
@@ -270,6 +300,7 @@ impl MountPolicyProgram {
         })
     }
 
+    /// Evaluate the visibility decision for a child `name` under `dir`.
     pub fn decide_child(&self, dir: &LexicalPath, name: &str) -> Explained<Decision> {
         match dir.child(name) {
             Ok(path) => self.decide(&path),
@@ -282,6 +313,8 @@ impl MountPolicyProgram {
         }
     }
 
+    /// Whether any unmask rule could match a descendant of `dir`, so `dir` itself
+    /// must remain traversable even though it is masked.
     pub fn may_unmask_descendant(&self, dir: &LexicalPath) -> bool {
         if dir.is_non_utf8() {
             return false;

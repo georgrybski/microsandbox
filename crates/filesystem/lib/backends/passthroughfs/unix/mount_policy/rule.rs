@@ -9,6 +9,7 @@ use super::pattern::Pattern;
 // Types
 //--------------------------------------------------------------------------------------------------
 
+/// The effect a path-policy rule has on visibility: mask or unmask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuleEffect {
@@ -16,6 +17,7 @@ pub enum RuleEffect {
     Unmask,
 }
 
+/// The provenance scope of a policy rule, ordered by authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScopeKind {
@@ -27,6 +29,7 @@ pub enum ScopeKind {
     MountEntry,
 }
 
+/// Provenance of a policy rule: the layer, source file, and scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleOrigin {
     pub layer: String,
@@ -34,6 +37,7 @@ pub struct RuleOrigin {
     pub scope_kind: ScopeKind,
 }
 
+/// A single compiled path-policy rule: effect, pattern, overridability, origin.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PathPolicyRule {
     pub effect: RuleEffect,
@@ -47,12 +51,14 @@ pub struct PathPolicyRule {
 //--------------------------------------------------------------------------------------------------
 
 impl PathPolicyRule {
+    /// Whether this rule is terminal (non-overridable) and freezes further matches.
     pub fn is_terminal(&self) -> bool {
         !self.overridable
     }
 }
 
 impl ScopeKind {
+    /// Return the numeric authority rank of this scope (higher overrides lower).
     pub fn authority(self) -> u32 {
         self as u32
     }

@@ -10,6 +10,10 @@ use super::rule::RuleOrigin;
 // Types
 //--------------------------------------------------------------------------------------------------
 
+/// A compiled glob pattern for a mount path-policy rule (spec 22 §6).
+///
+/// Patterns are mount-root-relative and reject absolute paths, `..` escapes,
+/// and NUL bytes. Directory-only patterns (trailing `/`) only match directories.
 #[derive(Debug, Clone)]
 pub struct Pattern {
     raw: String,
@@ -18,12 +22,14 @@ pub struct Pattern {
     dir_only: bool,
 }
 
+/// The literal leading components of a [`Pattern`], used for descendant checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiteralPrefix {
     components: Vec<String>,
     extends_below: bool,
 }
 
+/// Why a [`Pattern`] failed to compile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatternErrorKind {
     Empty,
@@ -33,6 +39,7 @@ pub enum PatternErrorKind {
     InvalidGlob { pattern: String, message: String },
 }
 
+/// Error returned when a [`Pattern`] cannot be compiled, with optional provenance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatternError {
     kind: PatternErrorKind,
@@ -44,6 +51,12 @@ pub struct PatternError {
 //--------------------------------------------------------------------------------------------------
 
 impl Pattern {
+    /// Compile a [`Pattern`] from a raw glob string, recording the rule [`RuleOrigin`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`PatternError`] (see [`PatternErrorKind`]) if the pattern is
+    /// empty, absolute, contains `..` or a NUL byte, or is not a valid glob.
     pub fn compile(raw: &str, origin: &RuleOrigin) -> Result<Self, PatternError> {
         Self::compile_inner(raw).map_err(|kind| PatternError {
             kind,
@@ -51,6 +64,11 @@ impl Pattern {
         })
     }
 
+    /// Parse a [`Pattern`] without recording rule provenance.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`PatternError`] for the same reasons as [`Pattern::compile`].
     pub fn parse(raw: &str) -> Result<Self, PatternError> {
         Self::compile_inner(raw).map_err(|kind| PatternError { kind, origin: None })
     }
@@ -113,14 +131,17 @@ impl Pattern {
         })
     }
 
+    /// Whether the pattern matches the given path string.
     pub fn matches_path(&self, path: &str) -> bool {
         (!self.dir_only && self.is_match(path)) || self.matches_any_ancestor(path)
     }
 
+    /// Whether the pattern matches the given directory path string.
     pub fn matches_dir(&self, path: &str) -> bool {
         self.is_match(path) || self.matches_any_ancestor(path)
     }
 
+    /// Whether the pattern matches a path whose directory-ness is unknown.
     pub fn matches_unknown(&self, path: &str) -> bool {
         self.is_match(path) || self.matches_any_ancestor(path)
     }
@@ -140,6 +161,7 @@ impl Pattern {
         false
     }
 
+    /// Return the literal leading components, if any, for descendant analysis.
     pub fn literal_prefix(&self) -> Option<LiteralPrefix> {
         let body = self.raw.strip_suffix('/').unwrap_or(&self.raw);
         let total = body.split('/').count();
@@ -158,15 +180,18 @@ impl Pattern {
 }
 
 impl LiteralPrefix {
+    /// Return the literal leading components of the pattern.
     pub fn components(&self) -> &[String] {
         &self.components
     }
+    /// Whether the pattern extends below its literal prefix (i.e. has a glob tail).
     pub fn extends_below(&self) -> bool {
         self.extends_below
     }
 }
 
 impl PatternError {
+    /// Return the error kind for a [`PatternError`].
     pub fn kind(&self) -> &PatternErrorKind {
         &self.kind
     }

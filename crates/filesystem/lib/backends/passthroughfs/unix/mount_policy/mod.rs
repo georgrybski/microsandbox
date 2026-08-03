@@ -1,7 +1,5 @@
 //! Pure compiled mount path-policy types and evaluator (spec 22).
 
-#![allow(unused_imports)]
-
 mod lexical;
 mod pattern;
 mod program;
