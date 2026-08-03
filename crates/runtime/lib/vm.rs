@@ -42,7 +42,7 @@ use crate::heartbeat::{self, HeartbeatDecision, HeartbeatReader};
 use crate::logging::LogLevel;
 use crate::metrics::run_metrics_sampler;
 use crate::relay::{self, AgentRelay};
-use crate::{RuntimeError, RuntimeResult};
+use crate::{MountPolicyLoadError, RuntimeError, RuntimeResult};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -1900,22 +1900,22 @@ struct ParsedMountSpec {
 fn load_mount_policy(
     approved_root: &Path,
     policy_path: &str,
-) -> Result<MountPolicyProgram, String> {
+) -> Result<MountPolicyProgram, MountPolicyLoadError> {
     if policy_path.is_empty() || Path::new(policy_path).is_absolute() {
-        return Err("mount policy path must be a non-empty relative path".to_string());
+        return Err(MountPolicyLoadError::PathEscape);
     }
     let path = Path::new(policy_path);
     if path
         .components()
         .any(|component| matches!(component, Component::ParentDir))
     {
-        return Err("mount policy path escapes the approved state directory".to_string());
+        return Err(MountPolicyLoadError::PathEscape);
     }
 
     #[cfg(unix)]
     let bytes = {
         let root = std::ffi::CString::new(approved_root.as_os_str().as_bytes())
-            .map_err(|_| "invalid approved state directory".to_string())?;
+            .map_err(|error| MountPolicyLoadError::Io(std::io::Error::other(error)))?;
         // SAFETY: `root` is a valid CString built from the approved runtime
         // state directory. O_NOFOLLOW rejects symlinks and O_DIRECTORY requires
         // a directory, so the path cannot be redirected via a symlink swap.
@@ -1928,10 +1928,16 @@ fn load_mount_policy(
             )
         };
         if root_fd < 0 {
-            return Err(format!(
-                "cannot open approved state directory: {}",
-                std::io::Error::last_os_error()
-            ));
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                return Err(MountPolicyLoadError::SymlinkRejected);
+            }
+            if error.raw_os_error() == Some(libc::ENOENT) {
+                return Err(MountPolicyLoadError::FileNotFound(
+                    approved_root.display().to_string(),
+                ));
+            }
+            return Err(MountPolicyLoadError::Io(error));
         }
         let mut current = root_fd;
         let components: Vec<_> = path.components().collect();
@@ -1941,7 +1947,7 @@ fn load_mount_policy(
             // leaking it. It is not owned by any Rust object and is not used
             // again after this point (no double-close).
             unsafe { libc::close(current) };
-            return Err("mount policy path must be a non-empty relative path".to_string());
+            return Err(MountPolicyLoadError::PathEscape);
         }
         let mut bytes = Vec::new();
         for (index, component) in components.iter().enumerate() {
@@ -1949,7 +1955,7 @@ fn load_mount_policy(
                 continue;
             };
             let name = std::ffi::CString::new(name.as_bytes())
-                .map_err(|_| "invalid mount policy path component".to_string())?;
+                .map_err(|error| MountPolicyLoadError::Io(std::io::Error::other(error)))?;
             let flags = libc::O_RDONLY
                 | libc::O_CLOEXEC
                 | libc::O_NOFOLLOW
@@ -1973,11 +1979,12 @@ fn load_mount_policy(
                 // (no double-close).
                 unsafe { libc::close(current) };
                 if error.raw_os_error() == Some(libc::ELOOP) {
-                    return Err(
-                        "mount policy path escapes the approved state directory".to_string()
-                    );
+                    return Err(MountPolicyLoadError::SymlinkRejected);
                 }
-                return Err(format!("cannot open policy file: {error}"));
+                if error.raw_os_error() == Some(libc::ENOENT) {
+                    return Err(MountPolicyLoadError::FileNotFound(policy_path.to_string()));
+                }
+                return Err(MountPolicyLoadError::Io(error));
             }
             // SAFETY: `current` is a valid open fd that is no longer needed
             // once `next` has been obtained; closing it prevents fd leakage.
@@ -1992,7 +1999,7 @@ fn load_mount_policy(
                 // drop; `current` is not referenced again (no double-close).
                 let mut file = unsafe { std::fs::File::from_raw_fd(current) };
                 if let Err(error) = file.read_to_end(&mut bytes) {
-                    return Err(format!("cannot read policy file: {error}"));
+                    return Err(MountPolicyLoadError::Io(error));
                 }
             }
         }
@@ -2001,12 +2008,14 @@ fn load_mount_policy(
 
     #[cfg(unix)]
     {
-        serde_json::from_slice(&bytes)
-            .map_err(|error| format!("invalid mount policy JSON: {error}"))
+        serde_json::from_slice(&bytes).map_err(MountPolicyLoadError::from)
     }
 
     #[cfg(not(unix))]
-    Err("mount policy loading is unsupported on this platform".to_string())
+    Err(MountPolicyLoadError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "mount policy loading is unsupported on this platform",
+    )))
 }
 
 /// Parse a `--mount` spec into [`ParsedMountSpec`].
