@@ -313,6 +313,11 @@ fn cascade_remove(
                 } else if std::fs::remove_file(entry.path()).is_err() {
                     return false;
                 }
+                if let Some(parent_inode) = dir_synthetic_inode
+                    && let Some(tags) = fs.tags()
+                {
+                    tags.evict(parent_inode, name.as_bytes());
+                }
             }
         }
     }

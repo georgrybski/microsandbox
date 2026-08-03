@@ -254,6 +254,26 @@ fn cascade_uses_correct_parent_for_tagged_check() {
 }
 
 #[test]
+fn cascade_evicts_descendant_tags() {
+    let mut sb = sandbox(program(&["dir/**"], &[], &[], &[], &[]));
+    sb.host_create_dir("dir");
+    sb.host_create_file("dir/untagged.txt", b"host");
+    let dir = host_inode(&mut sb, "dir");
+    sb.fuse_create(dir, "tagged.txt", 0o644).unwrap();
+    assert!(sb.fs.tagged_visible(dir, b"tagged.txt"));
+
+    sb.fs
+        .unlink(sb.ctx(), dir, &TestSandbox::cstr("tagged.txt"))
+        .unwrap();
+    assert!(!sb.fs.tagged_visible(dir, b"tagged.txt"));
+    sb.fs
+        .rmdir(sb.ctx(), ROOT_INODE, &TestSandbox::cstr("dir"))
+        .unwrap();
+    assert!(!sb.root.join("dir").exists());
+    assert!(!sb.fs.tagged_visible(dir, b"tagged.txt"));
+}
+
+#[test]
 fn rename_masked_untagged_source_is_enoent_anti_laundering() {
     let sb = sandbox(program(&[".env"], &[], &[], &[], &[]));
     sb.host_create_file(".env", b"secret");
