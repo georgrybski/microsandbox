@@ -109,6 +109,8 @@ pub(crate) fn do_open(
     #[cfg(target_os = "linux")]
     if masked_policy_path {
         if inode::lexical_inode_path(fs, inode).is_none() {
+            // SAFETY: `fd` is a valid fd returned by `open_inode_fd`; the lexical path
+            // disappeared, so it is closed here and not referenced again.
             unsafe { libc::close(fd) };
             return Err(platform::enoent());
         }
@@ -117,6 +119,8 @@ pub(crate) fn do_open(
                 .and_then(|alias| tags.get_identity(alias.parent, &alias.name))
         });
         if stored.is_none() && !write_intent {
+            // SAFETY: `fd` is a valid fd returned by `open_inode_fd`; no stored identity
+            // exists for this read-only alias, so it is closed and not used again.
             unsafe { libc::close(fd) };
             return Err(platform::enoent());
         }
@@ -124,6 +128,8 @@ pub(crate) fn do_open(
             let actual = match inode::linux_alt_key_from_fd(fd) {
                 Ok(actual) => actual,
                 Err(err) => {
+                    // SAFETY: `fd` is a valid fd returned by `open_inode_fd`; identity lookup
+                    // failed, so it is closed here and not referenced again.
                     unsafe { libc::close(fd) };
                     return Err(err);
                 }
@@ -134,6 +140,8 @@ pub(crate) fn do_open(
                 {
                     tags.evict(alias.parent, &alias.name);
                 }
+                // SAFETY: `fd` is a valid fd returned by `open_inode_fd`; the identity
+                // mismatch evicted the alias, so it is closed and not used again.
                 unsafe { libc::close(fd) };
                 return Err(platform::enoent());
             }
@@ -162,6 +170,8 @@ pub(crate) fn do_open(
         }
     }
 
+    // SAFETY: `fd` is a valid fd from `open_inode_fd`; `from_raw_fd` takes ownership so
+    // `File` closes it on drop, and `fd` is not referenced again.
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
 
     let handle = fs.next_handle.fetch_add(1, Ordering::Relaxed);
@@ -295,6 +305,8 @@ pub(crate) fn do_flush(
     let data = handles.get(&handle).ok_or_else(platform::ebadf)?;
     let f = data.file.read().unwrap();
 
+    // SAFETY: `f.as_raw_fd()` is a valid owned fd from the handle; `dup` returns a new fd,
+    // which is checked before use.
     let newfd = unsafe { libc::dup(f.as_raw_fd()) };
     if newfd < 0 {
         let err = io::Error::last_os_error();
@@ -305,6 +317,8 @@ pub(crate) fn do_flush(
         }
         return Err(platform::linux_error(err));
     }
+    // SAFETY: `newfd` is the valid dup'd fd returned above; it is closed once to trigger
+    // POSIX lock release and is not used again.
     let ret = unsafe { libc::close(newfd) };
     if ret < 0 {
         return Err(platform::linux_error(io::Error::last_os_error()));

@@ -52,6 +52,8 @@ pub(crate) fn do_unlink(
 
     #[cfg(target_os = "linux")]
     let pre_unlink_fd = {
+        // SAFETY: `parent_fd` is a valid directory fd and `name` is a valid NUL-terminated
+        // name; libc does not retain the pointer after `openat` returns.
         let fd = unsafe {
             libc::openat(
                 parent_fd.raw(),
@@ -67,6 +69,8 @@ pub(crate) fn do_unlink(
         Some(fd) => match inode::linux_alt_key_from_fd(fd) {
             Ok(key) => Some(key),
             Err(err) => {
+                // SAFETY: `fd` is a valid O_PATH fd from `openat`; it is closed on this
+                // error path and not referenced again.
                 unsafe { libc::close(fd) };
                 return Err(err);
             }
@@ -77,6 +81,8 @@ pub(crate) fn do_unlink(
     // On macOS, grab an fd before unlink to keep the file data alive.
     #[cfg(target_os = "macos")]
     let pre_unlink_fd = {
+        // SAFETY: `parent_fd` is a valid directory fd and `name` is a valid NUL-terminated
+        // name; libc does not retain the pointer after `openat` returns.
         let fd = unsafe {
             libc::openat(
                 parent_fd.raw(),
@@ -87,14 +93,20 @@ pub(crate) fn do_unlink(
         if fd >= 0 { Some(fd) } else { None }
     };
 
+    // SAFETY: `parent_fd` is valid and `name` points to a validated C string; libc uses the
+    // pointer only for the duration of `unlinkat`.
     let ret = unsafe { libc::unlinkat(parent_fd.raw(), name.as_ptr(), 0) };
     if ret < 0 {
         #[cfg(target_os = "linux")]
         if let Some(fd) = pre_unlink_fd {
+            // SAFETY: `fd` is the valid probe fd from `openat`; unlink failed, so it is
+            // closed here and not used again.
             unsafe { libc::close(fd) };
         }
         #[cfg(target_os = "macos")]
         if let Some(fd) = pre_unlink_fd {
+            // SAFETY: `fd` is the valid pre-unlink fd from `openat`; unlink failed, so it is
+            // closed here and not used again.
             unsafe { libc::close(fd) };
         }
         return Err(platform::linux_error(io::Error::last_os_error()));
@@ -110,12 +122,18 @@ pub(crate) fn do_unlink(
                 if detached {
                     inode::store_unlinked_fd(&data, fd);
                 } else {
+                    // SAFETY: `fd` is a valid probe fd from `openat`; ownership was not
+                    // transferred, so it is closed once and not used again.
                     unsafe { libc::close(fd) };
                 }
             } else {
+                // SAFETY: `fd` is a valid probe fd from `openat`; no inode retained it, so
+                // it is closed once and not used again.
                 unsafe { libc::close(fd) };
             }
         } else {
+            // SAFETY: `fd` is a valid probe fd from `openat`; no inode retained it, so it is
+            // closed once and not used again.
             unsafe { libc::close(fd) };
         }
     }
@@ -140,9 +158,13 @@ pub(crate) fn do_unlink(
                 inode::store_unlinked_fd(data, fd);
             } else {
                 // No tracked inode — close the fd.
+                // SAFETY: `fd` is a valid pre-unlink fd from `openat`; no inode retained it,
+                // so it is closed once and not used again.
                 unsafe { libc::close(fd) };
             }
         } else {
+            // SAFETY: `fd` is a valid pre-unlink fd from `openat`; fstat failed, so it is
+            // closed once and not used again.
             unsafe { libc::close(fd) };
         }
     }
@@ -173,6 +195,8 @@ pub(crate) fn do_rmdir(
 
     #[cfg(target_os = "linux")]
     let pre_rmdir_fd = {
+        // SAFETY: `parent_fd` is a valid directory fd and `name` is a valid NUL-terminated
+        // name; libc does not retain the pointer after `openat` returns.
         let fd = unsafe {
             libc::openat(
                 parent_fd.raw(),
@@ -188,6 +212,8 @@ pub(crate) fn do_rmdir(
         Some(fd) => match inode::linux_alt_key_from_fd(fd) {
             Ok(key) => Some(key),
             Err(err) => {
+                // SAFETY: `fd` is a valid O_PATH fd from `openat`; it is closed on this
+                // error path and not referenced again.
                 unsafe { libc::close(fd) };
                 return Err(err);
             }
@@ -195,6 +221,8 @@ pub(crate) fn do_rmdir(
         None => None,
     };
 
+    // SAFETY: `parent_fd` is valid and `name` points to a validated C string; libc uses the
+    // pointer only for the duration of `unlinkat`.
     let ret = unsafe { libc::unlinkat(parent_fd.raw(), name.as_ptr(), libc::AT_REMOVEDIR) };
     if ret < 0 {
         let initial_errno = io::Error::last_os_error().raw_os_error();
@@ -210,12 +238,16 @@ pub(crate) fn do_rmdir(
             )
             && cascade_remove(fs, &lexical, 0, None)
         {
+            // SAFETY: `parent_fd` is valid and `name` points to a validated C string; libc
+            // uses the pointer only for the duration of `unlinkat`.
             let retry =
                 unsafe { libc::unlinkat(parent_fd.raw(), name.as_ptr(), libc::AT_REMOVEDIR) };
             if retry == 0 {
                 // Continue through the ordinary successful-rmdir cleanup below.
             } else {
                 if let Some(fd) = pre_rmdir_fd {
+                    // SAFETY: `fd` is a valid probe fd from `openat`; retry failed, so it is
+                    // closed once and not used again.
                     unsafe { libc::close(fd) };
                 }
                 return Err(io::Error::from_raw_os_error(libc::ENOTEMPTY));
@@ -223,6 +255,8 @@ pub(crate) fn do_rmdir(
         } else {
             #[cfg(target_os = "linux")]
             if let Some(fd) = pre_rmdir_fd {
+                // SAFETY: `fd` is a valid probe fd from `openat`; rmdir failed, so it is
+                // closed once and not used again.
                 unsafe { libc::close(fd) };
             }
             return Err(io::Error::from_raw_os_error(
@@ -241,12 +275,18 @@ pub(crate) fn do_rmdir(
                 if detached {
                     inode::store_unlinked_fd(&data, fd);
                 } else {
+                    // SAFETY: `fd` is a valid probe fd from `openat`; ownership was not
+                    // transferred, so it is closed once and not used again.
                     unsafe { libc::close(fd) };
                 }
             } else {
+                // SAFETY: `fd` is a valid probe fd from `openat`; no inode retained it, so it
+                // is closed once and not used again.
                 unsafe { libc::close(fd) };
             }
         } else {
+            // SAFETY: `fd` is a valid probe fd from `openat`; no inode retained it, so it is
+            // closed once and not used again.
             unsafe { libc::close(fd) };
         }
     }
@@ -323,40 +363,58 @@ fn cascade_remove_fd(
     policy: &super::mount_policy::MountPolicyProgram,
 ) -> bool {
     if depth > 64 {
+        // SAFETY: `dir_fd` is a valid directory fd owned by this function; the depth limit
+        // aborts recursion, so it is closed once and not used again.
         unsafe { libc::close(dir_fd) };
         return false;
     }
 
+    // SAFETY: `dir_fd` is a valid open directory fd; `fdopendir` takes ownership and
+    // `closedir` closes it, so it is not closed separately after success.
     let dir = unsafe { libc::fdopendir(dir_fd) };
     if dir.is_null() {
+        // SAFETY: `fdopendir` failed and did not take ownership; `dir_fd` is valid and is
+        // closed once here, not used again.
         unsafe { libc::close(dir_fd) };
         return false;
     }
 
     loop {
+        // SAFETY: `dir` is a valid DIR* from `fdopendir`; the returned dirent pointer is
+        // valid until the next readdir/closedir call on this DIR* and is not freed here.
         let ent = unsafe { libc::readdir(dir) };
         if ent.is_null() {
             break;
         }
+        // SAFETY: `ent` is the valid dirent returned by `readdir`; its d_name pointer is
+        // valid within the dirent lifetime, and `to_owned` copies it before the next call.
         let name_owned = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) }.to_owned();
         let name_bytes = name_owned.as_bytes();
         if name_bytes == b"." || name_bytes == b".." {
             continue;
         }
         let Some(name_str) = std::str::from_utf8(name_bytes).ok() else {
+            // SAFETY: `dir` is valid and owns the fd from `fdopendir`; `closedir` releases it
+            // once, and the DIR* is not used again.
             unsafe { libc::closedir(dir) };
             return false;
         };
         let Ok(child) = lexical.child(name_str) else {
+            // SAFETY: `dir` is valid and owns the fd from `fdopendir`; `closedir` releases it
+            // once, and the DIR* is not used again.
             unsafe { libc::closedir(dir) };
             return false;
         };
         if policy.is_protected(&child) {
+            // SAFETY: `dir` is valid and owns the fd from `fdopendir`; `closedir` releases it
+            // once, and the DIR* is not used again.
             unsafe { libc::closedir(dir) };
             return false;
         }
         match policy.decide(&child).decision {
             super::mount_policy::Decision::Visible => {
+                // SAFETY: `dir` is valid and owns the fd from `fdopendir`; `closedir` releases
+                // it once, and the DIR* is not used again.
                 unsafe { libc::closedir(dir) };
                 return false;
             }
@@ -364,13 +422,19 @@ fn cascade_remove_fd(
                 if dir_synthetic_inode
                     .is_some_and(|parent| fs.tagged_visible(parent, name_bytes)) =>
             {
+                // SAFETY: `dir` is valid and owns the fd from `fdopendir`; `closedir` releases
+                // it once, and the DIR* is not used again.
                 unsafe { libc::closedir(dir) };
                 return false;
             }
             super::mount_policy::Decision::Masked
             | super::mount_policy::Decision::TraversalOnly => {
                 // Determine entry type without following symlinks.
+                // SAFETY: zeroed stat struct is safe because all-zero bytes is a valid
+                // initialization for libc::stat; all fields are overwritten by fstatat before use.
                 let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                // SAFETY: `dir_fd` is valid, `name_owned` points to a live NUL-terminated
+                // name, and `&mut st` is valid for writes for the duration of fstatat.
                 let ret = unsafe {
                     libc::fstatat(
                         dir_fd,
@@ -380,10 +444,14 @@ fn cascade_remove_fd(
                     )
                 };
                 if ret < 0 {
+                    // SAFETY: `dir` is valid and owns the fd from `fdopendir`; `closedir`
+                    // releases it once, and the DIR* is not used again.
                     unsafe { libc::closedir(dir) };
                     return false;
                 }
                 if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                    // SAFETY: `dir_fd` is valid and `name_owned` is a live NUL-terminated
+                    // name; libc does not retain the pointer after openat returns.
                     let child_fd = unsafe {
                         libc::openat(
                             dir_fd,
@@ -392,6 +460,8 @@ fn cascade_remove_fd(
                         )
                     };
                     if child_fd < 0 {
+                        // SAFETY: `dir` is valid and owns the fd from `fdopendir`; `closedir`
+                        // releases it once, and the DIR* is not used again.
                         unsafe { libc::closedir(dir) };
                         return false;
                     }
@@ -407,20 +477,30 @@ fn cascade_remove_fd(
                             });
                     // The recursive call consumes child_fd via closedir.
                     if !cascade_remove_fd(fs, child_fd, &child, depth + 1, child_synth, policy) {
+                        // SAFETY: `dir` is valid and owns the fd from `fdopendir`; `closedir`
+                        // releases it once, and the DIR* is not used again.
                         unsafe { libc::closedir(dir) };
                         return false;
                     }
+                    // SAFETY: `dir_fd` is valid and `name_owned` points to a live C string;
+                    // libc uses the pointer only for the duration of unlinkat.
                     let ret =
                         unsafe { libc::unlinkat(dir_fd, name_owned.as_ptr(), libc::AT_REMOVEDIR) };
                     if ret < 0 {
+                        // SAFETY: `dir` is valid and owns the fd from `fdopendir`; `closedir`
+                        // releases it once, and the DIR* is not used again.
                         unsafe { libc::closedir(dir) };
                         return false;
                     }
                 } else {
                     // Non-directory (file, symlink, special): unlink the entry
                     // itself; never follow a symlink target.
+                    // SAFETY: `dir_fd` is valid and `name_owned` points to a live C string;
+                    // libc uses the pointer only for the duration of unlinkat.
                     let ret = unsafe { libc::unlinkat(dir_fd, name_owned.as_ptr(), 0) };
                     if ret < 0 {
+                        // SAFETY: `dir` is valid and owns the fd from `fdopendir`; `closedir`
+                        // releases it once, and the DIR* is not used again.
                         unsafe { libc::closedir(dir) };
                         return false;
                     }
@@ -434,6 +514,8 @@ fn cascade_remove_fd(
         }
     }
 
+    // SAFETY: `dir` is valid and owns the fd from `fdopendir`; `closedir` releases it once,
+    // and the DIR* is not used again.
     unsafe { libc::closedir(dir) };
     true
 }
@@ -471,6 +553,8 @@ pub(crate) fn do_rename(
 
     #[cfg(target_os = "linux")]
     {
+        // SAFETY: `old_fd` is a valid directory fd and `oldname` is a validated C string;
+        // libc does not retain the pointer after openat returns.
         let source_probe_fd = unsafe {
             libc::openat(
                 old_fd.raw(),
@@ -484,12 +568,18 @@ pub(crate) fn do_rename(
         let source_key = match inode::linux_alt_key_from_fd(source_probe_fd) {
             Ok(key) => key,
             Err(err) => {
+                // SAFETY: `source_probe_fd` is a valid fd from openat; it is closed once on
+                // this error path and not referenced again.
                 unsafe { libc::close(source_probe_fd) };
                 return Err(err);
             }
         };
+        // SAFETY: `source_probe_fd` is a valid fd from openat; its identity was read and it is
+        // closed once here, with no subsequent references.
         unsafe { libc::close(source_probe_fd) };
 
+        // SAFETY: `new_fd` is a valid directory fd and `newname` is a validated C string;
+        // libc does not retain the pointer after openat returns.
         let target_probe_fd = unsafe {
             libc::openat(
                 new_fd.raw(),
@@ -501,6 +591,8 @@ pub(crate) fn do_rename(
             let target_key = match inode::linux_alt_key_from_fd(target_probe_fd) {
                 Ok(key) => key,
                 Err(err) => {
+                    // SAFETY: `target_probe_fd` is a valid fd from openat; it is closed once
+                    // on this error path and not referenced again.
                     unsafe { libc::close(target_probe_fd) };
                     return Err(err);
                 }
@@ -512,6 +604,8 @@ pub(crate) fn do_rename(
             return Err(platform::linux_error(io::Error::last_os_error()));
         };
 
+        // SAFETY: directory fds are valid, names are validated C strings, and libc uses the
+        // pointers only for this syscall; no pointer outlives the call.
         let ret = unsafe {
             libc::syscall(
                 libc::SYS_renameat2,
@@ -524,6 +618,8 @@ pub(crate) fn do_rename(
         };
         if ret < 0 {
             if let Some((fd, _)) = target_probe {
+                // SAFETY: `fd` is a valid target probe fd from openat; rename failed, so it is
+                // closed once and not used again.
                 unsafe { libc::close(fd) };
             }
             return Err(platform::linux_error(io::Error::last_os_error()));
@@ -542,6 +638,8 @@ pub(crate) fn do_rename(
                     tags.evict(olddir, oldname.to_bytes());
                     tags.evict(newdir, newname.to_bytes());
                 }
+                // SAFETY: `*fd` is a valid target probe fd from openat; it is closed once after
+                // the exchange and not used again.
                 unsafe { libc::close(*fd) };
                 return Ok(());
             }
@@ -556,6 +654,8 @@ pub(crate) fn do_rename(
                     let _ = inode::remove_alias_locked(&mut inodes, &target, &new_alias);
                     inode::register_alias_locked(&mut inodes, &target, old_alias);
                 }
+                // SAFETY: `fd` is a valid target probe fd from openat; ownership was not
+                // transferred, so it is closed once and not used again.
                 unsafe { libc::close(fd) };
             }
             if let Some(tags) = fs.tags() {
@@ -576,12 +676,18 @@ pub(crate) fn do_rename(
                         if detached {
                             inode::store_unlinked_fd(&target, fd);
                         } else {
+                            // SAFETY: `fd` is a valid target probe fd from openat; ownership was
+                            // not transferred, so it is closed once and not used again.
                             unsafe { libc::close(fd) };
                         }
                     } else {
+                        // SAFETY: `fd` is a valid target probe fd from openat; ownership was not
+                        // transferred, so it is closed once and not used again.
                         unsafe { libc::close(fd) };
                     }
                 } else {
+                    // SAFETY: `fd` is a valid target probe fd from openat; no inode retained it,
+                    // so it is closed once and not used again.
                     unsafe { libc::close(fd) };
                 }
             }
@@ -595,6 +701,8 @@ pub(crate) fn do_rename(
     #[cfg(target_os = "macos")]
     {
         if flags == 0 {
+            // SAFETY: directory fds are valid, names are validated C strings, and libc uses the
+            // pointers only for this call; no pointer outlives the call.
             let ret = unsafe {
                 libc::renameat(
                     old_fd.raw(),
@@ -620,6 +728,8 @@ pub(crate) fn do_rename(
                 macos_flags |= 0x00000002; // RENAME_SWAP
             }
 
+            // SAFETY: directory fds are valid, names are validated C strings, and libc uses the
+            // pointers only for this call; no pointer outlives the call.
             let ret = unsafe {
                 libc::renameatx_np(
                     old_fd.raw(),
