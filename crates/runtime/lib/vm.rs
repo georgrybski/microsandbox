@@ -1999,10 +1999,14 @@ fn load_mount_policy(
         bytes
     };
 
-    #[cfg(not(unix))]
-    let bytes = return Err("mount policy loading is unsupported on this platform".to_string());
+    #[cfg(unix)]
+    {
+        serde_json::from_slice(&bytes)
+            .map_err(|error| format!("invalid mount policy JSON: {error}"))
+    }
 
-    serde_json::from_slice(&bytes).map_err(|error| format!("invalid mount policy JSON: {error}"))
+    #[cfg(not(unix))]
+    Err("mount policy loading is unsupported on this platform".to_string())
 }
 
 /// Parse a `--mount` spec into [`ParsedMountSpec`].
