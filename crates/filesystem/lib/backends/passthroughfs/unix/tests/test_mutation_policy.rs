@@ -338,25 +338,21 @@ fn rename_exchange_identical_identity_evicts_tags() {
 
 #[test]
 fn protect_is_untouchable_and_never_tagged() {
-    let mut sb = sandbox(program(&[], &[], &[".workestrate"], &[], &[]));
-    sb.host_create_dir(".workestrate");
-    let inode = host_inode(&mut sb, ".workestrate");
-    TestSandbox::assert_errno(sb.lookup_root(".workestrate"), LINUX_ENOENT);
-    assert!(
-        !names(&sb, ROOT_INODE)
-            .iter()
-            .any(|name| name == b".workestrate")
-    );
-    TestSandbox::assert_errno(sb.fuse_create_root(".workestrate"), LINUX_EACCES);
+    let mut sb = sandbox(program(&[], &[], &[".secret"], &[], &[]));
+    sb.host_create_dir(".secret");
+    let inode = host_inode(&mut sb, ".secret");
+    TestSandbox::assert_errno(sb.lookup_root(".secret"), LINUX_ENOENT);
+    assert!(!names(&sb, ROOT_INODE).iter().any(|name| name == b".secret"));
+    TestSandbox::assert_errno(sb.fuse_create_root(".secret"), LINUX_EACCES);
     TestSandbox::assert_errno(sb.fuse_open(inode, libc::O_WRONLY as u32), LINUX_EACCES);
     TestSandbox::assert_errno(
         sb.fs
-            .unlink(sb.ctx(), ROOT_INODE, &TestSandbox::cstr(".workestrate")),
+            .unlink(sb.ctx(), ROOT_INODE, &TestSandbox::cstr(".secret")),
         LINUX_ENOENT,
     );
-    TestSandbox::assert_errno(rename(&sb, ".workestrate", "x"), LINUX_ENOENT);
-    TestSandbox::assert_errno(rename(&sb, "x", ".workestrate"), LINUX_ENOENT);
-    TestSandbox::assert_errno(sb.lookup_root(".workestrate"), LINUX_ENOENT);
+    TestSandbox::assert_errno(rename(&sb, ".secret", "x"), LINUX_ENOENT);
+    TestSandbox::assert_errno(rename(&sb, "x", ".secret"), LINUX_ENOENT);
+    TestSandbox::assert_errno(sb.lookup_root(".secret"), LINUX_ENOENT);
 }
 
 #[test]
