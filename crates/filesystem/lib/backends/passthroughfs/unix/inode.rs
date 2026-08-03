@@ -341,6 +341,10 @@ fn do_lookup_linux(
                 .tags()
                 .and_then(|tags| tags.get_identity(parent, name.to_bytes()))
             else {
+                // SAFETY: `fd` is a valid O_PATH fd for the looked-up entry. No
+                // tag identity is recorded for this masked alias, so the
+                // lookup fails closed (ENOENT). The fd is not owned elsewhere
+                // and is not used again after close (no double-close).
                 unsafe { libc::close(fd) };
                 return Err(platform::enoent());
             };
@@ -348,6 +352,11 @@ fn do_lookup_linux(
                 if let Some(tags) = fs.tags() {
                     tags.evict(parent, name.to_bytes());
                 }
+                // SAFETY: `fd` is a valid O_PATH fd whose recorded tag identity
+                // no longer matches the entry's current identity (rename race);
+                // the alias is evicted and the lookup fails closed (ENOENT).
+                // The fd is not owned elsewhere and is not used again after
+                // close (no double-close).
                 unsafe { libc::close(fd) };
                 return Err(platform::enoent());
             }

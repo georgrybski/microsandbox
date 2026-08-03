@@ -1916,6 +1916,11 @@ fn load_mount_policy(
     let bytes = {
         let root = std::ffi::CString::new(approved_root.as_os_str().as_bytes())
             .map_err(|_| "invalid approved state directory".to_string())?;
+        // SAFETY: `root` is a valid CString built from the approved runtime
+        // state directory. O_NOFOLLOW rejects symlinks and O_DIRECTORY requires
+        // a directory, so the path cannot be redirected via a symlink swap.
+        // The path is the approved state dir, not guest-controlled. The
+        // returned fd is checked (< 0) before use.
         let root_fd = unsafe {
             libc::open(
                 root.as_ptr(),
@@ -1931,6 +1936,10 @@ fn load_mount_policy(
         let mut current = root_fd;
         let components: Vec<_> = path.components().collect();
         if components.is_empty() {
+            // SAFETY: `current` is the valid root_fd opened above. The path is
+            // empty so we bail before descending; close the fd to avoid
+            // leaking it. It is not owned by any Rust object and is not used
+            // again after this point (no double-close).
             unsafe { libc::close(current) };
             return Err("mount policy path must be a non-empty relative path".to_string());
         }
@@ -1949,9 +1958,19 @@ fn load_mount_policy(
                 } else {
                     0
                 };
+            // SAFETY: `current` is a valid open directory fd (the root_fd or a
+            // previously opened component). `name` is a valid CString for one
+            // path component. flags include O_NOFOLLOW (rejects symlinks) and
+            // O_DIRECTORY for intermediate components, so the path cannot
+            // escape the approved root via a symlink swap. The returned fd is
+            // checked (< 0) before use.
             let next = unsafe { libc::openat(current, name.as_ptr(), flags) };
             if next < 0 {
                 let error = std::io::Error::last_os_error();
+                // SAFETY: `current` is a valid open fd that we are abandoning
+                // because the next component could not be opened. It is not
+                // owned by any Rust object and is not used again after close
+                // (no double-close).
                 unsafe { libc::close(current) };
                 if error.raw_os_error() == Some(libc::ELOOP) {
                     return Err(
@@ -1960,9 +1979,17 @@ fn load_mount_policy(
                 }
                 return Err(format!("cannot open policy file: {error}"));
             }
+            // SAFETY: `current` is a valid open fd that is no longer needed
+            // once `next` has been obtained; closing it prevents fd leakage.
+            // It is not owned by any Rust object and is not referenced again
+            // after close (no double-close).
             unsafe { libc::close(current) };
             current = next;
             if index + 1 == components.len() {
+                // SAFETY: `current` is the fd of the final policy file
+                // component, valid and not owned by any other Rust object.
+                // from_raw_fd takes ownership so the File closes `current` on
+                // drop; `current` is not referenced again (no double-close).
                 let mut file = unsafe { std::fs::File::from_raw_fd(current) };
                 if let Err(error) = file.read_to_end(&mut bytes) {
                     return Err(format!("cannot read policy file: {error}"));

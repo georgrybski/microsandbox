@@ -80,11 +80,19 @@ impl TagStore {
         fd: RawFd,
         alt_key: InodeAltKey,
     ) -> io::Result<()> {
+        // SAFETY: `fd` is a valid open descriptor passed by the caller (an
+        // O_PATH fd from openat). F_DUPFD_CLOEXEC returns a new fd with
+        // FD_CLOEXEC set; the original `fd` stays owned by the caller and is
+        // not closed here. The return value is checked (< 0) before use.
         let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
         if dup < 0 {
             return Err(io::Error::last_os_error());
         }
         let value = TagValue {
+            // SAFETY: `dup` is a freshly duplicated fd from fcntl above that
+            // is valid and not owned by any other Rust object. from_raw_fd
+            // takes ownership so the resulting File closes `dup` on drop; `dup`
+            // is not referenced again (no double-close).
             file: unsafe { std::fs::File::from_raw_fd(dup) },
             alt_key,
         };

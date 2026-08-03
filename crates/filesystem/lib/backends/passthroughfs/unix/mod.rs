@@ -481,10 +481,17 @@ impl PassthroughFs {
             return;
         };
         let Ok(key) = inode::linux_alt_key_from_fd(fd) else {
+            // SAFETY: `fd` is a valid O_PATH fd from open_inode_fd whose identity
+            // could not be resolved, so tagging is skipped. It is not owned by any
+            // Rust object and is not used again after close (no double-close).
             unsafe { libc::close(fd) };
             return;
         };
         let _ = tags.tag(alias.parent, &alias.name, fd, key);
+        // SAFETY: `fd` is a valid O_PATH fd from open_inode_fd. tags.tag()
+        // duplicates it via F_DUPFD_CLOEXEC (owning the duplicate), so the
+        // original `fd` is no longer needed and is closed here. It is not used
+        // again after close (no double-close).
         unsafe { libc::close(fd) };
     }
 
@@ -497,6 +504,10 @@ impl PassthroughFs {
         let Ok(name) = std::ffi::CString::new(name) else {
             return;
         };
+        // SAFETY: `parent_fd.raw()` is a valid open directory fd for the parent
+        // inode, and `name` is a valid CString built from a validated guest
+        // name. O_NOFOLLOW rejects symlinks so the child entry itself is pinned
+        // rather than its target. The returned fd is checked (< 0) before use.
         let fd = unsafe {
             libc::openat(
                 parent_fd.raw(),
@@ -510,6 +521,10 @@ impl PassthroughFs {
         if let Ok(key) = inode::linux_alt_key_from_fd(fd) {
             let _ = tags.tag(parent, name.as_bytes(), fd, key);
         }
+        // SAFETY: `fd` is a valid O_PATH fd from the openat above. tags.tag()
+        // (when the key resolved) duplicates it, so the original is closed
+        // here; on key-resolution failure the fd is also closed. It is not used
+        // again after close (no double-close).
         unsafe { libc::close(fd) };
     }
 }
