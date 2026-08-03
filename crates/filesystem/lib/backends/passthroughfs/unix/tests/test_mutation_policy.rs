@@ -72,6 +72,13 @@ fn host_inode(sb: &mut TestSandbox, name: &str) -> u64 {
     inode
 }
 
+fn host_child_inode(sb: &mut TestSandbox, parent: u64, name: &str) -> u64 {
+    let policy = sb.fs.cfg.mask_policy.take();
+    let inode = sb.lookup(parent, name).unwrap().inode;
+    sb.fs.cfg.mask_policy = policy;
+    inode
+}
+
 fn names(sb: &TestSandbox, inode: u64) -> Vec<Vec<u8>> {
     let handle = sb.fuse_opendir(inode).unwrap();
     sb.fs
@@ -193,6 +200,57 @@ fn cascade_blocked_by_protected_no_name_leak() {
         sb.fs.rmdir(sb.ctx(), ROOT_INODE, &TestSandbox::cstr("dir")),
         LINUX_ENOTEMPTY,
     );
+}
+
+#[test]
+fn cascade_blocked_by_tagged_descendant_no_data_loss() {
+    let mut sb = sandbox(program(
+        &["dir/secrets", "dir/secrets/**"],
+        &[],
+        &[],
+        &[],
+        &[],
+    ));
+    sb.host_create_dir("dir");
+    sb.host_create_dir("dir/secrets");
+    sb.host_create_file("dir/secrets/untagged.txt", b"host data");
+    let dir = host_inode(&mut sb, "dir");
+    let secrets = host_child_inode(&mut sb, dir, "secrets");
+
+    // Creating through the guest tags this masked child under the real secrets inode.
+    sb.fuse_create(secrets, "tagged.txt", 0o644).unwrap();
+    assert!(sb.fs.tagged_visible(secrets, b"tagged.txt"));
+
+    TestSandbox::assert_errno(
+        sb.fs.rmdir(sb.ctx(), dir, &TestSandbox::cstr("secrets")),
+        LINUX_ENOTEMPTY,
+    );
+    assert!(sb.root.join("dir/secrets/tagged.txt").exists());
+}
+
+#[test]
+fn cascade_uses_correct_parent_for_tagged_check() {
+    let mut sb = sandbox(program(
+        &["dir/secrets", "dir/secrets/**"],
+        &[],
+        &[],
+        &[],
+        &[],
+    ));
+    sb.host_create_dir("dir");
+    sb.host_create_dir("dir/secrets");
+    let dir = host_inode(&mut sb, "dir");
+    let secrets = host_child_inode(&mut sb, dir, "secrets");
+    sb.fuse_create(secrets, "tagged.txt", 0o644).unwrap();
+
+    assert!(sb.fs.tagged_visible(secrets, b"tagged.txt"));
+    assert!(!sb.fs.tagged_visible(0, b"tagged.txt"));
+    // Before the fix, cascade_remove used parent 0 and deleted this file.
+    TestSandbox::assert_errno(
+        sb.fs.rmdir(sb.ctx(), dir, &TestSandbox::cstr("secrets")),
+        LINUX_ENOTEMPTY,
+    );
+    assert!(sb.root.join("dir/secrets/tagged.txt").exists());
 }
 
 #[test]

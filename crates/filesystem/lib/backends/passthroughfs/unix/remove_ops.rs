@@ -206,7 +206,7 @@ pub(crate) fn do_rmdir(
                 super::mount_policy::Decision::Masked
                     | super::mount_policy::Decision::TraversalOnly
             )
-            && cascade_remove(fs, &path, &lexical, 0)
+            && cascade_remove(fs, &path, &lexical, 0, None)
         {
             let retry =
                 unsafe { libc::unlinkat(parent_fd.raw(), name.as_ptr(), libc::AT_REMOVEDIR) };
@@ -261,6 +261,7 @@ fn cascade_remove(
     lexical_path: &str,
     lexical: &super::mount_policy::LexicalPath,
     depth: usize,
+    dir_synthetic_inode: Option<u64>,
 ) -> bool {
     if depth > 64 {
         return false;
@@ -269,6 +270,8 @@ fn cascade_remove(
         return false;
     };
     let host_path = fs.cfg.root_dir.join(lexical_path);
+    let dir_synthetic_inode =
+        dir_synthetic_inode.or_else(|| inode::synthetic_inode_for_host_path(fs, &host_path));
     let Ok(entries) = std::fs::read_dir(&host_path) else {
         return false;
     };
@@ -287,7 +290,10 @@ fn cascade_remove(
         }
         match policy.decide(&child).decision {
             super::mount_policy::Decision::Visible => return false,
-            super::mount_policy::Decision::Masked if fs.tagged_visible(0, name.as_bytes()) => {
+            super::mount_policy::Decision::Masked
+                if dir_synthetic_inode
+                    .is_some_and(|parent| fs.tagged_visible(parent, name.as_bytes())) =>
+            {
                 return false;
             }
             super::mount_policy::Decision::Masked
@@ -296,7 +302,9 @@ fn cascade_remove(
                     return false;
                 };
                 if meta.file_type().is_dir() {
-                    if !cascade_remove(fs, &child_path, &child, depth + 1) {
+                    let child_synthetic_inode =
+                        inode::synthetic_inode_for_host_path(fs, &entry.path());
+                    if !cascade_remove(fs, &child_path, &child, depth + 1, child_synthetic_inode) {
                         return false;
                     }
                     if std::fs::remove_dir(entry.path()).is_err() {

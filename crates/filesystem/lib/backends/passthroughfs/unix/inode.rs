@@ -858,6 +858,41 @@ pub(crate) fn linux_alt_key_from_fd(fd: RawFd) -> io::Result<InodeAltKey> {
     ))
 }
 
+/// Find the synthetic inode currently tracking a host path, without following symlinks.
+#[cfg(target_os = "linux")]
+pub(crate) fn synthetic_inode_for_host_path(
+    fs: &PassthroughFs,
+    host_path: &std::path::Path,
+) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(host_path.as_os_str().as_bytes()).ok()?;
+    let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+    let ret = unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW | libc::AT_STATX_SYNC_AS_STAT,
+            libc::STATX_BASIC_STATS | libc::STATX_MNT_ID,
+            &mut stx,
+        )
+    };
+    if ret < 0 {
+        return None;
+    }
+
+    let alt_key = InodeAltKey::new(
+        stx.stx_ino,
+        platform::statx_to_stat64(&stx).st_dev,
+        stx.stx_mnt_id,
+    );
+    fs.inodes
+        .read()
+        .unwrap()
+        .get_alt(&alt_key)
+        .map(|data| data.inode)
+}
+
 #[cfg(target_os = "linux")]
 fn dup_retained_fd_linux(data: &InodeData) -> io::Result<Option<RawFd>> {
     let retained = data.retained_fd.lock().unwrap();
