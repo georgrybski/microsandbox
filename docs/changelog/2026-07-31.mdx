@@ -1,0 +1,24 @@
+---
+title: "Week of July 31, 2026"
+description: "Mount path policy for bind mounts: hide, protect, and write-protect host paths from the guest with a fail-closed compiled policy."
+icon: "bolt"
+---
+
+## New features
+
+**Mount path policy**
+
+Bind mounts now accept a `policy=<path>` token (Rust SDK: `.mount_policy(path)`) that points at a compiled mount path-policy JSON file resolved beneath the sandbox's approved runtime state directory. The policy hides, protects, and write-protects host paths from the guest without changing the underlying directory:
+
+- **Masked** paths return `ENOENT` on lookup, are omitted from `readdir`, and reject `create`/`rename` with `EACCES`. A masked directory with an unmasked descendant becomes traversal-only.
+- **Protect** rules are terminal masks that later rules cannot override.
+- **Write deny** rules block writes to matching paths even when they are visible.
+- A bounded tag store and fail-closed cascade removal keep masked aliases consistent across rename and forget races.
+
+The loader is fail-closed: it rejects absolute/`..` paths, opens each component with `O_NOFOLLOW`, parses the JSON once, and refuses to start the sandbox on a malformed file, an unknown field, or an unsupported or missing `version` (supported version is `1`).
+
+Mount path policy is Linux-first. On macOS the `policy=` token and `mount_policy` field are accepted for compatibility but enforcement is a no-op. See [Volumes](/sandboxes/volumes).
+
+## Breaking changes
+
+- **`VolumeMount::Bind` gained a `mount_policy: Option<PathBuf>` field.** `microsandbox-types` is pre-1.0 (0.6.8), so exhaustive matches and constructions of `VolumeMount::Bind` must add the new field (use `mount_policy: None` or `..Default::default()`). We accepted this break rather than adding `#[non_exhaustive]`, which would have broken every existing exhaustive match on the variant.

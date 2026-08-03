@@ -23,8 +23,8 @@ CLI mount flags use `SOURCE:DEST[:OPTIONS]`. The `:` before `OPTIONS` starts the
 
 | Flag | Source | Options |
 |------|--------|---------|
-| `--mount-dir` | Host directory | `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `stat-virt=strict\|relaxed\|off`, `host-perms=private\|mirror` |
-| `--mount-file` | Host file | `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `stat-virt=strict\|relaxed\|off`, `host-perms=private\|mirror` |
+| `--mount-dir` | Host directory | `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `stat-virt=strict\|relaxed\|off`, `host-perms=private\|mirror`, `policy=<path>` |
+| `--mount-file` | Host file | `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `stat-virt=strict\|relaxed\|off`, `host-perms=private\|mirror`, `policy=<path>` |
 | `--mount-named` | Named volume | `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `kind=dir\|disk`, `size=<size>` for `kind=disk`, `quota=<size>` for directory volumes; directory-backed named volumes also support `stat-virt=strict\|relaxed\|off`, `host-perms=private\|mirror` |
 | `--mount-disk` | Host disk image | `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `format=raw\|qcow2\|vmdk`, `fstype=<type>` |
 | `--tmpfs` | Guest path | `ro`, `rw`, `noexec`, `nosuid`, `nodev`; size may be passed as `PATH:SIZE[:OPTIONS]` |
@@ -376,3 +376,73 @@ msb create python --name full \
   --tmpfs /tmp:1G:noexec,nosuid,nodev
 ```
 </CodeGroup>
+
+## Mount path policy
+
+A bind mount can carry a compiled **mount path policy** that hides or protects host paths from the guest without changing the underlying directory. Use the `policy=<path>` mount token to point at a policy program JSON file resolved beneath the sandbox's approved runtime state directory.
+
+<CodeGroup>
+```bash CLI
+msb create python --name dev \
+  --mount-dir ./src:/app/src:ro \
+  --mount-dir ./data:/app/data:policy=policies/data.json
+```
+
+```rust Rust
+let sb = Sandbox::builder("dev")
+    .image("python")
+    .volume("/app/src", |v| v.bind("./src").readonly())
+    .volume("/app/data", |v| v.bind("./data").mount_policy("policies/data.json"))
+    .create()
+    .await?;
+```
+</CodeGroup>
+
+### Masking semantics
+
+For each guest-visible path the policy returns one of:
+
+- **Visible** — the path is exposed normally.
+- **Masked** — the path is hidden: `lookup` returns `ENOENT`, the name is omitted from `readdir`, and `create`/`rename` into it return `EACCES`. A masked directory that a later rule unmasks a descendant of becomes **traversal-only**: the directory itself is hidden but can still be traversed so the descendant can be reached.
+- **TraversalOnly** — hidden itself but traversable for unmasked descendants.
+
+Write admission is enforced separately: a `writes.deny` rule that matches a path blocks writes (`EACCES`) even when the path is otherwise visible. `protect` rules are terminal masks that cannot be overridden by later rules.
+
+To preserve correctness across rename and forget races, the backend keeps a small **tag store** of pinned `O_PATH` descriptors for masked aliases. When a masked directory is removed, the backend performs a bounded **cascade removal** of masked descendants (depth-limited, fail-closed) so stale tags are evicted.
+
+### Fail-closed loader
+
+The policy file is loaded once at sandbox start, relative to the sandbox's approved runtime state directory. The loader:
+
+- rejects absolute paths and `..` components (the path cannot escape the approved state directory);
+- opens each component with `O_NOFOLLOW` (a symlink swap cannot redirect the lookup);
+- parses the JSON exactly once and refuses to start the sandbox on a malformed file, an unknown field, or an unsupported or missing `version`.
+
+### JSON program format
+
+The program is a JSON object with `version: 1` and four rule lists:
+
+```json
+{
+  "version": 1,
+  "rules": [
+    { "effect": "mask", "pattern": "secrets/**", "overridable": false,
+      "origin": { "layer": "workload", "file": "policy.json", "scope_kind": "workload" } }
+  ],
+  "protect": [
+    { "effect": "mask", "pattern": "init.krun", "overridable": false,
+      "origin": { "layer": "workload", "file": "policy.json", "scope_kind": "workload" } }
+  ],
+  "writes": { "allow": [], "deny": [
+    { "effect": "mask", "pattern": "secrets/**", "overridable": false,
+      "origin": { "layer": "workload", "file": "policy.json", "scope_kind": "workload" } }
+  ] },
+  "case_sensitivity": "sensitive"
+}
+```
+
+`rules` are ordered mask/unmask rules (last non-frozen match wins); `protect` are terminal masks; `writes` is an `{allow, deny}` rule set for write admission; `case_sensitivity` is `"sensitive"` (default) or `"insensitive"`. Patterns are mount-root-relative globs; a trailing `/` makes a pattern directory-only.
+
+### Platform support
+
+Mount path policy is Linux-first. On macOS the `policy=` token and the `mount_policy` builder field are accepted for API compatibility, but enforcement is a no-op (paths are visible). On Windows the field is not supported.
