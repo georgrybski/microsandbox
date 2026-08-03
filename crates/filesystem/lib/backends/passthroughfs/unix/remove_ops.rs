@@ -670,11 +670,6 @@ fn remove_admission(fs: &PassthroughFs, parent: u64, name: &CStr) -> io::Result<
     Ok(true)
 }
 
-/// Sentinel child name used only to probe whether a masked directory masks
-/// descendants; it must never collide with a real guest name.
-#[cfg(target_os = "linux")]
-const MOUNT_POLICY_PROBE_NAME: &str = "__mount_policy_probe__";
-
 #[cfg(target_os = "linux")]
 fn rmdir_admission(fs: &PassthroughFs, parent: u64, name: &CStr) -> io::Result<bool> {
     let Some(policy) = fs.mask_policy() else {
@@ -716,7 +711,7 @@ fn rmdir_admission(fs: &PassthroughFs, parent: u64, name: &CStr) -> io::Result<b
     // directory must remain indistinguishable from a missing name.
     if matches!(
         policy
-            .decide_child(&path, MOUNT_POLICY_PROBE_NAME)
+            .decide_child(&path, "__mount_policy_probe__")
             .decision,
         super::mount_policy::Decision::Masked | super::mount_policy::Decision::TraversalOnly
     ) {
