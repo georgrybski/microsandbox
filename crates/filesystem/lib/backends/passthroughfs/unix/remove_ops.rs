@@ -13,6 +13,8 @@ use crate::{
     Context,
     backends::shared::{name_validation, platform},
 };
+#[cfg(target_os = "linux")]
+use std::os::fd::RawFd;
 
 //--------------------------------------------------------------------------------------------------
 // Functions
@@ -206,7 +208,7 @@ pub(crate) fn do_rmdir(
                 super::mount_policy::Decision::Masked
                     | super::mount_policy::Decision::TraversalOnly
             )
-            && cascade_remove(fs, &path, &lexical, 0, None)
+            && cascade_remove(fs, &lexical, 0, None)
         {
             let retry =
                 unsafe { libc::unlinkat(parent_fd.raw(), name.as_ptr(), libc::AT_REMOVEDIR) };
@@ -258,7 +260,6 @@ pub(crate) fn do_rmdir(
 #[cfg(target_os = "linux")]
 fn cascade_remove(
     fs: &PassthroughFs,
-    lexical_path: &str,
     lexical: &super::mount_policy::LexicalPath,
     depth: usize,
     dir_synthetic_inode: Option<u64>,
@@ -269,59 +270,171 @@ fn cascade_remove(
     let Some(policy) = fs.mask_policy() else {
         return false;
     };
-    let host_path = fs.cfg.root_dir.join(lexical_path);
-    let dir_synthetic_inode =
-        dir_synthetic_inode.or_else(|| inode::synthetic_inode_for_host_path(fs, &host_path));
-    let Ok(entries) = std::fs::read_dir(&host_path) else {
+    // Root itself is never a cascade target; fail closed.
+    if lexical.components().is_empty() {
         return false;
+    }
+
+    // Open the target directory by descending from the backend root fd with
+    // O_NOFOLLOW on every component, so all subsequent operations stay
+    // fd-relative and contained beneath the root (openat2 / RESOLVE_BENEATH
+    // when available). Never follows symlinks.
+    let components: Vec<Vec<u8>> = lexical
+        .components()
+        .iter()
+        .map(|c| c.as_bytes().to_vec())
+        .collect();
+    let dir_fd = match inode::secure_open_path_linux(
+        fs,
+        &components,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+    ) {
+        Ok(fd) => fd,
+        Err(_) => return false,
     };
-    for entry in entries {
-        let Ok(entry) = entry else { return false };
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
+
+    // Resolve the synthetic inode tracking this directory (for tag eviction),
+    // preferring the caller-supplied value and falling back to an fd identity
+    // lookup so no raw host path is consulted.
+    let dir_synthetic_inode = dir_synthetic_inode.or_else(|| {
+        inode::linux_alt_key_from_fd(dir_fd)
+            .ok()
+            .and_then(|alt_key| {
+                fs.inodes
+                    .read()
+                    .unwrap()
+                    .get_alt(&alt_key)
+                    .map(|data| data.inode)
+            })
+    });
+
+    cascade_remove_fd(fs, dir_fd, lexical, depth, dir_synthetic_inode, policy)
+}
+
+/// Recursively unlink masked entries beneath `dir_fd`, which is consumed
+/// (closed via `closedir`) in all return paths.
+#[cfg(target_os = "linux")]
+fn cascade_remove_fd(
+    fs: &PassthroughFs,
+    dir_fd: RawFd,
+    lexical: &super::mount_policy::LexicalPath,
+    depth: usize,
+    dir_synthetic_inode: Option<u64>,
+    policy: &super::mount_policy::MountPolicyProgram,
+) -> bool {
+    if depth > 64 {
+        unsafe { libc::close(dir_fd) };
+        return false;
+    }
+
+    let dir = unsafe { libc::fdopendir(dir_fd) };
+    if dir.is_null() {
+        unsafe { libc::close(dir_fd) };
+        return false;
+    }
+
+    loop {
+        let ent = unsafe { libc::readdir(dir) };
+        if ent.is_null() {
+            break;
+        }
+        let name_owned = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) }.to_owned();
+        let name_bytes = name_owned.as_bytes();
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+        let Some(name_str) = std::str::from_utf8(name_bytes).ok() else {
+            unsafe { libc::closedir(dir) };
             return false;
         };
-        let child_path = format!("{lexical_path}/{name}");
-        let Ok(child) = super::mount_policy::LexicalPath::new(&child_path) else {
+        let Ok(child) = lexical.child(name_str) else {
+            unsafe { libc::closedir(dir) };
             return false;
         };
         if policy.is_protected(&child) {
+            unsafe { libc::closedir(dir) };
             return false;
         }
         match policy.decide(&child).decision {
-            super::mount_policy::Decision::Visible => return false,
+            super::mount_policy::Decision::Visible => {
+                unsafe { libc::closedir(dir) };
+                return false;
+            }
             super::mount_policy::Decision::Masked
                 if dir_synthetic_inode
-                    .is_some_and(|parent| fs.tagged_visible(parent, name.as_bytes())) =>
+                    .is_some_and(|parent| fs.tagged_visible(parent, name_bytes)) =>
             {
+                unsafe { libc::closedir(dir) };
                 return false;
             }
             super::mount_policy::Decision::Masked
             | super::mount_policy::Decision::TraversalOnly => {
-                let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
-                    return false;
+                // Determine entry type without following symlinks.
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                let ret = unsafe {
+                    libc::fstatat(
+                        dir_fd,
+                        name_owned.as_ptr(),
+                        &mut st,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
                 };
-                if meta.file_type().is_dir() {
-                    let child_synthetic_inode =
-                        inode::synthetic_inode_for_host_path(fs, &entry.path());
-                    if !cascade_remove(fs, &child_path, &child, depth + 1, child_synthetic_inode) {
-                        return false;
-                    }
-                    if std::fs::remove_dir(entry.path()).is_err() {
-                        return false;
-                    }
-                } else if std::fs::remove_file(entry.path()).is_err() {
+                if ret < 0 {
+                    unsafe { libc::closedir(dir) };
                     return false;
+                }
+                if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                    let child_fd = unsafe {
+                        libc::openat(
+                            dir_fd,
+                            name_owned.as_ptr(),
+                            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+                        )
+                    };
+                    if child_fd < 0 {
+                        unsafe { libc::closedir(dir) };
+                        return false;
+                    }
+                    let child_synth =
+                        inode::linux_alt_key_from_fd(child_fd)
+                            .ok()
+                            .and_then(|alt_key| {
+                                fs.inodes
+                                    .read()
+                                    .unwrap()
+                                    .get_alt(&alt_key)
+                                    .map(|data| data.inode)
+                            });
+                    // The recursive call consumes child_fd via closedir.
+                    if !cascade_remove_fd(fs, child_fd, &child, depth + 1, child_synth, policy) {
+                        unsafe { libc::closedir(dir) };
+                        return false;
+                    }
+                    let ret =
+                        unsafe { libc::unlinkat(dir_fd, name_owned.as_ptr(), libc::AT_REMOVEDIR) };
+                    if ret < 0 {
+                        unsafe { libc::closedir(dir) };
+                        return false;
+                    }
+                } else {
+                    // Non-directory (file, symlink, special): unlink the entry
+                    // itself; never follow a symlink target.
+                    let ret = unsafe { libc::unlinkat(dir_fd, name_owned.as_ptr(), 0) };
+                    if ret < 0 {
+                        unsafe { libc::closedir(dir) };
+                        return false;
+                    }
                 }
                 if let Some(parent_inode) = dir_synthetic_inode
                     && let Some(tags) = fs.tags()
                 {
-                    tags.evict(parent_inode, name.as_bytes());
+                    tags.evict(parent_inode, name_bytes);
                 }
             }
         }
     }
-    let _ = lexical;
+
+    unsafe { libc::closedir(dir) };
     true
 }
 
