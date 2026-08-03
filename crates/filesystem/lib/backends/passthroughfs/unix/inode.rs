@@ -220,6 +220,21 @@ pub(crate) fn vol_path(dev: u64, ino: u64) -> std::ffi::CString {
 pub(crate) fn do_lookup(fs: &PassthroughFs, parent: u64, name: &CStr) -> io::Result<Entry> {
     crate::backends::shared::name_validation::validate_name(name)?;
 
+    #[cfg(target_os = "linux")]
+    if let Some(policy) = fs.mask_policy() {
+        let Some(path) = lexical_child_path(fs, parent, name.to_bytes()) else {
+            return Err(platform::enoent());
+        };
+        let lexical =
+            super::mount_policy::LexicalPath::new(&path).map_err(|_| platform::enoent())?;
+        if matches!(
+            policy.decide(&lexical).decision,
+            super::mount_policy::Decision::Masked
+        ) {
+            return Err(platform::enoent());
+        }
+    }
+
     let parent_fd = get_inode_fd(fs, parent)?;
 
     #[cfg(target_os = "linux")]
@@ -227,6 +242,37 @@ pub(crate) fn do_lookup(fs: &PassthroughFs, parent: u64, name: &CStr) -> io::Res
 
     #[cfg(target_os = "macos")]
     return do_lookup_macos(fs, parent_fd.raw(), name);
+}
+
+/// Derive a mount-root-relative lexical path by walking the inode anchors
+/// (spec 22 §14 lexical path derivation).
+#[cfg(target_os = "linux")]
+pub(crate) fn lexical_child_path(fs: &PassthroughFs, parent: u64, name: &[u8]) -> Option<String> {
+    let inodes = fs.inodes.read().unwrap();
+    let mut seen = HashSet::new();
+    let mut components = build_anchor_components_locked(&inodes, parent, &mut seen).ok()?;
+    validate_component(name).ok()?;
+    components.push(name.to_vec());
+    components
+        .into_iter()
+        .map(|component| String::from_utf8(component).ok())
+        .collect::<Option<Vec<_>>>()
+        .map(|components| components.join("/"))
+}
+
+/// Derive a mount-root-relative lexical path for an inode by walking anchors
+/// (spec 22 §14 lexical path derivation).
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+pub(crate) fn lexical_inode_path(fs: &PassthroughFs, inode: u64) -> Option<String> {
+    let inodes = fs.inodes.read().unwrap();
+    let mut seen = HashSet::new();
+    let components = build_anchor_components_locked(&inodes, inode, &mut seen).ok()?;
+    components
+        .into_iter()
+        .map(|component| String::from_utf8(component).ok())
+        .collect::<Option<Vec<_>>>()
+        .map(|components| components.join("/"))
 }
 
 /// Linux lookup: open → statx(AT_EMPTY_PATH) → patched_stat (3 syscalls).

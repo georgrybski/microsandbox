@@ -49,6 +49,7 @@ pub struct PassthroughFsBuilder {
     inject_init: bool,
     bind_identity_map: Option<BindIdentityMapHandle>,
     quota_bytes: Option<u64>,
+    mask_policy: Option<std::sync::Arc<super::mount_policy::MountPolicyProgram>>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -71,6 +72,7 @@ impl PassthroughFsBuilder {
             inject_init: true,
             bind_identity_map: None,
             quota_bytes: None,
+            mask_policy: None,
         }
     }
 
@@ -151,6 +153,15 @@ impl PassthroughFsBuilder {
         self
     }
 
+    /// Set the optional compiled mount path-policy program.
+    pub fn mask_policy(
+        mut self,
+        policy: Option<std::sync::Arc<super::mount_policy::MountPolicyProgram>>,
+    ) -> Self {
+        self.mask_policy = policy;
+        self
+    }
+
     /// Build the PassthroughFs instance.
     pub fn build(self) -> io::Result<PassthroughFs> {
         let root_dir = self
@@ -170,6 +181,7 @@ impl PassthroughFsBuilder {
             inject_init: self.inject_init,
             bind_identity_map: self.bind_identity_map,
             quota_bytes: self.quota_bytes,
+            mask_policy: self.mask_policy,
         };
 
         // Open the root directory, contained beneath the anchor when one is set.

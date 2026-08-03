@@ -11,6 +11,7 @@ mod file_ops;
 mod host_mode;
 pub(crate) mod inode;
 mod metadata;
+pub(crate) mod mount_policy;
 mod remove_ops;
 mod special;
 mod xattr_ops;
@@ -171,6 +172,11 @@ pub struct PassthroughConfig {
     /// `None` means unbounded. When set, guest-attributable growth past this
     /// many bytes is rejected with `ENOSPC`.
     pub quota_bytes: Option<u64>,
+
+    /// Optional compiled mount path-policy program enforced for this mount's
+    /// lifetime (spec 22). `None` means no masking: behavior is byte-identical
+    /// to the policy-absent path. Immutable after `PassthroughFs::new`.
+    pub mask_policy: Option<Arc<mount_policy::MountPolicyProgram>>,
 }
 
 /// Passthrough filesystem backend.
@@ -432,6 +438,11 @@ impl PassthroughFs {
             quota.ensure_baseline();
         }
     }
+
+    /// Return the immutable compiled mount path-policy program, if configured.
+    pub(crate) fn mask_policy(&self) -> Option<&Arc<mount_policy::MountPolicyProgram>> {
+        self.cfg.mask_policy.as_ref()
+    }
 }
 
 impl PassthroughConfig {
@@ -477,6 +488,7 @@ impl Default for PassthroughConfig {
             inject_init: true,
             bind_identity_map: None,
             quota_bytes: None,
+            mask_policy: None,
         }
     }
 }
