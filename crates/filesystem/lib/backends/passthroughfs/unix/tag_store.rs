@@ -28,6 +28,7 @@ pub(crate) type TagKey = (u64, Vec<u8>);
 
 /// An O_PATH-pinned host identity and the identity recorded when it was tagged.
 pub(crate) struct TagValue {
+    /// Held to pin the duplicated O_PATH fd; dropped on LRU eviction.
     #[allow(dead_code)]
     pub(crate) file: std::fs::File,
     pub(crate) alt_key: InodeAltKey,
@@ -48,12 +49,16 @@ impl TagStore {
     pub(crate) fn new() -> Self {
         Self {
             cache: Mutex::new(LruCache::new(
+                // CAPACITY is a non-zero const (10_000), so this never panics.
                 std::num::NonZeroUsize::new(CAPACITY).unwrap(),
             )),
             exhausted: AtomicU64::new(0),
         }
     }
 
+    // NOTE: lookups allocate a Vec for the name (TagKey = (u64, Vec<u8>)). A
+    // borrow-keyed lookup would need a custom key type with a Borrow impl; the
+    // allocation is acceptable for a 10k-entry LRU keyed by short alias names.
     /// Test and touch an alias tag.
     pub(crate) fn contains(&self, parent: u64, name: &[u8]) -> bool {
         self.cache
