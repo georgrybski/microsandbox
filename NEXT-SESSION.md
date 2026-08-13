@@ -1,6 +1,6 @@
 # NEXT-SESSION — microsandbox mount path policy resumption
 
-> **STATUS: HANDOFF (2026-08-04, HEAD `2eaddae1`; rebase complete, compile green, runtime + signing + PR pending)**
+> **STATUS: HANDOFF (2026-08-13, HEAD `c3316d60`; 33 commits on fork main `b43d7522`; rebase complete + compile green + merge verified conflict-free; runtime + signing + PR still pending; merge-readiness addendum below)**
 > See-also: [STATUS.md](STATUS.md) · [DEVELOPMENT.md](DEVELOPMENT.md)
 
 This file is the self-contained handoff for the next session working the
@@ -47,3 +47,26 @@ carries what remains.
   container restart; the real rebase on this branch is the source of truth.
 - Compile gate re-run: `cargo check --workspace --all-targets` (green as of
   2026-08-04; rustc 1.97.1).
+
+
+## Merge-readiness addendum (2026-08-13)
+
+> Assessment by the cross-repo merge-readiness session (see
+> `~/Development/agent-workbench/handovers/2026-08-13-mount-merge-readiness.md`).
+
+- **Branch state:** 33 commits on fork main `b43d7522` (the earlier "32" count
+  and "HEAD `2eaddae1`" predate the `c3316d60` docs commit — 33 is current).
+- **Verified mergeable:** `git merge-base` = `b43d7522`; branch is linear;
+  `git merge-tree --write-tree` against fork main exits 0 (no conflicts). The
+  merge onto fork main is a clean fast-forward — no rebase needed.
+- **Upstream posture:** fork main `b43d7522` = upstream main `f2d78581` + the
+  agentd fix (fork PR #1, merged). Upstream main has NOT moved past
+  `f2d78581`; a later upstream rebase stays trivial. Upstream PR #1 (agentd)
+  status at assessment: **UNKNOWN from this container** (gh token invalid —
+  re-verify).
+- **workestrate coupling:** workestrate pins `74919059` (pre-merge branch tip,
+  NOT an ancestor of fork main; build.rs differs cosmetically 2+/2-). Plan: pin
+  bump `74919059` → this branch's merged rev (R2 = b43d7522 + 33) so
+  workestrate consumes the `mount_policy` field (unblocks the SDK seam).
+- **Remaining gates (unchanged):** host signing (33 commits unsigned), host
+  `cargo test --workspace` (libcap-ng), upstream PR posts, squash decision.
