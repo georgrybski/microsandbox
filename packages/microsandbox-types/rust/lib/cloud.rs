@@ -626,6 +626,7 @@ impl From<CloudVolumeMount> for VolumeMount {
                 // the protective no-follow behavior.
                 follow_root_symlinks: false,
                 quota_mib,
+                mount_policy: None,
             },
             CloudVolumeMount::Named {
                 name,
@@ -669,6 +670,9 @@ impl From<CloudVolumeMount> for VolumeMount {
 }
 
 impl From<VolumeMount> for CloudVolumeMount {
+    /// Intentionally drops `follow_root_symlinks` and `mount_policy`: the cloud
+    /// wire format does not carry host-side mount policy or symlink resolution,
+    /// which are re-derived on the host when the mount is rehydrated.
     fn from(m: VolumeMount) -> Self {
         match m {
             VolumeMount::Bind {
@@ -679,6 +683,7 @@ impl From<VolumeMount> for CloudVolumeMount {
                 host_permissions,
                 follow_root_symlinks: _,
                 quota_mib,
+                mount_policy: _,
             } => CloudVolumeMount::Bind {
                 host,
                 guest,

@@ -62,7 +62,7 @@ pub(crate) fn do_readdir(
         #[allow(clippy::readonly_write_lock)]
         let file = data.file.write().unwrap();
         let inject_init = fs.injects_init() && inode == 1;
-        *snapshot_lock = Some(build_snapshot(file.as_raw_fd(), inject_init)?);
+        *snapshot_lock = Some(build_snapshot(fs, inode, file.as_raw_fd(), inject_init)?);
     }
 
     let snapshot = snapshot_lock.as_ref().unwrap();
@@ -90,7 +90,7 @@ pub(crate) fn do_readdir_for_each(
         #[allow(clippy::readonly_write_lock)]
         let file = data.file.write().unwrap();
         let inject_init = fs.injects_init() && inode == 1;
-        *snapshot_lock = Some(build_snapshot(file.as_raw_fd(), inject_init)?);
+        *snapshot_lock = Some(build_snapshot(fs, inode, file.as_raw_fd(), inject_init)?);
     }
 
     let snapshot = snapshot_lock.as_ref().unwrap();
@@ -132,6 +132,7 @@ pub(crate) fn do_readdirplus(
                 de.type_ = mode_to_dtype(file_type);
                 result.push((de, entry));
             }
+            // Also covers policy-masked entries that slip past the snapshot filter as race defense-in-depth.
             Err(err) if lookup_says_gone(&err) => continue,
             Err(_) => result.push((de, no_lookup_entry())),
         }
@@ -158,7 +159,7 @@ pub(crate) fn do_readdirplus_for_each(
         #[allow(clippy::readonly_write_lock)]
         let file = data.file.write().unwrap();
         let inject_init = fs.injects_init() && inode == 1;
-        *snapshot_lock = Some(build_snapshot(file.as_raw_fd(), inject_init)?);
+        *snapshot_lock = Some(build_snapshot(fs, inode, file.as_raw_fd(), inject_init)?);
     }
 
     let snapshot = snapshot_lock.as_ref().unwrap();
@@ -196,6 +197,7 @@ pub(crate) fn do_readdirplus_for_each(
                 let looked_up_inode = entry.inode;
                 (entry, Some(looked_up_inode))
             }
+            // Also covers policy-masked entries that slip past the snapshot filter as race defense-in-depth.
             Err(err) if lookup_says_gone(&err) => continue,
             Err(_) => (no_lookup_entry(), None),
         };
@@ -291,8 +293,37 @@ fn no_lookup_entry() -> Entry {
 }
 
 /// Build a point-in-time directory snapshot with stable synthetic offsets.
-fn build_snapshot(fd: i32, inject_init: bool) -> io::Result<DirSnapshot> {
+fn build_snapshot(
+    fs: &PassthroughFs,
+    dir_inode: u64,
+    fd: i32,
+    inject_init: bool,
+) -> io::Result<DirSnapshot> {
     let mut entries = read_dir_entries(fd)?;
+
+    #[cfg(target_os = "linux")]
+    if let Some(policy) = fs.mask_policy() {
+        entries.retain(|entry| {
+            if entry.name == b"." || entry.name == b".." {
+                return true;
+            }
+
+            let Some(path) = inode::lexical_child_path(fs, dir_inode, &entry.name) else {
+                return false;
+            };
+            let Ok(path) = super::mount_policy::LexicalPath::new(&path) else {
+                return false;
+            };
+            if policy.is_protected(&path) {
+                return false;
+            }
+            match policy.decide(&path).decision {
+                super::mount_policy::Decision::Masked => fs.tagged_visible(dir_inode, &entry.name),
+                super::mount_policy::Decision::TraversalOnly
+                | super::mount_policy::Decision::Visible => true,
+            }
+        });
+    }
 
     if inject_init
         && !entries

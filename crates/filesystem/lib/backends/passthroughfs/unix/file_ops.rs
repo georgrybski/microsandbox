@@ -45,6 +45,42 @@ pub(crate) fn do_open(
         return Ok((Some(init_binary::INIT_HANDLE), OpenOptions::KEEP_CACHE));
     }
 
+    #[cfg(target_os = "linux")]
+    let (masked_policy_path, write_intent) = {
+        let write_intent = open_flags_mutate(flags as i32);
+        let mut masked = false;
+        if let Some(policy) = fs.mask_policy()
+            && let Some(path) = inode::lexical_inode_path(fs, inode)
+            && let Ok(path) = super::mount_policy::LexicalPath::new(&path)
+        {
+            if policy.is_protected(&path) {
+                return Err(platform::eacces());
+            }
+            // writes.deny is a global write ACL: evaluate for all paths.
+            if write_intent
+                && matches!(
+                    policy.decide_write(&path).decision,
+                    super::mount_policy::WriteDecision::Deny
+                )
+            {
+                return Err(platform::eacces());
+            }
+            if matches!(
+                policy.decide(&path).decision,
+                super::mount_policy::Decision::Masked
+            ) {
+                masked = true;
+                if !write_intent && !fs.tagged_visible_for_inode(inode) {
+                    return Err(platform::enoent());
+                }
+            }
+        }
+        (masked, write_intent)
+    };
+
+    #[cfg(target_os = "macos")]
+    let write_intent = open_flags_mutate(flags as i32);
+
     let mut open_flags = inode::translate_open_flags(flags as i32);
     if fs.cfg.readonly() && open_flags_mutate(open_flags) {
         return Err(platform::erofs());
@@ -70,6 +106,53 @@ pub(crate) fn do_open(
     // open_inode_fd adds O_CLOEXEC itself and rejects real host symlinks.
     let fd = inode::open_inode_fd(fs, inode, open_flags)?;
 
+    #[cfg(target_os = "linux")]
+    if masked_policy_path {
+        if inode::lexical_inode_path(fs, inode).is_none() {
+            // SAFETY: `fd` is a valid fd returned by `open_inode_fd`; the lexical path
+            // disappeared, so it is closed here and not referenced again.
+            unsafe { libc::close(fd) };
+            return Err(platform::enoent());
+        }
+        let stored = fs.tags().and_then(|tags| {
+            inode::current_anchor_alias_for_policy(fs, inode)
+                .and_then(|alias| tags.get_identity(alias.parent, &alias.name))
+        });
+        if stored.is_none() && !write_intent {
+            // SAFETY: `fd` is a valid fd returned by `open_inode_fd`; no stored identity
+            // exists for this read-only alias, so it is closed and not used again.
+            unsafe { libc::close(fd) };
+            return Err(platform::enoent());
+        }
+        if let Some(stored) = stored {
+            let actual = match inode::linux_alt_key_from_fd(fd) {
+                Ok(actual) => actual,
+                Err(err) => {
+                    // SAFETY: `fd` is a valid fd returned by `open_inode_fd`; identity lookup
+                    // failed, so it is closed here and not referenced again.
+                    unsafe { libc::close(fd) };
+                    return Err(err);
+                }
+            };
+            if actual != stored {
+                if let Some(alias) = inode::current_anchor_alias_for_policy(fs, inode)
+                    && let Some(tags) = fs.tags()
+                {
+                    tags.evict(alias.parent, &alias.name);
+                }
+                // SAFETY: `fd` is a valid fd returned by `open_inode_fd`; the identity
+                // mismatch evicted the alias, so it is closed and not used again.
+                unsafe { libc::close(fd) };
+                return Err(platform::enoent());
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    if masked_policy_path && write_intent {
+        fs.tag_inode(inode);
+    }
+
     // Clear SUID/SGID on open+truncate (HANDLE_KILLPRIV_V2).
     if kill_priv && (open_flags & libc::O_TRUNC != 0) {
         if fs.cfg.xattr_enabled() {
@@ -87,6 +170,8 @@ pub(crate) fn do_open(
         }
     }
 
+    // SAFETY: `fd` is a valid fd from `open_inode_fd`; `from_raw_fd` takes ownership so
+    // `File` closes it on drop, and `fd` is not referenced again.
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
 
     let handle = fs.next_handle.fetch_add(1, Ordering::Relaxed);
@@ -147,11 +232,38 @@ pub(crate) fn do_write(
     let f = data.file.read().unwrap();
 
     let fd = f.as_raw_fd();
+    #[cfg(target_os = "linux")]
+    let write_masked = if let Some(policy) = fs.mask_policy()
+        && let Some(path) = inode::lexical_inode_path(fs, inode)
+        && let Ok(path) = super::mount_policy::LexicalPath::new(&path)
+    {
+        if policy.is_protected(&path) {
+            return Err(platform::eacces());
+        }
+        // writes.deny is a global write ACL: evaluate for all paths.
+        if matches!(
+            policy.decide_write(&path).decision,
+            super::mount_policy::WriteDecision::Deny
+        ) {
+            return Err(platform::eacces());
+        }
+        matches!(
+            policy.decide(&path).decision,
+            super::mount_policy::Decision::Masked
+        )
+    } else {
+        false
+    };
     // Charge the quota for any growth past EOF before writing, so an
     // over-budget write is refused with ENOSPC rather than hitting the disk.
     fs.quota_charge_to(fd, offset.saturating_add(size as u64))?;
 
     let written = r.read_to(&f, size as usize, offset)?;
+
+    #[cfg(target_os = "linux")]
+    if written > 0 && write_masked {
+        fs.tag_inode(inode);
+    }
 
     if kill_priv {
         if fs.cfg.xattr_enabled() {
@@ -193,6 +305,8 @@ pub(crate) fn do_flush(
     let data = handles.get(&handle).ok_or_else(platform::ebadf)?;
     let f = data.file.read().unwrap();
 
+    // SAFETY: `f.as_raw_fd()` is a valid owned fd from the handle; `dup` returns a new fd,
+    // which is checked before use.
     let newfd = unsafe { libc::dup(f.as_raw_fd()) };
     if newfd < 0 {
         let err = io::Error::last_os_error();
@@ -203,6 +317,8 @@ pub(crate) fn do_flush(
         }
         return Err(platform::linux_error(err));
     }
+    // SAFETY: `newfd` is the valid dup'd fd returned above; it is closed once to trigger
+    // POSIX lock release and is not used again.
     let ret = unsafe { libc::close(newfd) };
     if ret < 0 {
         return Err(platform::linux_error(io::Error::last_os_error()));

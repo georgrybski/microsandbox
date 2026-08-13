@@ -5,11 +5,13 @@
 //! `Vm::enter()` from msb_krun. It **never returns** — the VMM calls
 //! `_exit()` on guest shutdown after running exit observers.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::num::NonZero;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::OnceLock;
@@ -20,7 +22,7 @@ use microsandbox_db::entity::run as run_entity;
 #[cfg(unix)]
 use microsandbox_filesystem::{BindIdentityMapHandle, DynFileSystem};
 use microsandbox_filesystem::{
-    HostPermissions, PassthroughConfig, PassthroughFs, StatVirtualization,
+    HostPermissions, MountPolicyProgram, PassthroughConfig, PassthroughFs, StatVirtualization,
 };
 use microsandbox_metrics::{ActivateSlot, MetricsRegistry, ReleaseMode};
 use microsandbox_protocol::{
@@ -45,7 +47,7 @@ use crate::heartbeat::{self, HeartbeatDecision, HeartbeatReader};
 use crate::logging::LogLevel;
 use crate::metrics::run_metrics_sampler;
 use crate::relay::{self, AgentRelay};
-use crate::{RuntimeError, RuntimeResult};
+use crate::{MountPolicyLoadError, RuntimeError, RuntimeResult};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -1532,6 +1534,7 @@ fn build_vm(
     }
 
     // Additional mounts.
+    let policy_root = config.runtime_dir.join("mount-policy");
     for mount_spec in &vm.mounts {
         let parsed = parse_mount_spec(mount_spec)
             .map_err(|e| RuntimeError::Custom(format!("--mount {mount_spec:?}: {e}")))?;
@@ -1540,6 +1543,12 @@ fn build_vm(
         #[cfg(unix)]
         let mount_bind_identity_map =
             bind_identity_map_for_mount(&mut bind_identity_map, parsed.stat_virtualization);
+        let mask_policy = match &parsed.policy_path {
+            None => None,
+            Some(rel) => Some(Arc::new(load_mount_policy(&policy_root, rel).map_err(
+                |e| RuntimeError::Custom(format!("mount {tag}: policy load failed: {e}")),
+            )?)),
+        };
         let cfg = PassthroughConfig {
             root_dir: PathBuf::from(parsed.host_path),
             inject_init: false,
@@ -1552,6 +1561,7 @@ fn build_vm(
             #[cfg(unix)]
             bind_identity_map: mount_bind_identity_map,
             quota_bytes: parsed.quota_bytes,
+            mask_policy,
             ..Default::default()
         };
         let backend = PassthroughFs::new(cfg)
@@ -2300,6 +2310,130 @@ struct ParsedMountSpec {
     readonly: bool,
     follow_root_symlinks: bool,
     quota_bytes: Option<u64>,
+    /// Relative path to a compiled mount policy, resolved beneath runtime state.
+    policy_path: Option<String>,
+}
+
+/// Load a compiled mount policy beneath the explicitly approved runtime state directory.
+fn load_mount_policy(
+    approved_root: &Path,
+    policy_path: &str,
+) -> Result<MountPolicyProgram, MountPolicyLoadError> {
+    if policy_path.is_empty() || Path::new(policy_path).is_absolute() {
+        return Err(MountPolicyLoadError::PathEscape);
+    }
+    let path = Path::new(policy_path);
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(MountPolicyLoadError::PathEscape);
+    }
+
+    #[cfg(unix)]
+    let bytes = {
+        let root = std::ffi::CString::new(approved_root.as_os_str().as_bytes())
+            .map_err(|error| MountPolicyLoadError::Io(std::io::Error::other(error)))?;
+        // SAFETY: `root` is a valid CString built from the approved runtime
+        // state directory. O_NOFOLLOW rejects symlinks and O_DIRECTORY requires
+        // a directory, so the path cannot be redirected via a symlink swap.
+        // The path is the approved state dir, not guest-controlled. The
+        // returned fd is checked (< 0) before use.
+        let root_fd = unsafe {
+            libc::open(
+                root.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if root_fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                return Err(MountPolicyLoadError::SymlinkRejected);
+            }
+            if error.raw_os_error() == Some(libc::ENOENT) {
+                return Err(MountPolicyLoadError::FileNotFound(
+                    approved_root.display().to_string(),
+                ));
+            }
+            return Err(MountPolicyLoadError::Io(error));
+        }
+        let mut current = root_fd;
+        let components: Vec<_> = path.components().collect();
+        if components.is_empty() {
+            // SAFETY: `current` is the valid root_fd opened above. The path is
+            // empty so we bail before descending; close the fd to avoid
+            // leaking it. It is not owned by any Rust object and is not used
+            // again after this point (no double-close).
+            unsafe { libc::close(current) };
+            return Err(MountPolicyLoadError::PathEscape);
+        }
+        let mut bytes = Vec::new();
+        for (index, component) in components.iter().enumerate() {
+            let Component::Normal(name) = component else {
+                continue;
+            };
+            let name = std::ffi::CString::new(name.as_bytes())
+                .map_err(|error| MountPolicyLoadError::Io(std::io::Error::other(error)))?;
+            let flags = libc::O_RDONLY
+                | libc::O_CLOEXEC
+                | libc::O_NOFOLLOW
+                | if index + 1 < components.len() {
+                    libc::O_DIRECTORY
+                } else {
+                    0
+                };
+            // SAFETY: `current` is a valid open directory fd (the root_fd or a
+            // previously opened component). `name` is a valid CString for one
+            // path component. flags include O_NOFOLLOW (rejects symlinks) and
+            // O_DIRECTORY for intermediate components, so the path cannot
+            // escape the approved root via a symlink swap. The returned fd is
+            // checked (< 0) before use.
+            let next = unsafe { libc::openat(current, name.as_ptr(), flags) };
+            if next < 0 {
+                let error = std::io::Error::last_os_error();
+                // SAFETY: `current` is a valid open fd that we are abandoning
+                // because the next component could not be opened. It is not
+                // owned by any Rust object and is not used again after close
+                // (no double-close).
+                unsafe { libc::close(current) };
+                if error.raw_os_error() == Some(libc::ELOOP) {
+                    return Err(MountPolicyLoadError::SymlinkRejected);
+                }
+                if error.raw_os_error() == Some(libc::ENOENT) {
+                    return Err(MountPolicyLoadError::FileNotFound(policy_path.to_string()));
+                }
+                return Err(MountPolicyLoadError::Io(error));
+            }
+            // SAFETY: `current` is a valid open fd that is no longer needed
+            // once `next` has been obtained; closing it prevents fd leakage.
+            // It is not owned by any Rust object and is not referenced again
+            // after close (no double-close).
+            unsafe { libc::close(current) };
+            current = next;
+            if index + 1 == components.len() {
+                // SAFETY: `current` is the fd of the final policy file
+                // component, valid and not owned by any other Rust object.
+                // from_raw_fd takes ownership so the File closes `current` on
+                // drop; `current` is not referenced again (no double-close).
+                let mut file = unsafe { std::fs::File::from_raw_fd(current) };
+                if let Err(error) = file.read_to_end(&mut bytes) {
+                    return Err(MountPolicyLoadError::Io(error));
+                }
+            }
+        }
+        bytes
+    };
+
+    #[cfg(unix)]
+    {
+        serde_json::from_slice(&bytes).map_err(MountPolicyLoadError::from)
+    }
+
+    #[cfg(not(unix))]
+    Err(MountPolicyLoadError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "mount policy loading is unsupported on this platform",
+    )))
 }
 
 /// Parse a `--mount` spec into [`ParsedMountSpec`].
@@ -2333,6 +2467,7 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
     let mut readonly = false;
     let mut follow_root_symlinks = false;
     let mut quota_bytes = None;
+    let mut policy_path = None;
     let mut seen_stat_virt = false;
     let mut seen_host_perms = false;
     let mut seen_access = false;
@@ -2341,6 +2476,7 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
     let mut seen_nodev = false;
     let mut seen_follow_root = false;
     let mut seen_quota = false;
+    let mut seen_policy = false;
 
     if let Some(opts) = options {
         for opt in opts.split(',') {
@@ -2440,6 +2576,20 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
                             })?;
                             quota_bytes = Some(mib.saturating_mul(1024 * 1024));
                         }
+                        "policy" => {
+                            if seen_policy {
+                                return Err(
+                                    "mount option `policy` specified more than once".to_string()
+                                );
+                            }
+                            seen_policy = true;
+                            if value.is_empty() {
+                                return Err(
+                                    "mount option `policy` requires a non-empty path".to_string()
+                                );
+                            }
+                            policy_path = Some(value.to_string());
+                        }
                         other => return Err(format!("unknown mount option {other:?}")),
                     }
                 }
@@ -2455,6 +2605,7 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
         readonly,
         follow_root_symlinks,
         quota_bytes,
+        policy_path,
     })
 }
 
@@ -2551,8 +2702,9 @@ mod tests {
     use super::{
         ConsoleSharedState, HostPermissions, StatVirtualization, append_block_root_env,
         bind_rootfs_backend, guest_shutdown_flush_timeout,
-        guest_shutdown_flush_timeout_with_override, parse_mount_spec, prepend_scripts_path,
-        request_guest_shutdown, request_guest_shutdown_with_timeout, thp_kernel_cmdline,
+        guest_shutdown_flush_timeout_with_override, load_mount_policy, parse_mount_spec,
+        prepend_scripts_path, request_guest_shutdown, request_guest_shutdown_with_timeout,
+        thp_kernel_cmdline,
         validate_disk_format,
     };
 
@@ -2691,6 +2843,35 @@ mod tests {
     fn test_parse_mount_spec_rejects_unknown_key() {
         let err = parse_mount_spec("foo:/host/data:bogus=1").unwrap_err();
         assert!(err.contains("unknown mount option"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_mount_spec_policy() {
+        let parsed = parse_mount_spec("foo:/host/data:policy=/path/to/policy.json").unwrap();
+        assert_eq!(parsed.policy_path.as_deref(), Some("/path/to/policy.json"));
+        assert!(parse_mount_spec("foo:/host/data:policy=a,policy=b").is_err());
+        assert!(parse_mount_spec("foo:/host/data:policy=").is_err());
+        assert!(parse_mount_spec("foo:/host/data:unknown=value").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_load_mount_policy_confines_and_validates_file() {
+        let root = tempfile::tempdir().unwrap();
+        let policy = br#"{"version":1,"rules":[],"protect":[],"writes":{"allow":[],"deny":[]},"case_sensitivity":"sensitive"}"#;
+        std::fs::write(root.path().join("valid.json"), policy).unwrap();
+        assert!(load_mount_policy(root.path(), "valid.json").is_ok());
+        std::fs::write(root.path().join("bad.json"), b"not json").unwrap();
+        assert!(load_mount_policy(root.path(), "bad.json").is_err());
+        std::fs::write(root.path().join("v2.json"), br#"{"version":2}"#).unwrap();
+        assert!(load_mount_policy(root.path(), "v2.json").is_err());
+        std::fs::write(root.path().join("missing-version.json"), br#"{"rules":[]}"#).unwrap();
+        assert!(load_mount_policy(root.path(), "missing-version.json").is_err());
+        assert!(load_mount_policy(root.path(), "../valid.json").is_err());
+        assert!(load_mount_policy(root.path(), "/valid.json").is_err());
+        assert!(load_mount_policy(root.path(), "missing.json").is_err());
+        std::os::unix::fs::symlink("valid.json", root.path().join("link.json")).unwrap();
+        assert!(load_mount_policy(root.path(), "link.json").is_err());
     }
 
     #[test]
