@@ -2543,6 +2543,10 @@ fn sandbox_cli_args(
         db_connect_timeout_secs,
         log_dir: log_dir.to_path_buf(),
         runtime_dir: runtime_dir.to_path_buf(),
+        mount_policy_dir: local
+            .config()
+            .home()
+            .join(microsandbox_utils::MOUNT_POLICY_DIR_NAME),
         sandboxes_dir: local.sandboxes_dir(),
         run_dir: local.config().run_dir(),
         cpu_lease_dir: local.config().run_dir().join("cpu-leases"),

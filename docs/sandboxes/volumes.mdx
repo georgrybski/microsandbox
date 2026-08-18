@@ -413,7 +413,7 @@ msb create python --name full \
 
 ## Mount path policy
 
-A bind mount can carry a compiled **mount path policy** that hides or protects host paths from the guest without changing the underlying directory. Use the `policy=<path>` mount token to point at a policy program JSON file resolved beneath the sandbox's approved runtime state directory.
+A bind mount can carry a compiled **mount path policy** that hides or protects host paths from the guest without changing the underlying directory. Use the `policy=<path>` mount token to point at a policy program JSON file resolved beneath the approved mount-policy directory: `$MSB_HOME/mount-policy/` (default `~/.microsandbox/mount-policy/`). The token is always relative to that directory — for example `policy=policies/data.json` resolves to `$MSB_HOME/mount-policy/policies/data.json`.
 
 <CodeGroup>
 ```bash CLI
@@ -446,9 +446,9 @@ To preserve correctness across rename and forget races, the backend keeps a smal
 
 ### Fail-closed loader
 
-The policy file is loaded once at sandbox start, relative to the sandbox's approved runtime state directory. The loader:
+The policy file is loaded once at sandbox start, relative to the approved mount-policy directory `$MSB_HOME/mount-policy/` (default `~/.microsandbox/mount-policy/`). The loader:
 
-- rejects absolute paths and `..` components (the path cannot escape the approved state directory);
+- rejects absolute paths and `..` components (the path cannot escape the approved directory);
 - opens each component with `O_NOFOLLOW` (a symlink swap cannot redirect the lookup);
 - parses the JSON exactly once and refuses to start the sandbox on a malformed file, an unknown field, or an unsupported or missing `version`.
 

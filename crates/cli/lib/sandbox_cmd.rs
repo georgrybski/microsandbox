@@ -267,6 +267,7 @@ pub fn run(args: SandboxArgs) -> ! {
         sandbox_db_connect_timeout_secs: launch.db_connect_timeout_secs,
         log_dir: launch.log_dir,
         runtime_dir: launch.runtime_dir,
+        mount_policy_dir: launch.mount_policy_dir,
         sandboxes_dir: launch.sandboxes_dir,
         run_dir,
         lifecycle_guard,
@@ -670,6 +671,7 @@ mod tests {
 
         let launch = LaunchConfig {
             db_path: PathBuf::from("/tmp/x.db"),
+            mount_policy_dir: PathBuf::new(),
             env: vec!["TOKEN=secret".to_string()],
             block_writeback_limit_bytes: Some(512 * 1024 * 1024),
             block_writeback_pool_bytes: Some(4 * 1024 * 1024 * 1024),
@@ -703,6 +705,7 @@ mod tests {
         let launch = LaunchConfig {
             sandboxes_dir: PathBuf::from("/tmp/msb/sandboxes"),
             agent_sock: PathBuf::from("/tmp/msb/run/agent/legacy.sock"),
+            mount_policy_dir: PathBuf::new(),
             ..Default::default()
         };
         let mut value = serde_json::to_value(&launch).unwrap();
@@ -723,6 +726,7 @@ mod tests {
         let launch = LaunchConfig {
             sandboxes_dir: PathBuf::from("/tmp/msb/sandboxes"),
             agent_sock: PathBuf::from("/tmp/msb/sandboxes/demo/runtime/agent.sock"),
+            mount_policy_dir: PathBuf::new(),
             ..Default::default()
         };
 
@@ -737,6 +741,7 @@ mod tests {
 
         let launch = LaunchConfig {
             workdir: Some(PathBuf::from("/srv")),
+            mount_policy_dir: PathBuf::new(),
             ..Default::default()
         };
         let mut file = tempfile::tempfile().unwrap();

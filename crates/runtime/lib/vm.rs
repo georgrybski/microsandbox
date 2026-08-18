@@ -118,6 +118,12 @@ pub struct Config {
     /// Runtime directory (scripts, heartbeat).
     pub runtime_dir: PathBuf,
 
+    /// Approved root beneath which `policy=` mount tokens are resolved
+    /// (see [`crate::launch::LaunchConfig::mount_policy_dir`]). Empty means
+    /// a legacy launch config; the loader falls back to
+    /// `<runtime_dir>/mount-policy`.
+    pub mount_policy_dir: PathBuf,
+
     /// Root directory holding every sandbox's persisted state
     /// (`<sandboxes_dir>/<name>`). Passed explicitly so runtime-owned
     /// lifecycle maintenance can remove ephemeral sandbox directories without
@@ -1534,7 +1540,23 @@ fn build_vm(
     }
 
     // Additional mounts.
-    let policy_root = config.runtime_dir.join("mount-policy");
+    //
+    // The approved root for `policy=` mount tokens is MSB_HOME-anchored
+    // (`<msb home>/mount-policy`), not the per-sandbox runtime dir: sandbox
+    // create's `prepare_create_target` rejects or wipes a pre-existing
+    // `sandboxes/<name>` directory, so a policy staged under
+    // `<runtime>/mount-policy` could never survive to VM build. The
+    // MSB_HOME-anchored dir survives re-creates and keeps the same
+    // fail-closed properties (relative-only, no `..`, `O_NOFOLLOW`
+    // component walk beneath the root). Legacy launch configs that carry
+    // no `mount_policy_dir` fall back to the old runtime-dir root.
+    let policy_root = if config.mount_policy_dir.as_os_str().is_empty() {
+        config
+            .runtime_dir
+            .join(microsandbox_utils::MOUNT_POLICY_DIR_NAME)
+    } else {
+        config.mount_policy_dir.clone()
+    };
     for mount_spec in &vm.mounts {
         let parsed = parse_mount_spec(mount_spec)
             .map_err(|e| RuntimeError::Custom(format!("--mount {mount_spec:?}: {e}")))?;
@@ -2704,8 +2726,7 @@ mod tests {
         bind_rootfs_backend, guest_shutdown_flush_timeout,
         guest_shutdown_flush_timeout_with_override, load_mount_policy, parse_mount_spec,
         prepend_scripts_path, request_guest_shutdown, request_guest_shutdown_with_timeout,
-        thp_kernel_cmdline,
-        validate_disk_format,
+        thp_kernel_cmdline, validate_disk_format,
     };
 
     use microsandbox_filesystem::{Context, DynFileSystem, FsOptions};
