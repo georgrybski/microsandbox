@@ -2704,8 +2704,7 @@ mod tests {
         bind_rootfs_backend, guest_shutdown_flush_timeout,
         guest_shutdown_flush_timeout_with_override, load_mount_policy, parse_mount_spec,
         prepend_scripts_path, request_guest_shutdown, request_guest_shutdown_with_timeout,
-        thp_kernel_cmdline,
-        validate_disk_format,
+        thp_kernel_cmdline, validate_disk_format,
     };
 
     use microsandbox_filesystem::{Context, DynFileSystem, FsOptions};
