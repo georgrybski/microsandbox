@@ -1,6 +1,6 @@
 use super::mount_policy::{
     CaseSensitivity, CompiledRuleSet, Decision, LexicalPath, MountPolicyProgram, PathPolicyRule,
-    Pattern, RuleEffect, RuleOrigin, ScopeKind,
+    Pattern, RuleEffect, RuleOrigin, ScopeKind, WriteDecision, WriteRuleEffect,
 };
 use super::*;
 use std::path::PathBuf;
@@ -230,4 +230,173 @@ fn lookup_masks_policy_path_and_none_is_byte_identical_off() {
     absent_sb.host_create_file("visible.txt", b"visible");
     assert!(absent_sb.lookup_root(".env").is_ok());
     assert!(absent_sb.lookup_root("visible.txt").is_ok());
+}
+
+fn write_rule(pattern: &str, scope_kind: ScopeKind, overridable: bool) -> PathPolicyRule {
+    PathPolicyRule {
+        effect: RuleEffect::Mask,
+        pattern: Pattern::parse(pattern).unwrap(),
+        overridable,
+        origin: RuleOrigin {
+            layer: "test".to_string(),
+            file: PathBuf::from("test.json"),
+            scope_kind,
+        },
+    }
+}
+
+fn write_program(
+    protect: &[&str],
+    allow: &[(&str, ScopeKind, bool)],
+    deny: &[(&str, ScopeKind, bool)],
+) -> MountPolicyProgram {
+    MountPolicyProgram {
+        version: 1,
+        rules: Vec::new(),
+        protect: protect
+            .iter()
+            .map(|pattern| write_rule(pattern, ScopeKind::Workload, true))
+            .collect(),
+        writes: CompiledRuleSet {
+            allow: allow
+                .iter()
+                .map(|(pattern, scope_kind, overridable)| {
+                    write_rule(pattern, *scope_kind, *overridable)
+                })
+                .collect(),
+            deny: deny
+                .iter()
+                .map(|(pattern, scope_kind, overridable)| {
+                    write_rule(pattern, *scope_kind, *overridable)
+                })
+                .collect(),
+        },
+        case_sensitivity: CaseSensitivity::Sensitive,
+    }
+}
+
+fn decide_write(policy: &MountPolicyProgram, path: &str) -> WriteDecision {
+    policy
+        .decide_write(&LexicalPath::new(path).unwrap())
+        .decision
+}
+
+#[test]
+fn write_allow_carves_exception_within_same_scope() {
+    let policy = write_program(
+        &[],
+        &[("secrets/public.txt", ScopeKind::Workload, true)],
+        &[("secrets/**", ScopeKind::Workload, true)],
+    );
+    assert_eq!(
+        decide_write(&policy, "secrets/public.txt"),
+        WriteDecision::Allow
+    );
+    assert_eq!(
+        decide_write(&policy, "secrets/key.pem"),
+        WriteDecision::Deny
+    );
+}
+
+#[test]
+fn write_allow_rule_is_active_and_recorded() {
+    let policy = write_program(&[], &[("docs/**", ScopeKind::Workload, true)], &[]);
+    let explained = policy.decide_write(&LexicalPath::new("docs/a.txt").unwrap());
+    assert_eq!(explained.decision, WriteDecision::Allow);
+    assert_eq!(explained.matches.len(), 1);
+    assert_eq!(explained.matches[0].effect, WriteRuleEffect::Allow);
+    assert!(!explained.matches[0].frozen_out);
+}
+
+#[test]
+fn higher_authority_write_rule_wins_regardless_of_bucket() {
+    let deny_wins = write_program(
+        &[],
+        &[("f.txt", ScopeKind::Workload, true)],
+        &[("f.txt", ScopeKind::HomeRegistry, true)],
+    );
+    assert_eq!(decide_write(&deny_wins, "f.txt"), WriteDecision::Deny);
+
+    let allow_wins = write_program(
+        &[],
+        &[("f.txt", ScopeKind::HomeRegistry, true)],
+        &[("f.txt", ScopeKind::Workload, true)],
+    );
+    assert_eq!(decide_write(&allow_wins, "f.txt"), WriteDecision::Allow);
+}
+
+#[test]
+fn terminal_write_deny_cannot_be_allowed_over() {
+    let policy = write_program(
+        &[],
+        &[("f.txt", ScopeKind::HomeRegistry, true)],
+        &[("f.txt", ScopeKind::Workload, false)],
+    );
+    let explained = policy.decide_write(&LexicalPath::new("f.txt").unwrap());
+    assert_eq!(explained.decision, WriteDecision::Deny);
+    assert_eq!(
+        explained.frozen_by,
+        Some(RuleOrigin {
+            layer: "test".to_string(),
+            file: PathBuf::from("test.json"),
+            scope_kind: ScopeKind::Workload,
+        })
+    );
+    let allow_match = explained
+        .matches
+        .iter()
+        .find(|m| m.effect == WriteRuleEffect::Allow)
+        .unwrap();
+    assert!(allow_match.frozen_out);
+}
+
+#[test]
+fn terminal_write_allow_cannot_be_denied_over() {
+    let policy = write_program(
+        &[],
+        &[("f.txt", ScopeKind::Workload, false)],
+        &[("f.txt", ScopeKind::HomeRegistry, true)],
+    );
+    let explained = policy.decide_write(&LexicalPath::new("f.txt").unwrap());
+    assert_eq!(explained.decision, WriteDecision::Allow);
+    let deny_match = explained
+        .matches
+        .iter()
+        .find(|m| m.effect == WriteRuleEffect::Deny)
+        .unwrap();
+    assert!(deny_match.frozen_out);
+}
+
+#[test]
+fn protect_short_circuits_write_allow() {
+    let policy = write_program(
+        &[".secret"],
+        &[
+            (".secret", ScopeKind::HomeRegistry, true),
+            (".secret", ScopeKind::Workload, false),
+        ],
+        &[],
+    );
+    let explained = policy.decide_write(&LexicalPath::new(".secret").unwrap());
+    assert_eq!(explained.decision, WriteDecision::Deny);
+    assert_eq!(explained.matches[0].effect, WriteRuleEffect::Protect);
+    assert_eq!(
+        explained
+            .matches
+            .iter()
+            .filter(|m| m.effect == WriteRuleEffect::Allow)
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn write_default_allow_and_non_utf8_fail_closed() {
+    let policy = write_program(&[], &[], &[("blocked.txt", ScopeKind::Workload, true)]);
+    assert_eq!(decide_write(&policy, "other.txt"), WriteDecision::Allow);
+
+    let path = LexicalPath::from_bytes(b"\xff").unwrap();
+    let result = policy.decide_write(&path);
+    assert_eq!(result.decision, WriteDecision::Deny);
+    assert!(result.fail_closed_non_utf8);
 }

@@ -1,7 +1,7 @@
 //! Compiled mount policy program and pure evaluator (spec 22 §§4, 7, 10, 12, 13).
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
-use std::fmt;
+use std::{cmp::Reverse, fmt};
 
 use super::{LexicalPath, PathPolicyRule, PatternError, RuleEffect, RuleOrigin};
 
@@ -244,10 +244,18 @@ impl MountPolicyProgram {
 
     /// Evaluate the write-admission decision for a lexical path.
     ///
-    /// Protected paths deny. Otherwise the write allow/deny rules are sorted by
-    /// authority scope (and allow before deny within a scope), then applied in
-    /// that order; the last non-frozen rule wins. Non-UTF-8 paths deny
-    /// fail-closed.
+    /// Protected paths short-circuit to [`WriteDecision::Deny`]: matching
+    /// protect rules are recorded in the explain trace, but write rules cannot
+    /// change the decision. Otherwise the union of `writes.allow` and
+    /// `writes.deny` is evaluated ordered by scope authority — the
+    /// lowest-authority scope first, so a higher-authority rule overrides a
+    /// lower-authority one — with deny rules before allow rules within the
+    /// same scope, then by index within the rule's own bucket. The last
+    /// non-frozen match wins, so within one scope an allow rule carves an
+    /// exception out of a broader deny. A terminal rule (`overridable ==
+    /// false`) freezes the decision: a frozen deny cannot be allowed over and
+    /// a frozen allow cannot be denied over. No match defaults to
+    /// [`WriteDecision::Allow`]. Non-UTF-8 paths deny fail-closed.
     pub fn decide_write(&self, path: &LexicalPath) -> Explained<WriteDecision, WriteRuleMatch> {
         let Some(text) = path.as_str() else {
             return Explained {
@@ -295,8 +303,8 @@ impl MountPolicyProgram {
         }
         ordered.sort_by_key(|(authority, bucket, index, _)| {
             (
-                *authority,
-                if *bucket == WriteRuleEffect::Allow {
+                Reverse(*authority),
+                if *bucket == WriteRuleEffect::Deny {
                     0
                 } else {
                     1
@@ -328,11 +336,13 @@ impl MountPolicyProgram {
             if frozen_out || protected {
                 continue;
             }
-            if bucket == WriteRuleEffect::Deny {
-                decision = WriteDecision::Deny;
-                if rule.is_terminal() {
-                    frozen_by = Some(rule.origin.clone());
-                }
+            decision = if bucket == WriteRuleEffect::Allow {
+                WriteDecision::Allow
+            } else {
+                WriteDecision::Deny
+            };
+            if rule.is_terminal() {
+                frozen_by = Some(rule.origin.clone());
             }
         }
         Explained {
