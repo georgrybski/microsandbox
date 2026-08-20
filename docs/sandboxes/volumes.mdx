@@ -415,6 +415,8 @@ msb create python --name full \
 
 A bind mount can carry a compiled **mount path policy** that hides or protects host paths from the guest without changing the underlying directory. Use the `policy=<path>` mount token to point at a policy program JSON file resolved beneath the sandbox's approved runtime state directory.
 
+> For the stack-level story — how the workestrate tooling compiles hierarchical policy config into these program files — see [MOUNT-POLICY.md](https://github.com/georgrybski/microsandbox/blob/develop/MOUNT-POLICY.md) in this repository (and the workestrate mount-policy concept docs it references).
+
 <CodeGroup>
 ```bash CLI
 msb create python --name dev \
