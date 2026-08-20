@@ -73,7 +73,10 @@ impl PathPolicyRule {
 }
 
 impl ScopeKind {
-    /// Return the numeric authority rank of this scope (higher overrides lower).
+    /// Return the numeric authority rank of this scope: 0 = home-registry
+    /// (highest authority) through 5 = mount-entry (lowest). Evaluation is
+    /// rank-ascending and the last non-frozen match wins, so a higher-authority
+    /// rule only sticks when it is terminal (`overridable == false`).
     pub fn authority(self) -> u32 {
         self as u32
     }
