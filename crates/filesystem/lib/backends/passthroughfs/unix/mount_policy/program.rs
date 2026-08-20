@@ -1,7 +1,7 @@
 //! Compiled mount policy program and pure evaluator (spec 22 §§4, 7, 10, 12, 13).
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
-use std::{cmp::Reverse, fmt};
+use std::fmt;
 
 use super::{LexicalPath, PathPolicyRule, PatternError, RuleEffect, RuleOrigin};
 
@@ -247,15 +247,16 @@ impl MountPolicyProgram {
     /// Protected paths short-circuit to [`WriteDecision::Deny`]: matching
     /// protect rules are recorded in the explain trace, but write rules cannot
     /// change the decision. Otherwise the union of `writes.allow` and
-    /// `writes.deny` is evaluated ordered by scope authority — the
-    /// lowest-authority scope first, so a higher-authority rule overrides a
-    /// lower-authority one — with deny rules before allow rules within the
-    /// same scope, then by index within the rule's own bucket. The last
-    /// non-frozen match wins, so within one scope an allow rule carves an
-    /// exception out of a broader deny. A terminal rule (`overridable ==
-    /// false`) freezes the decision: a frozen deny cannot be allowed over and
-    /// a frozen allow cannot be denied over. No match defaults to
-    /// [`WriteDecision::Allow`]. Non-UTF-8 paths deny fail-closed.
+    /// `writes.deny` is evaluated in authority order — home-registry first,
+    /// mount-entry last, mirroring the read axis — with deny rules before
+    /// allow rules within the same scope, then by index within the rule's own
+    /// bucket. The last non-frozen match wins, so a later (lower-authority)
+    /// scope relaxes an earlier scope's rule unless a terminal rule
+    /// (`overridable == false`) froze the decision, and within one scope an
+    /// allow rule carves an exception out of a broader deny. A frozen deny
+    /// cannot be allowed over and a frozen allow cannot be denied over. No
+    /// match defaults to [`WriteDecision::Allow`]. Non-UTF-8 paths deny
+    /// fail-closed.
     pub fn decide_write(&self, path: &LexicalPath) -> Explained<WriteDecision, WriteRuleMatch> {
         let Some(text) = path.as_str() else {
             return Explained {
@@ -303,7 +304,7 @@ impl MountPolicyProgram {
         }
         ordered.sort_by_key(|(authority, bucket, index, _)| {
             (
-                Reverse(*authority),
+                *authority,
                 if *bucket == WriteRuleEffect::Deny {
                     0
                 } else {

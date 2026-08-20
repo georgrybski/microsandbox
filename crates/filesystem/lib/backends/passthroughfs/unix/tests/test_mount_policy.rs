@@ -309,28 +309,28 @@ fn write_allow_rule_is_active_and_recorded() {
 }
 
 #[test]
-fn higher_authority_write_rule_wins_regardless_of_bucket() {
-    let deny_wins = write_program(
-        &[],
-        &[("f.txt", ScopeKind::Workload, true)],
-        &[("f.txt", ScopeKind::HomeRegistry, true)],
-    );
-    assert_eq!(decide_write(&deny_wins, "f.txt"), WriteDecision::Deny);
-
+fn later_scope_write_rule_wins_unless_frozen() {
     let allow_wins = write_program(
         &[],
+        &[("f.txt", ScopeKind::Workload, true)],
+        &[("f.txt", ScopeKind::HomeRegistry, true)],
+    );
+    assert_eq!(decide_write(&allow_wins, "f.txt"), WriteDecision::Allow);
+
+    let deny_wins = write_program(
+        &[],
         &[("f.txt", ScopeKind::HomeRegistry, true)],
         &[("f.txt", ScopeKind::Workload, true)],
     );
-    assert_eq!(decide_write(&allow_wins, "f.txt"), WriteDecision::Allow);
+    assert_eq!(decide_write(&deny_wins, "f.txt"), WriteDecision::Deny);
 }
 
 #[test]
 fn terminal_write_deny_cannot_be_allowed_over() {
     let policy = write_program(
         &[],
-        &[("f.txt", ScopeKind::HomeRegistry, true)],
-        &[("f.txt", ScopeKind::Workload, false)],
+        &[("f.txt", ScopeKind::Workload, true)],
+        &[("f.txt", ScopeKind::HomeRegistry, false)],
     );
     let explained = policy.decide_write(&LexicalPath::new("f.txt").unwrap());
     assert_eq!(explained.decision, WriteDecision::Deny);
@@ -339,7 +339,7 @@ fn terminal_write_deny_cannot_be_allowed_over() {
         Some(RuleOrigin {
             layer: "test".to_string(),
             file: PathBuf::from("test.json"),
-            scope_kind: ScopeKind::Workload,
+            scope_kind: ScopeKind::HomeRegistry,
         })
     );
     let allow_match = explained
@@ -354,8 +354,8 @@ fn terminal_write_deny_cannot_be_allowed_over() {
 fn terminal_write_allow_cannot_be_denied_over() {
     let policy = write_program(
         &[],
-        &[("f.txt", ScopeKind::Workload, false)],
-        &[("f.txt", ScopeKind::HomeRegistry, true)],
+        &[("f.txt", ScopeKind::HomeRegistry, false)],
+        &[("f.txt", ScopeKind::Workload, true)],
     );
     let explained = policy.decide_write(&LexicalPath::new("f.txt").unwrap());
     assert_eq!(explained.decision, WriteDecision::Allow);
