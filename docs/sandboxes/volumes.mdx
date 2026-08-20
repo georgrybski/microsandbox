@@ -437,10 +437,12 @@ let sb = Sandbox::builder("dev")
 For each guest-visible path the policy returns one of:
 
 - **Visible** — the path is exposed normally.
-- **Masked** — the path is hidden: `lookup` returns `ENOENT`, the name is omitted from `readdir`, and `create`/`rename` into it return `EACCES`. A masked directory that a later rule unmasks a descendant of becomes **traversal-only**: the directory itself is hidden but can still be traversed so the descendant can be reached.
+- **Masked** — the host entry is sealed: `lookup`, read-opens, `stat`, `unlink`, and renaming it out fail with `ENOENT`, the name is omitted from `readdir`, and no host mutation is possible through the masked alias. Creating over a masked *name* is allowed and tags the guest-created alias (union semantics); write-opening (`O_WRONLY`/`O_RDWR`/`O_CREAT`) a masked host file adopts and tags that host file, making the alias guest-owned. A masked directory that a later rule unmasks a descendant of becomes **traversal-only**: the directory itself is hidden but can still be traversed so the descendant can be reached.
 - **TraversalOnly** — hidden itself but traversable for unmasked descendants.
 
-Write admission is enforced separately: a `writes.deny` rule that matches a path blocks writes (`EACCES`) even when the path is otherwise visible. `protect` rules are terminal masks that cannot be overridden by later rules.
+Write admission is enforced separately from visibility: the evaluator takes the union of `writes.allow` and `writes.deny` rules ordered by scope authority, so a higher-authority scope overrides a lower one, with deny rules applied before allow rules within the same scope; the last non-frozen match wins and the default is allow. A rule with `"overridable": false` is terminal and freezes the decision against all later matches. A matching write deny blocks creates, write-opens, attribute changes, and removals with `EACCES` even when the path is otherwise visible; on remove-class operations an untagged masked path still fails with `ENOENT`, since invisibility takes precedence there.
+
+`protect` rules are terminal masks that can never be overridden or tagged: create/open/setattr-class operations fail with `EACCES`, remove-class operations fail with `ENOENT`, and a protected entry blocks cascade removal of a masked ancestor.
 
 To preserve correctness across rename and forget races, the backend keeps a small **tag store** of pinned `O_PATH` descriptors for masked aliases. When a masked directory is removed, the backend performs a bounded **cascade removal** of masked descendants (depth-limited, fail-closed) so stale tags are evicted.
 
@@ -475,7 +477,7 @@ The program is a JSON object with `version: 1` and four rule lists:
 }
 ```
 
-`rules` are ordered mask/unmask rules (last non-frozen match wins); `protect` are terminal masks; `writes` is an `{allow, deny}` rule set for write admission; `case_sensitivity` is `"sensitive"` (default) or `"insensitive"`. Patterns are mount-root-relative globs; a trailing `/` makes a pattern directory-only.
+`rules` are ordered mask/unmask rules (last non-frozen match wins); `protect` are terminal masks that also deny writes; `writes` is an `{allow, deny}` rule set for write admission — both buckets are effective: the evaluator applies the union ordered by scope authority (deny before allow within a scope, last non-frozen match wins, default allow); `case_sensitivity` is `"sensitive"` (default) or `"insensitive"`. Patterns are mount-root-relative globs; a trailing `/` makes a pattern directory-only.
 
 ### Platform support
 
