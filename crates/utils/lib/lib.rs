@@ -33,6 +33,15 @@ pub const CACHE_SUBDIR: &str = "cache";
 /// Subdirectory for per-sandbox state.
 pub const SANDBOXES_SUBDIR: &str = "sandboxes";
 
+/// MSB_HOME-anchored subdirectory holding compiled mount policies.
+///
+/// This is the approved root beneath which the runtime's fail-closed
+/// loader resolves `policy=` mount tokens. It lives next to `sandboxes/`
+/// (not inside a per-sandbox runtime dir) because sandbox create wipes or
+/// rejects a pre-existing `sandboxes/<name>` directory, so a policy staged
+/// there could never survive to VM build.
+pub const MOUNT_POLICY_DIR_NAME: &str = "mount-policy";
+
 /// Subdirectory for named volumes.
 pub const VOLUMES_SUBDIR: &str = "volumes";
 

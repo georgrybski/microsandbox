@@ -31,7 +31,10 @@ pub fn render(name: &str, err: &BootError) {
     let cause = format!("{}: {}", stage, err.message);
 
     let hint_text = stage_hint(err);
-    let log_pointer = format!("run `msb logs --source system {name}` for full diagnostics");
+    let log_pointer = format!(
+        "run `msb logs --source system {name}` for full diagnostics \
+         (the system log may not exist if the runtime died before creating it)"
+    );
 
     let mut lines: Vec<ErrorLine<'_>> = Vec::with_capacity(3);
     lines.push(ErrorLine::Cause(&cause));

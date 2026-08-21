@@ -39,6 +39,17 @@ pub struct LaunchConfig {
     /// Runtime directory (scripts, heartbeat).
     pub runtime_dir: PathBuf,
 
+    /// Approved root beneath which `policy=` mount tokens are resolved.
+    ///
+    /// Host-side and user-owned (anchored at `MSB_HOME/mount-policy`, not the
+    /// per-sandbox runtime directory). The fail-closed loader
+    /// (`vm::load_mount_policy`) still rejects absolute paths and `..`
+    /// components and walks each component with `O_NOFOLLOW` beneath this
+    /// root. Empty means a legacy launch config; the loader falls back to
+    /// `<runtime_dir>/mount-policy`.
+    #[serde(default)]
+    pub mount_policy_dir: PathBuf,
+
     /// Root directory holding every sandbox's persisted state.
     pub sandboxes_dir: PathBuf,
 
