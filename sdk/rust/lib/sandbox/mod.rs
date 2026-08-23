@@ -17,7 +17,6 @@ pub mod init;
 pub(crate) mod metrics;
 mod modify;
 mod patch;
-#[cfg(windows)]
 mod reap;
 #[cfg(feature = "ssh")]
 pub mod ssh;
