@@ -468,6 +468,10 @@ impl SandboxHandle {
     }
 
     /// Stop the sandbox gracefully using the default stop timeout.
+    ///
+    /// Returns only once the sandbox is observed stopped **and** the recorded
+    /// local runtime process has actually exited, so a follow-up
+    /// [`remove`](Self::remove) cannot trip its still-alive-process guard.
     pub async fn stop(&self) -> MicrosandboxResult<()> {
         self.stop_with_timeout(DEFAULT_STOP_TIMEOUT).await
     }
@@ -476,6 +480,7 @@ impl SandboxHandle {
     pub async fn stop_with_timeout(&self, timeout: std::time::Duration) -> MicrosandboxResult<()> {
         let current = self.refresh().await?;
         if sandbox_status_is_terminal(current.status_snapshot()) {
+            current.await_local_runtime_exit().await?;
             return Ok(());
         }
 
@@ -492,6 +497,11 @@ impl SandboxHandle {
                 // process".
                 #[cfg(windows)]
                 current.reap_leaked_local_runtime().await?;
+                // All platforms: the row goes terminal on the VMM thread
+                // before the runtime process finishes teardown (writeback
+                // flush included), so prove the process is gone before
+                // returning.
+                current.await_local_runtime_exit().await?;
                 return Ok(());
             }
             Ok(Err(error)) => return Err(error),
@@ -507,6 +517,7 @@ impl SandboxHandle {
         match tokio::time::timeout(DEFAULT_KILL_TIMEOUT, current.wait_until_stopped()).await {
             Ok(result) => {
                 result?;
+                current.await_local_runtime_exit().await?;
                 Ok(())
             }
             Err(_) => Err(MicrosandboxError::Runtime(format!(
@@ -550,9 +561,14 @@ impl SandboxHandle {
     }
 
     /// Force-kill the sandbox and wait up to `timeout` for stopped-state observation.
+    ///
+    /// Also waits for the recorded local runtime process to exit (see
+    /// [`stop`](Self::stop)): the runtime's own exit observer can mark the row
+    /// terminal while the process is still exiting.
     pub async fn kill_with_timeout(&self, timeout: std::time::Duration) -> MicrosandboxResult<()> {
         let current = self.refresh().await?;
         if sandbox_status_is_terminal(current.status_snapshot()) {
+            current.await_local_runtime_exit().await?;
             return Ok(());
         }
 
@@ -560,6 +576,7 @@ impl SandboxHandle {
         match tokio::time::timeout(timeout, current.wait_until_stopped()).await {
             Ok(result) => {
                 result?;
+                current.await_local_runtime_exit().await?;
                 Ok(())
             }
             Err(_) => Err(MicrosandboxError::Runtime(format!(
@@ -654,6 +671,26 @@ impl SandboxHandle {
                     .await
             }
         }
+    }
+
+    /// Wait for the recorded local runtime process to actually exit after the
+    /// DB row went terminal, escalating to a kill when it outlives
+    /// [`RUNTIME_EXIT_GRACE`](super::reap::RUNTIME_EXIT_GRACE). A successful
+    /// stop must mean "no process". No-op for cloud handles.
+    async fn await_local_runtime_exit(&self) -> MicrosandboxResult<()> {
+        let Some(local) = self.local() else {
+            return Ok(());
+        };
+        let Some(local_backend) = self.backend.as_local() else {
+            return Ok(());
+        };
+        super::reap::await_recorded_runtime_exit(
+            local_backend,
+            local.db_id,
+            &self.name,
+            super::reap::RUNTIME_EXIT_GRACE,
+        )
+        .await
     }
 
     /// Kill any leftover VM process still backing this local sandbox after
