@@ -12,6 +12,7 @@ from microsandbox.types import (
     ExecEventType,
     ExecOptions,
     FsEntryKind,
+    HostPermissions,
     ImageArchiveFormat,
     ImageSource,
     InitConfig,
@@ -38,6 +39,7 @@ from microsandbox.types import (
     SnapshotFormat,
     SnapshotScope,
     SnapshotStateKind,
+    StatVirtualization,
     Stdin,
     ViolationAction,
     ViolationPolicy,
@@ -461,6 +463,7 @@ class SandboxSshOps:
         user: str = "root",
         term: str | None = None,
         sftp: bool = True,
+        inactivity_timeout: float | None = None,
     ) -> SshClient: ...
     async def prepare_server(
         self,
@@ -469,6 +472,7 @@ class SandboxSshOps:
         authorized_keys_path: str | os.PathLike[str] | None = None,
         user: str | None = None,
         sftp: bool = True,
+        inactivity_timeout: float | None = None,
     ) -> SshServer: ...
 
 class SshOutput:
@@ -617,6 +621,10 @@ class Volume:
         noexec: bool = False,
         nosuid: bool = False,
         nodev: bool = False,
+        stat_virtualization: StatVirtualization | None = None,
+        host_permissions: HostPermissions | None = None,
+        uid: int | None = None,
+        gid: int | None = None,
     ) -> MountConfig: ...
     @staticmethod
     def named(
@@ -630,6 +638,10 @@ class Volume:
         noexec: bool = False,
         nosuid: bool = False,
         nodev: bool = False,
+        stat_virtualization: StatVirtualization | None = None,
+        host_permissions: HostPermissions | None = None,
+        uid: int | None = None,
+        gid: int | None = None,
     ) -> MountConfig: ...
     @staticmethod
     def tmpfs(

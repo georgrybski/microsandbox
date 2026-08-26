@@ -57,7 +57,7 @@ Open a native in-process SSH client connected to the sandbox.
 <div className="msb-params">
   <div className="msb-param">
     <div className="msb-param-key"><code>opts</code><a className="msb-type" href="#sshclientoptions">SshClientOptions</a></div>
-    <div className="msb-param-desc">Optional client options: login user, terminal name, SFTP toggle.</div>
+    <div className="msb-param-desc">Optional client options: login user, terminal name, SFTP toggle, and inactivity timeout.</div>
   </div>
 </div>
 
@@ -71,6 +71,8 @@ Open a native in-process SSH client connected to the sandbox.
 </div>
 
 #### <span className="msb-recv">ssh.</span><span className="msb-hn">prepareServer()</span>
+
+<Tooltip tip="On microsandbox cloud, the reusable server works when you supply explicit host-key and authorized-key material; the convenience defaults are local-only."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
 
 ```typescript
 prepareServer(opts?: SshServerOptions): Promise<SshServer>
@@ -92,7 +94,7 @@ Prepare a reusable SSH server endpoint backed by the sandbox.
 <div className="msb-params">
   <div className="msb-param">
     <div className="msb-param-key"><code>opts</code><a className="msb-type" href="#sshserveroptions">SshServerOptions</a></div>
-    <div className="msb-param-desc">Optional server options: host key path, authorized-keys path, guest user, SFTP toggle.</div>
+    <div className="msb-param-desc">Optional server options: host key path, authorized-keys path, guest user, SFTP toggle, and inactivity timeout.</div>
   </div>
 </div>
 
@@ -576,6 +578,7 @@ Options for opening an SSH client. All fields are optional.
 | user | `string` | SSH login user |
 | term | `string` | Terminal name for interactive sessions |
 | sftp | `boolean` | Enable or disable SFTP on the internal server |
+| inactivityTimeoutSecs | `number` | Disconnect after this many whole seconds without SSH traffic. `0` disables the timeout; omitted inherits the global setting |
 
 ### SshExecOptions
 
@@ -610,3 +613,4 @@ Options for preparing an SSH server endpoint. All fields are optional.
 | authorizedKeysPath | `string` | Override the authorized-keys path |
 | user | `string` | Override the guest user used for exec requests |
 | sftp | `boolean` | Enable or disable SFTP |
+| inactivityTimeoutSecs | `number` | Disconnect after this many whole seconds without SSH traffic. `0` disables the timeout; omitted inherits the global setting |

@@ -20,12 +20,13 @@ use std::time::Duration;
 use microsandbox_db::DbWriteConnection;
 use microsandbox_db::entity::run as run_entity;
 #[cfg(unix)]
-use microsandbox_filesystem::{BindIdentityMapHandle, DynFileSystem};
+use microsandbox_filesystem::{BindIdentityMap, BindIdentityMapHandle, DynFileSystem};
 use microsandbox_filesystem::{
     HostPermissions, MountPolicyProgram, PassthroughConfig, PassthroughFs, StatVirtualization,
 };
 use microsandbox_metrics::{ActivateSlot, MetricsRegistry, ReleaseMode};
 use microsandbox_protocol::{
+    bootstrap::{BootstrapBlockRoot, GuestBootstrap},
     codec,
     message::{Message, MessageType},
 };
@@ -235,7 +236,7 @@ enum ParentWatchdogSignal {
 /// `backing`); a user-supplied disk-image root disk carries its own path
 /// and format. A tmpfs root disk attaches no upper device at all — the
 /// caller leaves both `rootfs_upper` and `rootfs_upper_spec` unset and
-/// signals tmpfs through `MSB_BLOCK_ROOT`. The shape stays
+/// selects tmpfs in the typed guest bootstrap. The shape stays
 /// forward-compatible with qcow2 backing chains: when chains land,
 /// `backing` lists ancestor files that the runtime attaches read-only
 /// ahead of the head file.
@@ -255,7 +256,7 @@ pub struct UpperSpec {
 /// Specification for a disk-image volume mount attached to the guest.
 ///
 /// Each entry becomes one extra virtio-blk device. Agentd consumes the
-/// companion `MSB_DISK_MOUNTS` env var to know which device to mount where.
+/// companion typed bootstrap entry to know which device to mount where.
 #[derive(Debug, Clone)]
 pub struct DiskMountSpec {
     /// Stable block id. Surfaced in the guest as the virtio-blk `serial`
@@ -266,7 +267,7 @@ pub struct DiskMountSpec {
     pub host: PathBuf,
 
     /// Guest mount path. Not needed by the VMM, but carried here for
-    /// logging/validation; agentd reads the canonical value from the env.
+    /// logging/validation; agentd reads the canonical value from bootstrap.
     pub guest: String,
 
     /// Disk image format.
@@ -365,11 +366,8 @@ pub struct VmConfig {
     /// Path to the init binary in the guest.
     pub init_path: Option<PathBuf>,
 
-    /// Environment variables as `KEY=VALUE` pairs.
-    pub env: Vec<String>,
-
-    /// Working directory inside the guest.
-    pub workdir: Option<PathBuf>,
+    /// Typed one-shot configuration delivered to agentd over its console.
+    pub bootstrap: GuestBootstrap,
 
     /// Path to the executable to run in the guest.
     pub exec_path: Option<PathBuf>,
@@ -405,6 +403,12 @@ struct BindIdentityMapRegistration {
 }
 
 #[cfg(feature = "net")]
+struct KrunNetworkRateLimiters {
+    rx: Option<msb_krun::RateLimiterConfig>,
+    tx: Option<msb_krun::RateLimiterConfig>,
+}
+
+#[cfg(feature = "net")]
 type NetworkTerminationHandle = microsandbox_network::network::TerminationHandle;
 
 #[cfg(not(feature = "net"))]
@@ -427,6 +431,7 @@ type VmBuildOutput = (
     Option<NetworkTerminationHandle>,
     Option<NetworkMetricsHandle>,
     Option<NetworkSecretsHandle>,
+    Vec<u8>,
     BindIdentityMapRegistration,
 );
 
@@ -477,8 +482,7 @@ impl std::fmt::Debug for VmConfig {
         debug.field("backends", &format!("[{} backend(s)]", self.backends.len()));
         debug
             .field("init_path", &self.init_path)
-            .field("env", &self.env)
-            .field("workdir", &self.workdir)
+            .field("bootstrap", &self.bootstrap)
             .field("exec_path", &self.exec_path)
             .field("exec_args", &self.exec_args)
             .finish()
@@ -712,7 +716,11 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
     let exit_metrics_writer = metrics_writer.clone();
     let exit_cpu_guard = Arc::clone(&cpu_guard);
     let exit_writeback_guard = Arc::clone(&writeback_guard);
+    let placement_rt_handle = tokio_rt.handle().clone();
+    let placement_db = db.clone();
+    let placement_cpu_guard = Arc::clone(&cpu_guard);
     let resolved_numa_topology = cpu_guard.numa_topology();
+    let placement_required = cpu_guard.placement_required();
     #[cfg(windows)]
     let _agent_console_pipe_bridge = AgentConsolePipeBridge::spawn(
         agent_console_pipe_name(config.sandbox_id),
@@ -720,6 +728,11 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
         tokio_rt.handle(),
     )
     .map_err(|e| RuntimeError::Custom(format!("agent console pipe bridge: {e}")))?;
+    let host_placement = HostPlacement {
+        vcpu_targets: cpu_guard.vcpu_targets(),
+        required: placement_required,
+        numa_topology: resolved_numa_topology,
+    };
     let build_result = build_vm(
         &config,
         console_backend,
@@ -838,9 +851,29 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
                 tracing::debug!(error = %err, slot = writer.slot(), "metrics slot release at exit");
             }
         },
+        move |report: &msb_krun::PlacementReport| {
+            let pinned = report
+                .vcpus
+                .iter()
+                .filter(|result| matches!(result, msb_krun::VcpuPlacementResult::Pinned { .. }))
+                .count();
+            if let Err(error) =
+                placement_rt_handle.block_on(placement_cpu_guard.reconcile(&placement_db, report))
+            {
+                // Placement is already effective at the OS boundary. A catalog failure must not
+                // turn an ordinary best-effort policy into a sandbox-creation failure; the
+                // process-held lease remains conservative until exit or stale-lease recovery.
+                tracing::warn!(%error, "record effective host placement");
+            }
+            tracing::info!(
+                pinned_vcpus = pinned,
+                inherited_vcpus = report.vcpus.len().saturating_sub(pinned),
+                memory = ?report.memory,
+                "host placement acknowledged before guest execution"
+            );
+        },
         tokio_rt.handle().clone(),
-        cpu_guard.vcpu_targets(),
-        resolved_numa_topology,
+        host_placement,
         writeback_limit.as_ref(),
     );
     let (
@@ -848,6 +881,7 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
         _network_termination_handle,
         network_metrics_handle,
         _network_secrets_handle,
+        bootstrap_frame,
         bind_identity_map,
     ) = match build_result {
         Ok(vm) => vm,
@@ -874,6 +908,12 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
             return Err(e);
         }
     };
+
+    // This must be the first host-to-guest frame. It is queued before the
+    // watchdog and relay tasks can produce shutdown or init-ack messages, and
+    // remains buffered until agentd opens the console during early boot.
+    relay::push_guest_frame_blocking(&shared, bootstrap_frame)?;
+
     #[cfg(unix)]
     {
         relay =
@@ -1357,17 +1397,23 @@ fn is_writeback_limited_disk(format: msb_krun::DiskImageFormat, read_only: bool)
 }
 
 /// Build the `Vm` from config with an exit observer for cleanup.
+struct HostPlacement<'a> {
+    vcpu_targets: Option<&'a [crate::cpu::LogicalCpuId]>,
+    required: bool,
+    numa_topology: Option<msb_krun::NumaTopology>,
+}
+
 fn build_vm(
     config: &Config,
     console_backend: AgentConsoleBackend,
     on_exit: impl Fn(i32) + Send + 'static,
+    on_placement: impl FnOnce(&msb_krun::PlacementReport) + Send + 'static,
     tokio_handle: tokio::runtime::Handle,
-    vcpu_targets: Option<&[crate::cpu::LogicalCpuId]>,
-    numa_topology: Option<msb_krun::NumaTopology>,
+    host_placement: HostPlacement<'_>,
     writeback_limit: Option<&msb_krun::WritebackLimit>,
 ) -> RuntimeResult<VmBuildOutput> {
-    let mut exec_env = config.vm.env.clone();
     let vm = &config.vm;
+    let mut bootstrap = vm.bootstrap.clone();
     let balloon_stats_interval = config
         .metrics_sample_interval_ms
         .map(|interval_ms| Duration::from_millis(interval_ms.get()));
@@ -1384,16 +1430,19 @@ fn build_vm(
                 .max_vcpus(vm.max_cpus.max(vm.vcpus))
                 .max_memory_mib((vm.max_memory_mib.max(vm.memory_mib)) as usize)
                 .balloon_stats_interval(balloon_stats_interval);
-            if let Some(targets) = vcpu_targets {
-                m = m.vcpu_affinity(
-                    targets
-                        .iter()
-                        .copied()
-                        .map(|cpu| msb_krun::HostCpuId::in_group(cpu.group, cpu.index))
-                        .collect(),
-                );
+            if let Some(targets) = host_placement.vcpu_targets {
+                let affinity = targets
+                    .iter()
+                    .copied()
+                    .map(|cpu| msb_krun::HostCpuId::in_group(cpu.group, cpu.index))
+                    .collect();
+                m = if host_placement.required {
+                    m.vcpu_affinity(affinity)
+                } else {
+                    m.try_vcpu_affinity(affinity)
+                };
             }
-            if let Some(topology) = numa_topology {
+            if let Some(topology) = host_placement.numa_topology {
                 m = m.numa_topology(topology);
             }
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -1482,8 +1531,6 @@ fn build_vm(
                 apply_block_writeback_limit(d, format, false, writeback_limit.as_ref())
             });
         }
-
-        // MSB_BLOCK_ROOT env var is set by the caller (spawn_sandbox).
     } else if let Some(ref disk_path) = vm.rootfs_disk {
         #[cfg(unix)]
         {
@@ -1515,7 +1562,12 @@ fn build_vm(
             let d = d.path(&disk_path).format(format).read_only(readonly);
             apply_block_writeback_limit(d, format, readonly, writeback_limit.as_ref())
         });
-        append_block_root_env(&mut exec_env);
+        if bootstrap.block_root.is_none() {
+            bootstrap.block_root = Some(BootstrapBlockRoot::DiskImage {
+                device: "/dev/vda".to_string(),
+                fstype: None,
+            });
+        }
     }
 
     // Runtime directory mount — agentd mounts this at /.msb for scripts
@@ -1562,9 +1614,21 @@ fn build_vm(
             .map_err(|e| RuntimeError::Custom(format!("--mount {mount_spec:?}: {e}")))?;
 
         let tag = parsed.tag;
+        // Keep the host path as a PathBuf so mount failures can format it
+        // without relying on the string-only mount spec field.
+        let host_path = PathBuf::from(&parsed.host_path);
+        // Explicit guest owner for host files with no per-file override. Parsing
+        // guarantees uid/gid come as a pair, so this is Some only when both are set.
+        let override_owner = match (parsed.override_uid, parsed.override_gid) {
+            (Some(uid), Some(gid)) => Some((uid, gid)),
+            _ => None,
+        };
         #[cfg(unix)]
-        let mount_bind_identity_map =
-            bind_identity_map_for_mount(&mut bind_identity_map, parsed.stat_virtualization);
+        let mount_bind_identity_map = bind_identity_map_for_mount(
+            &mut bind_identity_map,
+            parsed.stat_virtualization,
+            override_owner,
+        );
         let mask_policy = match &parsed.policy_path {
             None => None,
             Some(rel) => Some(Arc::new(load_mount_policy(&policy_root, rel).map_err(
@@ -1572,7 +1636,7 @@ fn build_vm(
             )?)),
         };
         let cfg = PassthroughConfig {
-            root_dir: PathBuf::from(parsed.host_path),
+            root_dir: host_path.clone(),
             inject_init: false,
             stat_virtualization: parsed.stat_virtualization,
             host_permissions: parsed.host_permissions,
@@ -1582,12 +1646,37 @@ fn build_vm(
             no_symlink_root: !parsed.follow_root_symlinks,
             #[cfg(unix)]
             bind_identity_map: mount_bind_identity_map,
+            #[cfg(windows)]
+            default_owner: override_owner,
             quota_bytes: parsed.quota_bytes,
             mask_policy,
             ..Default::default()
         };
-        let backend = PassthroughFs::new(cfg)
-            .map_err(|e| RuntimeError::Custom(format!("mount {tag}: {e}")))?;
+        let backend = PassthroughFs::new(cfg).map_err(|e| {
+            // Name the folder on a permission error. The underlying error
+            // distinguishes path access from a strict metadata probe failure.
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                #[cfg(target_os = "macos")]
+                let platform_hint =
+                    " On macOS, grant access in System Settings > Privacy & Security.";
+                #[cfg(not(target_os = "macos"))]
+                let platform_hint = "";
+                let policy_hint = if matches!(
+                    parsed.stat_virtualization,
+                    StatVirtualization::Strict
+                ) {
+                    " For a foreign-owned path, use stat-virt=relaxed if full metadata virtualization is not required."
+                } else {
+                    ""
+                };
+                RuntimeError::Custom(format!(
+                    "mount {tag}: permission denied accessing host folder {} ({e}).{platform_hint}{policy_hint}",
+                    host_path.display(),
+                ))
+            } else {
+                RuntimeError::Custom(format!("mount {tag}: {e}"))
+            }
+        })?;
         builder = builder.fs(move |fs| fs.tag(&tag).custom(Box::new(backend)));
     }
 
@@ -1730,6 +1819,7 @@ fn build_vm(
             .secrets
             .validate()
             .map_err(|err| RuntimeError::Custom(format!("invalid network secrets: {err}")))?;
+        let rate_limiters = to_krun_network_rate_limiters(&vm.network);
 
         let mut network = microsandbox_network::network::SmoltcpNetwork::new_with_profile(
             vm.network.clone(),
@@ -1762,29 +1852,30 @@ fn build_vm(
             }
         }
 
-        for (key, value) in network.guest_env_vars() {
-            exec_env.push(format!("{key}={value}"));
-        }
+        bootstrap.network = Some(network.guest_bootstrap_network());
+        bootstrap.host_alias = Some(network.guest_host_alias().to_string());
+        bootstrap.default_env.extend(network.guest_secret_env());
 
-        builder = builder.net(move |n| n.mac(guest_mac).custom(net_backend));
+        builder = builder.net(move |mut n| {
+            n = n.mac(guest_mac);
+            if let Some(config) = rate_limiters.rx {
+                n = n.rx_rate_limiter(config);
+            }
+            if let Some(config) = rate_limiters.tx {
+                n = n.tx_rate_limiter(config);
+            }
+            n.custom(net_backend)
+        });
     }
 
-    // Execution configuration.
-    prepend_scripts_path(&mut exec_env);
+    // The kernel command line only selects agentd. Workload environment and
+    // cwd now travel through the typed bootstrap and exec protocols.
     builder = builder.exec(|mut e| {
         if let Some(ref path) = vm.exec_path {
             e = e.path(path);
         }
         if !vm.exec_args.is_empty() {
             e = e.args(&vm.exec_args);
-        }
-        for env_str in &exec_env {
-            if let Some((key, value)) = env_str.split_once('=') {
-                e = e.env(key, value);
-            }
-        }
-        if let Some(ref workdir) = vm.workdir {
-            e = e.workdir(workdir);
         }
         e
     });
@@ -1816,24 +1907,69 @@ fn build_vm(
     }
 
     // Exit observer — runs synchronously before _exit() for DB cleanup.
-    builder = builder.on_exit(on_exit);
+    builder = builder.on_placement(on_placement).on_exit(on_exit);
 
     let vm = builder
         .build()
         .map_err(|e| RuntimeError::Custom(format!("build VM: {e}")))?;
+
+    let bootstrap_frame = encode_bootstrap_frame(&bootstrap)?;
 
     Ok((
         vm,
         network_termination_handle,
         network_metrics_handle,
         network_secrets_handle,
+        bootstrap_frame,
         bind_identity_map,
     ))
+}
+
+fn encode_bootstrap_frame(bootstrap: &GuestBootstrap) -> RuntimeResult<Vec<u8>> {
+    let message = Message::with_payload(MessageType::Bootstrap, 0, bootstrap)
+        .map_err(|e| RuntimeError::Custom(format!("encode guest bootstrap: {e}")))?;
+    let mut frame = Vec::new();
+    codec::encode_to_buf(&message, &mut frame)
+        .map_err(|e| RuntimeError::Custom(format!("encode guest bootstrap frame: {e}")))?;
+    Ok(frame)
 }
 
 //--------------------------------------------------------------------------------------------------
 // Functions: Helpers
 //--------------------------------------------------------------------------------------------------
+
+#[cfg(feature = "net")]
+fn to_krun_network_rate_limiters(
+    config: &microsandbox_network::config::NetworkConfig,
+) -> KrunNetworkRateLimiters {
+    let rate_limiter = config.rate_limiter.as_ref();
+    KrunNetworkRateLimiters {
+        rx: rate_limiter
+            .and_then(|rate_limiter| rate_limiter.ingress.as_ref())
+            .map(to_krun_rate_limiter),
+        tx: rate_limiter
+            .and_then(|rate_limiter| rate_limiter.egress.as_ref())
+            .map(to_krun_rate_limiter),
+    }
+}
+
+#[cfg(feature = "net")]
+fn to_krun_rate_limiter(
+    config: &microsandbox_types::RateLimiterConfig,
+) -> msb_krun::RateLimiterConfig {
+    fn bucket(config: &microsandbox_types::TokenBucketConfig) -> msb_krun::TokenBucketConfig {
+        msb_krun::TokenBucketConfig {
+            size: config.size,
+            refill_time: Duration::from_millis(config.refill_time_ms),
+            one_time_burst: config.one_time_burst,
+        }
+    }
+
+    msb_krun::RateLimiterConfig {
+        bandwidth: config.bandwidth.as_ref().map(bucket),
+        ops: config.ops.as_ref().map(bucket),
+    }
+}
 
 async fn monitor_writeback_pressure(
     guard: Arc<crate::writeback::WritebackPressureGuard>,
@@ -2001,15 +2137,26 @@ fn release_reserved_metrics_slot(handoff: Option<&MetricsSlotHandoff>) {
 fn bind_identity_map_for_mount(
     registration: &mut BindIdentityMapRegistration,
     stat_virtualization: StatVirtualization,
+    override_owner: Option<(u32, u32)>,
 ) -> Option<BindIdentityMapHandle> {
     if matches!(stat_virtualization, StatVirtualization::Off) {
         return None;
+    }
+
+    // Explicit ownership is per mount. It must not initialize the shared
+    // default-user handle because doing so would make mount order determine the
+    // ownership of every other stat-virtualized mount in the VM.
+    if let Some((guest_uid, guest_gid)) = override_owner {
+        return Some(Arc::new(OnceLock::from(BindIdentityMap::fixed(
+            guest_uid, guest_gid,
+        ))));
     }
 
     registration.mount_count += 1;
     let handle = registration
         .handle
         .get_or_insert_with(|| Arc::new(OnceLock::new()));
+
     Some(Arc::clone(handle))
 }
 
@@ -2334,6 +2481,14 @@ struct ParsedMountSpec {
     quota_bytes: Option<u64>,
     /// Relative path to a compiled mount policy, resolved beneath runtime state.
     policy_path: Option<String>,
+    /// Guest uid to present for host files that carry no per-file override
+    /// (`uid=` option). `None` keeps the runtime default. Must be set together
+    /// with [`override_gid`](Self::override_gid).
+    override_uid: Option<u32>,
+    /// Guest gid to present for host files that carry no per-file override
+    /// (`gid=` option). `None` keeps the runtime default. Must be set together
+    /// with [`override_uid`](Self::override_uid).
+    override_gid: Option<u32>,
 }
 
 /// Load a compiled mount policy beneath the explicitly approved runtime state directory.
@@ -2462,9 +2617,12 @@ fn load_mount_policy(
 ///
 /// Wire grammar: `tag:host_path[:opts]`, where `opts` is a comma-separated
 /// option block of flags (`ro`, `rw`, `noexec`, `nosuid`, `nodev`,
-/// `follow-root-symlinks`) and keyed policies (`stat-virt=...`, `host-perms=...`).
-/// The `follow-root-symlinks` flag opts the mount out of the default no-follow
-/// root resolution; its absence keeps the protective default on.
+/// `follow-root-symlinks`) and keyed policies (`stat-virt=...`, `host-perms=...`,
+/// `uid=...`, `gid=...`, `policy=<path>`). The `follow-root-symlinks` flag opts
+/// the mount out of the default no-follow root resolution; its absence keeps the
+/// protective default on.
+/// `uid=`/`gid=` set the guest owner presented for host files that have no per-file
+/// override (see [`ParsedMountSpec::override_uid`]); they must be given together.
 fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
     let (tag, rest) = spec
         .split_once(':')
@@ -2490,6 +2648,8 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
     let mut follow_root_symlinks = false;
     let mut quota_bytes = None;
     let mut policy_path = None;
+    let mut override_uid = None;
+    let mut override_gid = None;
     let mut seen_stat_virt = false;
     let mut seen_host_perms = false;
     let mut seen_access = false;
@@ -2499,6 +2659,8 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
     let mut seen_follow_root = false;
     let mut seen_quota = false;
     let mut seen_policy = false;
+    let mut seen_uid = false;
+    let mut seen_gid = false;
 
     if let Some(opts) = options {
         for opt in opts.split(',') {
@@ -2612,11 +2774,45 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
                             }
                             policy_path = Some(value.to_string());
                         }
+                        "uid" => {
+                            if seen_uid {
+                                return Err(
+                                    "mount option `uid` specified more than once".to_string()
+                                );
+                            }
+                            seen_uid = true;
+                            override_uid = Some(value.parse::<u32>().map_err(|_| {
+                                format!("invalid uid {value:?} (expected an unsigned integer)")
+                            })?);
+                        }
+                        "gid" => {
+                            if seen_gid {
+                                return Err(
+                                    "mount option `gid` specified more than once".to_string()
+                                );
+                            }
+                            seen_gid = true;
+                            override_gid = Some(value.parse::<u32>().map_err(|_| {
+                                format!("invalid gid {value:?} (expected an unsigned integer)")
+                            })?);
+                        }
                         other => return Err(format!("unknown mount option {other:?}")),
                     }
                 }
             }
         }
+    }
+
+    // The override owner is applied host-side (before the guest resolves its
+    // default user), so both halves must be known up front: reject a lone
+    // `uid=`/`gid=`.
+    if override_uid.is_some() != override_gid.is_some() {
+        return Err("mount options `uid` and `gid` must be specified together".to_string());
+    }
+    if override_uid.is_some() && matches!(stat_virtualization, StatVirtualization::Off) {
+        return Err(
+            "mount options `uid` and `gid` cannot be combined with stat-virt=off".to_string(),
+        );
     }
 
     Ok(ParsedMountSpec {
@@ -2628,6 +2824,8 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
         follow_root_symlinks,
         quota_bytes,
         policy_path,
+        override_uid,
+        override_gid,
     })
 }
 
@@ -2679,7 +2877,10 @@ pub fn validate_disk_format(format: Option<&str>) -> msb_krun::Result<msb_krun::
     }
 }
 
-/// Append the default block root env var if not already set.
+/// Append the legacy default block-root environment value if not already set.
+///
+/// Retained for downstream source compatibility. VM launch now carries this
+/// value in [`GuestBootstrap`] and does not call this helper.
 pub fn append_block_root_env(env: &mut Vec<String>) {
     let prefix = format!("{}=", microsandbox_protocol::ENV_BLOCK_ROOT);
     if env.iter().any(|entry| entry.starts_with(&prefix)) {
@@ -2688,7 +2889,10 @@ pub fn append_block_root_env(env: &mut Vec<String>) {
     env.push(format!("{prefix}/dev/vda"));
 }
 
-/// Prepend `/.msb/scripts` to PATH for the initial guest command.
+/// Prepend `/.msb/scripts` to a legacy initial-command environment.
+///
+/// Retained for downstream source compatibility. Agentd now prepares PATH for
+/// each exec request after receiving the typed bootstrap.
 pub fn prepend_scripts_path(env: &mut Vec<String>) {
     let scripts = microsandbox_protocol::SCRIPTS_PATH;
     let prefix = "PATH=";
@@ -2716,6 +2920,8 @@ fn thp_kernel_cmdline(policy: microsandbox_types::TransparentHugePagePolicy) -> 
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "net")]
+    use super::to_krun_network_rate_limiters;
     #[cfg(unix)]
     use super::{
         BindIdentityMapRegistration, PARENT_WATCH_DETACH, ParentWatchdogSignal,
@@ -2723,14 +2929,14 @@ mod tests {
     };
     use super::{
         ConsoleSharedState, HostPermissions, StatVirtualization, append_block_root_env,
-        bind_rootfs_backend, guest_shutdown_flush_timeout,
+        bind_rootfs_backend, encode_bootstrap_frame, guest_shutdown_flush_timeout,
         guest_shutdown_flush_timeout_with_override, load_mount_policy, parse_mount_spec,
         prepend_scripts_path, request_guest_shutdown, request_guest_shutdown_with_timeout,
         thp_kernel_cmdline, validate_disk_format,
     };
 
     use microsandbox_filesystem::{Context, DynFileSystem, FsOptions};
-    use microsandbox_protocol::{codec, message::MessageType};
+    use microsandbox_protocol::{bootstrap::GuestBootstrap, codec, message::MessageType};
     #[cfg(unix)]
     use std::io::Write;
     #[cfg(unix)]
@@ -2743,6 +2949,65 @@ mod tests {
             gid: 0,
             pid: 1,
         }
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn network_rate_limiters_map_directions_without_losing_precision() {
+        let egress = microsandbox_types::RateLimiterConfig {
+            bandwidth: Some(microsandbox_types::TokenBucketConfig {
+                size: 1_048_576,
+                refill_time_ms: 1_234,
+                one_time_burst: 524_288,
+            }),
+            ops: Some(microsandbox_types::TokenBucketConfig {
+                size: 1_000,
+                refill_time_ms: 7,
+                one_time_burst: 12,
+            }),
+        };
+        let ingress = microsandbox_types::RateLimiterConfig {
+            bandwidth: Some(microsandbox_types::TokenBucketConfig {
+                size: 2_048,
+                refill_time_ms: 99,
+                one_time_burst: 256,
+            }),
+            ops: None,
+        };
+        let config = microsandbox_network::config::NetworkConfig {
+            rate_limiter: Some(microsandbox_types::NetworkRateLimiterConfig {
+                egress: Some(egress),
+                ingress: Some(ingress),
+            }),
+            ..Default::default()
+        };
+
+        let mapped = to_krun_network_rate_limiters(&config);
+
+        assert_eq!(
+            mapped.tx.as_ref().unwrap().bandwidth.as_ref().unwrap(),
+            &msb_krun::TokenBucketConfig {
+                size: 1_048_576,
+                refill_time: Duration::from_millis(1_234),
+                one_time_burst: 524_288,
+            }
+        );
+        assert_eq!(
+            mapped.tx.unwrap().ops.unwrap(),
+            msb_krun::TokenBucketConfig {
+                size: 1_000,
+                refill_time: Duration::from_millis(7),
+                one_time_burst: 12,
+            }
+        );
+        assert_eq!(
+            mapped.rx.unwrap().bandwidth.unwrap(),
+            msb_krun::TokenBucketConfig {
+                size: 2_048,
+                refill_time: Duration::from_millis(99),
+                one_time_burst: 256,
+            }
+        );
     }
 
     #[test]
@@ -2788,6 +3053,40 @@ mod tests {
         assert!(matches!(p.stat_virtualization, StatVirtualization::Strict));
         assert!(matches!(p.host_permissions, HostPermissions::Private));
         assert!(!p.readonly);
+        assert_eq!(p.override_uid, None);
+        assert_eq!(p.override_gid, None);
+    }
+
+    #[test]
+    fn test_parse_mount_spec_uid_gid() {
+        let p = parse_mount_spec("home:/host/home:uid=1000,gid=1000").unwrap();
+        assert_eq!(p.override_uid, Some(1000));
+        assert_eq!(p.override_gid, Some(1000));
+
+        // uid 0 (root) is a valid, distinct value from "unset".
+        let p = parse_mount_spec("home:/host/home:uid=0,gid=0").unwrap();
+        assert_eq!(p.override_uid, Some(0));
+        assert_eq!(p.override_gid, Some(0));
+    }
+
+    #[test]
+    fn test_parse_mount_spec_uid_gid_must_be_paired() {
+        assert!(parse_mount_spec("home:/host/home:uid=1000").is_err());
+        assert!(parse_mount_spec("home:/host/home:gid=1000").is_err());
+    }
+
+    #[test]
+    fn test_parse_mount_spec_uid_gid_reject_stat_virt_off() {
+        let err = parse_mount_spec("home:/host/home:uid=1000,gid=1000,stat-virt=off").unwrap_err();
+        assert!(
+            err.contains("cannot be combined with stat-virt=off"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_mount_spec_rejects_invalid_uid() {
+        assert!(parse_mount_spec("home:/host/home:uid=abc,gid=1000").is_err());
     }
 
     #[test]
@@ -2962,19 +3261,31 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn test_bind_identity_map_registration_shares_handle_for_virtualized_mounts() {
+    fn test_bind_identity_map_registration_separates_explicit_owners() {
         let mut registration = BindIdentityMapRegistration {
             handle: None,
             mount_count: 0,
         };
 
         let first =
-            bind_identity_map_for_mount(&mut registration, StatVirtualization::Strict).unwrap();
+            bind_identity_map_for_mount(&mut registration, StatVirtualization::Strict, None)
+                .unwrap();
         let second =
-            bind_identity_map_for_mount(&mut registration, StatVirtualization::Relaxed).unwrap();
-        let off = bind_identity_map_for_mount(&mut registration, StatVirtualization::Off);
+            bind_identity_map_for_mount(&mut registration, StatVirtualization::Relaxed, None)
+                .unwrap();
+        let fixed = bind_identity_map_for_mount(
+            &mut registration,
+            StatVirtualization::Relaxed,
+            Some((1000, 1001)),
+        )
+        .unwrap();
+        let off = bind_identity_map_for_mount(&mut registration, StatVirtualization::Off, None);
 
         assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &fixed));
+        let fixed = fixed.get().unwrap();
+        assert_eq!((fixed.guest_uid, fixed.guest_gid), (1000, 1001));
+        assert_eq!((fixed.overflow_uid, fixed.overflow_gid), (1000, 1001));
         assert!(off.is_none());
         assert_eq!(registration.mount_count, 2);
     }
@@ -2989,6 +3300,27 @@ mod tests {
         let msg = codec::try_decode_from_buf(&mut frame).unwrap().unwrap();
         assert_eq!(msg.t, MessageType::Shutdown);
         assert_eq!(msg.id, 0);
+    }
+
+    #[test]
+    fn test_bootstrap_frame_is_a_generation_seven_control_message() {
+        let bootstrap = GuestBootstrap {
+            default_env: vec![microsandbox_protocol::bootstrap::BootstrapEnvVar {
+                key: "APP_CONFIG".to_string(),
+                value: "{\"message\":\"hello\"}".to_string(),
+            }],
+            ..GuestBootstrap::default()
+        };
+
+        let mut frame = encode_bootstrap_frame(&bootstrap).unwrap();
+        let message = codec::try_decode_from_buf(&mut frame).unwrap().unwrap();
+
+        assert_eq!(message.t, MessageType::Bootstrap);
+        assert_eq!(message.id, 0);
+        assert_eq!(message.flags, 0);
+        assert_eq!(message.v, microsandbox_protocol::message::PROTOCOL_VERSION);
+        assert_eq!(message.payload::<GuestBootstrap>().unwrap(), bootstrap);
+        assert!(frame.is_empty());
     }
 
     #[test]

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use microsandbox_image::{ImageConfig, RegistryAuth};
 use microsandbox_protocol::{HANDOFF_INIT_AUTO, HANDOFF_INIT_IMAGE_ENTRYPOINT_CANDIDATES};
+use typed_path::Utf8UnixPath;
 
 use super::types::{MountOptions, RootDisk, RootfsSource, VolumeMount};
 
@@ -46,7 +47,7 @@ pub const DEFAULT_REPLACE_TIMEOUT: std::time::Duration = std::time::Duration::fr
 
 // Compile-time defaults for `SandboxConfig` serde. Serde's `#[serde(default
 // = "fn")]` attribute can't take parameters, so these can't consult a
-// `LocalBackend`. They intentionally mirror `LocalConfig::default()` /
+// `LocalBackend`. They intentionally mirror `GlobalConfig::default()` /
 // `SandboxDefaults::default()` for the same fields, so DB-row
 // deserialization (and `sandbox_config_from_cloud`) are side-effect-free.
 // A `LocalBackend` with non-default sandbox defaults applies them through
@@ -553,14 +554,9 @@ fn guest_mount_is(mount: &VolumeMount, path: &str) -> bool {
         | VolumeMount::Named { guest, .. }
         | VolumeMount::Tmpfs { guest, .. }
         | VolumeMount::DiskImage { guest, .. } => {
-            normalized_guest_path(guest) == normalized_guest_path(path)
+            Utf8UnixPath::new(guest).normalize() == Utf8UnixPath::new(path).normalize()
         }
     }
-}
-
-fn normalized_guest_path(path: &str) -> &str {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() { "/" } else { trimmed }
 }
 
 pub(crate) fn sandbox_log_level_from_runtime(level: LogLevel) -> SandboxLogLevel {
@@ -1675,6 +1671,32 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_runtime_defaults_preserves_canonical_tmp_alias() {
+        let mut config = SandboxConfig {
+            spec: SandboxSpec {
+                image: RootfsSource::oci("python:3.12"),
+                mounts: vec![VolumeMount::Bind {
+                    host: "/host/tmp".into(),
+                    guest: "/tmp/.".into(),
+                    options: MountOptions::default(),
+                    stat_virtualization: crate::sandbox::StatVirtualization::Strict,
+                    host_permissions: crate::sandbox::HostPermissions::Private,
+                    follow_root_symlinks: false,
+                    quota_mib: None,
+                    mount_policy: None,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        config.apply_runtime_defaults();
+
+        assert_eq!(config.spec.mounts.len(), 1);
+        assert_eq!(config.spec.mounts[0].guest(), "/tmp/.");
+    }
+
+    #[test]
     fn test_apply_runtime_defaults_skips_non_oci_roots() {
         let mut config = SandboxConfig {
             spec: SandboxSpec {
@@ -1714,6 +1736,22 @@ mod tests {
         config.apply_runtime_defaults();
 
         assert!(config.spec.mounts.is_empty());
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn unspecified_network_policy_uses_engine_public_default() {
+        use microsandbox_network::policy::{NetworkPolicy, NetworkProfile};
+
+        let config = SandboxConfig::default();
+        assert!(config.spec.network.policy.is_none());
+
+        let actual = config.local_network_config().unwrap().policy;
+        let expected = NetworkPolicy::from_profiles([NetworkProfile::Public]);
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
     }
 
     //----------------------------------------------------------------------------------------------

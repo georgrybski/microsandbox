@@ -3479,6 +3479,39 @@ mod tests {
         .unwrap();
         Migrator::up(db.inner(), None).await.unwrap();
 
+        // The newest owner-compatibility marker has no schema objects of its
+        // own. With no persisted sandboxes, its preflight permits rollback and
+        // removes only the migration record.
+        rollback_schema(db.inner(), 1).await.unwrap();
+
+        let rows = db
+            .query_all_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "SELECT version FROM seaql_migrations WHERE version = ?",
+                [schema_metadata::MOUNT_OWNER_CONFIG_MIGRATION_ID.into()],
+            ))
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "mount owner marker should be rolled back");
+
+        // Shared CPU assignment rows downgrade first. Active sandboxes are
+        // prohibited during schema rollback, so the allocation table is empty
+        // and can safely return to its exclusive logical-CPU key.
+        rollback_schema(db.inner(), 1).await.unwrap();
+
+        let rows = db
+            .query_all_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "SELECT version FROM seaql_migrations WHERE version = ?",
+                [schema_metadata::SHARED_CPU_ALLOCATION_MIGRATION_ID.into()],
+            ))
+            .await
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "shared CPU allocation should be rolled back"
+        );
+
         // The label rebuild is compatible with older releases, so its down
         // migration only removes the migration record. NUMA memory and
         // writeback state must remain until their own rollback steps.

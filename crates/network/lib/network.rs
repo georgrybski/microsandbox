@@ -10,16 +10,23 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use ipnetwork::{Ipv4Network, Ipv6Network};
+use microsandbox_protocol::bootstrap::{
+    BootstrapEnvVar, BootstrapIpv4, BootstrapIpv6, BootstrapNetwork,
+};
 use microsandbox_protocol::{ENV_HOST_ALIAS, ENV_NET, ENV_NET_IPV4, ENV_NET_IPV6};
-use microsandbox_types::DeploymentProfile;
+use microsandbox_types::{
+    DeploymentProfile, NetworkRateLimitDirection, RateLimitConfigError, RateLimiterConfig,
+};
 use msb_krun::backends::net::NetBackend;
 
-use crate::backend::SmoltcpBackend;
 use crate::config::{MAX_NETWORK_CONNECTIONS, NetworkConfig};
+use crate::netstack::{
+    backend::SmoltcpBackend,
+    poll::{self, GatewayIps, PollLoopConfig},
+    shared::{DEFAULT_QUEUE_CAPACITY, SharedState},
+};
 use crate::policy::{NetworkPolicy, NetworkProfile};
 use crate::secrets::handle::SecretsHandle;
-use crate::shared::{DEFAULT_QUEUE_CAPACITY, SharedState};
-use crate::stack::{self, GatewayIps, PollLoopConfig};
 use crate::tls::state::{TlsState, TlsStateError};
 
 //--------------------------------------------------------------------------------------------------
@@ -46,7 +53,7 @@ const MULTI_TENANT_MAX_CONNECTIONS: usize = 256;
 ///
 /// Owns the smoltcp poll thread and provides:
 /// - [`take_backend()`](Self::take_backend) — the `NetBackend` for `VmBuilder::net()`
-/// - [`guest_env_vars()`](Self::guest_env_vars) — `MSB_NET*` env vars for the guest
+/// - [`guest_bootstrap_network()`](Self::guest_bootstrap_network) — typed guest network setup
 /// - [`ca_cert_pem()`](Self::ca_cert_pem) — CA certificate for TLS interception
 pub struct SmoltcpNetwork {
     config: NetworkConfig,
@@ -88,6 +95,20 @@ pub enum NetworkInitError {
     /// TLS interception state failed to initialize.
     #[error("TLS initialization failed: {0}")]
     Tls(#[from] TlsStateError),
+
+    /// A stored rate limiter configuration failed validation.
+    #[error("invalid {direction} rate limiter: {source}")]
+    InvalidRateLimit {
+        /// Which limiter is invalid: `egress` or `ingress`.
+        direction: NetworkRateLimitDirection,
+        /// Underlying validation error.
+        #[source]
+        source: RateLimitConfigError,
+    },
+
+    /// A stored network rate limiter has neither direction configured.
+    #[error("invalid network rate limiter: at least one of egress or ingress is required")]
+    EmptyNetworkRateLimiter,
 }
 
 /// Handle for installing host-side termination behavior into the network stack.
@@ -227,6 +248,34 @@ impl SmoltcpNetwork {
             .unwrap_or(DEFAULT_QUEUE_CAPACITY)
             .max(DEFAULT_QUEUE_CAPACITY);
         let shared = Arc::new(SharedState::new(queue_capacity));
+        // Every write path validates rate limiters (`NetworkBuilder::build`),
+        // but a stored config bypasses the builder: fail startup cleanly
+        // instead of panicking on a corrupted spec.
+        if config.rate_limiter.as_ref().is_some_and(|rate_limiter| {
+            rate_limiter.egress.is_none() && rate_limiter.ingress.is_none()
+        }) {
+            return Err(NetworkInitError::EmptyNetworkRateLimiter);
+        }
+        config
+            .rate_limiter
+            .as_ref()
+            .and_then(|rate_limiter| rate_limiter.ingress.as_ref())
+            .map(RateLimiterConfig::validate)
+            .transpose()
+            .map_err(|source| NetworkInitError::InvalidRateLimit {
+                direction: NetworkRateLimitDirection::Ingress,
+                source,
+            })?;
+        config
+            .rate_limiter
+            .as_ref()
+            .and_then(|rate_limiter| rate_limiter.egress.as_ref())
+            .map(RateLimiterConfig::validate)
+            .transpose()
+            .map_err(|source| NetworkInitError::InvalidRateLimit {
+                direction: NetworkRateLimitDirection::Egress,
+                source,
+            })?;
         let backend = SmoltcpBackend::new(shared.clone());
 
         let secrets = SecretsHandle::new(config.secrets.clone());
@@ -296,7 +345,7 @@ impl SmoltcpNetwork {
             std::thread::Builder::new()
                 .name("smoltcp-poll".into())
                 .spawn(move || {
-                    stack::smoltcp_poll_loop(
+                    poll::smoltcp_poll_loop(
                         shared,
                         poll_config,
                         network_policy,
@@ -360,6 +409,54 @@ impl SmoltcpNetwork {
         }
 
         vars
+    }
+
+    /// Build the typed network payload consumed by agentd during bootstrap.
+    pub fn guest_bootstrap_network(&self) -> BootstrapNetwork {
+        BootstrapNetwork {
+            interface: "eth0".to_string(),
+            mac: self.guest_mac,
+            mtu: self.mtu,
+            ipv4: self
+                .guest_ipv4
+                .zip(self.gateway_ipv4)
+                .map(|(address, gateway)| BootstrapIpv4 {
+                    address,
+                    prefix_len: 30,
+                    gateway,
+                    dns: Some(gateway),
+                }),
+            ipv6: self
+                .guest_ipv6
+                .zip(self.gateway_ipv6)
+                .map(|(address, gateway)| BootstrapIpv6 {
+                    address,
+                    prefix_len: 64,
+                    gateway,
+                    dns: Some(gateway),
+                }),
+        }
+    }
+
+    /// Return the stable hostname used by guests to address the host gateway.
+    pub fn guest_host_alias(&self) -> &'static str {
+        crate::HOST_ALIAS
+    }
+
+    /// Return guest-visible secret placeholders for the baseline environment.
+    ///
+    /// Real secret values stay in the host-side network handler and never
+    /// enter this payload.
+    pub fn guest_secret_env(&self) -> Vec<BootstrapEnvVar> {
+        self.config
+            .secrets
+            .secrets
+            .iter()
+            .map(|secret| BootstrapEnvVar {
+                key: secret.env_var.clone(),
+                value: secret.placeholder.clone(),
+            })
+            .collect()
     }
 
     /// CA certificate PEM bytes if TLS interception is enabled.
@@ -790,6 +887,31 @@ mod tests {
     }
 
     #[test]
+    fn guest_bootstrap_network_preserves_active_address_families() {
+        let net = SmoltcpNetwork::new_with_routes(NetworkConfig::default(), 7, true, true).unwrap();
+
+        let bootstrap = net.guest_bootstrap_network();
+
+        assert_eq!(bootstrap.interface, "eth0");
+        assert_eq!(bootstrap.mac, net.guest_mac());
+        assert_eq!(bootstrap.mtu, 1500);
+        assert_eq!(bootstrap.ipv4.unwrap().prefix_len, 30);
+        assert_eq!(bootstrap.ipv6.unwrap().prefix_len, 64);
+        assert_eq!(net.guest_host_alias(), crate::HOST_ALIAS);
+    }
+
+    #[test]
+    fn guest_bootstrap_network_allows_no_active_address_family() {
+        let net =
+            SmoltcpNetwork::new_with_routes(NetworkConfig::default(), 0, false, false).unwrap();
+
+        let bootstrap = net.guest_bootstrap_network();
+
+        assert!(bootstrap.ipv4.is_none());
+        assert!(bootstrap.ipv6.is_none());
+    }
+
+    #[test]
     fn new_with_routes_rejects_excessive_max_connections() {
         let mut config = NetworkConfig {
             max_connections: Some(MAX_NETWORK_CONNECTIONS + 1),
@@ -808,6 +930,36 @@ mod tests {
                 configured,
                 limit: MAX_NETWORK_CONNECTIONS
             } if configured == MAX_NETWORK_CONNECTIONS + 1
+        ));
+    }
+
+    /// A stored config bypasses the builder's validation, so an invalid
+    /// limiter must fail startup cleanly instead of panicking.
+    #[test]
+    fn new_with_routes_rejects_invalid_rate_limiter() {
+        let mut config = NetworkConfig {
+            rate_limiter: Some(microsandbox_types::NetworkRateLimiterConfig {
+                egress: None,
+                ingress: Some(microsandbox_types::RateLimiterConfig {
+                    bandwidth: None,
+                    ops: None,
+                }),
+            }),
+            ..NetworkConfig::default()
+        };
+        config.tls.enabled = false;
+
+        let err = match SmoltcpNetwork::new_with_routes(config, 0, true, false) {
+            Ok(_) => panic!("empty rate limiter should fail"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            NetworkInitError::InvalidRateLimit {
+                direction: NetworkRateLimitDirection::Ingress,
+                source: RateLimitConfigError::EmptyLimiter,
+            }
         ));
     }
 }

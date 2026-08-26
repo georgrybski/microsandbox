@@ -1087,6 +1087,10 @@ type NetworkConfig struct {
 	// MaxConnections caps concurrent network connections from the sandbox.
 	MaxConnections *uint
 
+	// RateLimiter configures local egress and ingress traffic limits. Nil means
+	// unlimited in both directions.
+	RateLimiter *NetworkRateLimiterConfig
+
 	// OnSecretViolation is the sandbox-wide action when a secret is sent to
 	// a disallowed host. Per-secret overrides via SecretEntry.OnViolation.
 	OnSecretViolation ViolationAction
@@ -1103,6 +1107,37 @@ type DNSConfig struct {
 	Nameservers []string
 	// QueryTimeoutMs caps DNS query latency.
 	QueryTimeoutMs *uint64
+}
+
+// RateLimiterConfig limits one traffic direction. A nil bucket leaves that
+// dimension unlimited.
+type RateLimiterConfig struct {
+	// Bandwidth caps throughput in bytes.
+	Bandwidth *TokenBucketConfig
+	// Ops caps packet rate in frames.
+	Ops *TokenBucketConfig
+}
+
+// NetworkRateLimiterConfig groups local network limits by traffic direction.
+type NetworkRateLimiterConfig struct {
+	// Egress throttles guest-to-runtime traffic. Nil means unlimited.
+	Egress *RateLimiterConfig
+	// Ingress throttles runtime-to-guest traffic. Nil means unlimited.
+	Ingress *RateLimiterConfig
+}
+
+// TokenBucketConfig describes a token bucket. The bucket starts full and
+// refills continuously: Size tokens every RefillTime.
+type TokenBucketConfig struct {
+	// Size is the bucket capacity in tokens: bytes for bandwidth buckets,
+	// frames for ops buckets.
+	Size uint64
+	// RefillTime is the time it takes to refill Size tokens. It must be at
+	// least one millisecond and a whole number of milliseconds.
+	RefillTime time.Duration
+	// OneTimeBurst grants extra tokens available at startup; the burst
+	// never refills. Optional.
+	OneTimeBurst uint64
 }
 
 // PolicyRule is a single firewall rule.
@@ -1565,6 +1600,20 @@ type MountConfig struct {
 	// Only meaningful for Bind and Named mounts. Zero value preserves the
 	// conservative default (Private).
 	HostPermissions HostPermissions
+
+	// Owner, when set, pins the guest owner presented for host files under this
+	// mount that carry no per-file stat override. Only meaningful for Bind and
+	// Named mounts. Nil keeps the runtime's fallback owner.
+	Owner *MountOwner
+}
+
+// MountOwner pins the guest owner presented for host files under a bind or named
+// mount that carry no per-file stat override (host-created files). Both fields
+// are required together; because uid 0 (root) is a valid value, this is passed
+// by pointer so that "unset" is distinct from "root".
+type MountOwner struct {
+	UID uint32
+	GID uint32
 }
 
 // MountKind discriminates between the four mount flavours.
@@ -1596,6 +1645,10 @@ type MountOptions struct {
 	Nodev              bool
 	StatVirtualization StatVirtualization
 	HostPermissions    HostPermissions
+	// Owner pins the guest owner presented for host files under this mount that
+	// carry no per-file stat override. Bind and Named mounts only. Nil keeps the
+	// runtime's fallback owner.
+	Owner *MountOwner
 	// QuotaMiB sets a guest-write quota for a bind mount, bounding how much
 	// the guest may add beyond the host directory's existing contents. Zero
 	// keeps the runtime's protective default. Bind mounts only; named volume
@@ -1655,6 +1708,7 @@ func (mountFactory) Bind(hostPath string, opts MountOptions) MountConfig {
 		Nodev:              opts.Nodev,
 		StatVirtualization: opts.StatVirtualization,
 		HostPermissions:    opts.HostPermissions,
+		Owner:              opts.Owner,
 		QuotaMiB:           opts.QuotaMiB,
 	}
 }
@@ -1670,6 +1724,7 @@ func (mountFactory) Named(name string, opts MountOptions) MountConfig {
 		Nodev:              opts.Nodev,
 		StatVirtualization: opts.StatVirtualization,
 		HostPermissions:    opts.HostPermissions,
+		Owner:              opts.Owner,
 	}
 }
 
@@ -1689,6 +1744,7 @@ func (mountFactory) NamedWith(name string, opts MountOptions, namedOpts NamedVol
 		Nodev:              opts.Nodev,
 		StatVirtualization: opts.StatVirtualization,
 		HostPermissions:    opts.HostPermissions,
+		Owner:              opts.Owner,
 	}
 }
 
