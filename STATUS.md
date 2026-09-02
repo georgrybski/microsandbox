@@ -5,7 +5,7 @@
 
 This file is the self-contained status report for the
 `feat/passthrough-mount-path-policy` branch in the microsandbox fork
-(`github.com/georgrybski/microsandbox`; upstream
+(`github.com/rybskiworks/microsandbox`; upstream
 `github.com/superradcompany/microsandbox`). It is the mount path policy
 feature (spec 22 consumer surface) that workestrate consumes via its SDK.
 
