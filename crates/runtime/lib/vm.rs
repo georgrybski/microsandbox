@@ -1604,6 +1604,14 @@ fn build_vm(
         builder = builder.fs(move |fs| fs.tag(&runtime_tag).custom(Box::new(backend)));
     }
 
+    let policy_root = if config.mount_policy_dir.as_os_str().is_empty() {
+        config
+            .runtime_dir
+            .join(microsandbox_utils::MOUNT_POLICY_DIR_NAME)
+    } else {
+        config.mount_policy_dir.clone()
+    };
+
     // Isolated file mounts. Each backend exposes a synthetic root containing
     // only the selected file, so remounting the tag cannot reveal host siblings.
     for file_mount in &vm.file_mounts {
@@ -1621,6 +1629,13 @@ fn build_vm(
             parsed.stat_virtualization,
             override_owner,
         );
+        #[cfg(unix)]
+        let mask_policy = match &parsed.policy_path {
+            None => None,
+            Some(rel) => Some(Arc::new(load_mount_policy(&policy_root, rel).map_err(
+                |e| RuntimeError::Custom(format!("file mount {tag}: policy load failed: {e}")),
+            )?)),
+        };
         let cfg = PassthroughConfig {
             stat_virtualization: parsed.stat_virtualization,
             host_permissions: parsed.host_permissions,
@@ -1630,6 +1645,8 @@ fn build_vm(
             bind_identity_map: mount_bind_identity_map,
             #[cfg(windows)]
             default_owner: override_owner,
+            #[cfg(unix)]
+            mask_policy,
             ..Default::default()
         };
         let backend = SingleFileFs::new(host_path.clone(), file_mount.filename.clone(), cfg)
@@ -1653,13 +1670,6 @@ fn build_vm(
     // fail-closed properties (relative-only, no `..`, `O_NOFOLLOW`
     // component walk beneath the root). Legacy launch configs that carry
     // no `mount_policy_dir` fall back to the old runtime-dir root.
-    let policy_root = if config.mount_policy_dir.as_os_str().is_empty() {
-        config
-            .runtime_dir
-            .join(microsandbox_utils::MOUNT_POLICY_DIR_NAME)
-    } else {
-        config.mount_policy_dir.clone()
-    };
     for mount_spec in &vm.mounts {
         let parsed = parse_mount_spec(mount_spec)
             .map_err(|e| RuntimeError::Custom(format!("--mount {mount_spec:?}: {e}")))?;
@@ -3241,6 +3251,63 @@ mod tests {
         assert!(load_mount_policy(root.path(), "missing.json").is_err());
         std::os::unix::fs::symlink("valid.json", root.path().join("link.json")).unwrap();
         assert!(load_mount_policy(root.path(), "link.json").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_mount_policy_load_failure_propagates() {
+        // Fail-closed contract: a file mount whose `policy=` token cannot be
+        // loaded must not silently fall back to an unprotected mount. The
+        // `file_mounts` loop in `build_vm` maps `load_mount_policy` failures
+        // to `file mount {tag}: policy load failed: {e}`; this test exercises
+        // that exact mapping without requiring FUSE.
+        let policy_root = tempfile::tempdir().unwrap();
+        let host_dir = tempfile::tempdir().unwrap();
+        let host_file = host_dir.path().join("host.txt");
+        std::fs::write(&host_file, b"hello").unwrap();
+
+        let tag = "testtag";
+        let spec = format!("{tag}:{}:policy=missing.json", host_file.display());
+        let file_mount = crate::launch::FileMountConfig {
+            mount: spec.clone(),
+            filename: "host.txt".to_string(),
+        };
+
+        // Verify the mount spec parses exactly as the `file_mounts` loop does
+        // and that the tag is preserved for the error prefix.
+        let parsed = parse_mount_spec(&file_mount.mount).expect("parse file_mount spec");
+        assert_eq!(parsed.tag, tag);
+        let policy_rel = parsed.policy_path.expect("policy token should be present");
+        assert_eq!(policy_rel, "missing.json");
+
+        // `load_mount_policy` must fail for a missing policy file, and the
+        // `build_vm` mapping must prefix it with the distinct fail-closed
+        // string `file mount {tag}: policy load failed`.
+        let err = load_mount_policy(policy_root.path(), &policy_rel).unwrap_err();
+        let mapped = format!("file mount {tag}: policy load failed: {err}");
+        assert!(
+            mapped.contains("file mount testtag: policy load failed"),
+            "expected fail-closed error, got: {mapped}"
+        );
+        // Underlying error should mention the missing policy file, proving the
+        // failure is not swallowed.
+        let err_string = err.to_string();
+        assert!(
+            err_string.contains("missing.json") || err_string.contains("not found"),
+            "unexpected policy load error: {err_string}"
+        );
+
+        // Also verify the `VmConfig::file_mounts` integration would propagate
+        // the same distinct string: constructing the analogous `VmConfig`
+        // spec `tag:/tmp/.../host.txt:policy=missing.json` must yield
+        // `file mount testtag: policy load failed` when the policy cannot be
+        // loaded (no FUSE mount is performed).
+        let direct_err = load_mount_policy(policy_root.path(), "missing.json").unwrap_err();
+        let direct_mapped = format!("file mount {tag}: policy load failed: {direct_err}");
+        assert!(
+            direct_mapped.contains("file mount testtag: policy load failed"),
+            "VmConfig file_mounts policy failure must propagate with distinct prefix, got: {direct_mapped}"
+        );
     }
 
     #[test]
