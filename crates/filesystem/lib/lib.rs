@@ -32,6 +32,8 @@ pub use backends::passthroughfs::mount_policy::{
 pub use backends::passthroughfs::{
     HostPermissions, PassthroughConfig, PassthroughFs, StatVirtualization,
 };
+#[cfg(windows)]
+pub use backends::singlefilefs::SingleFileFs;
 #[cfg(unix)]
 pub use backends::{
     dualfs::{
@@ -43,6 +45,7 @@ pub use backends::{
         BindIdentityMap, BindIdentityMapHandle, CachePolicy, HostPermissions, PassthroughConfig,
         PassthroughFs, PassthroughFsBuilder, StatVirtualization,
     },
+    singlefilefs::SingleFileFs,
 };
 pub use microsandbox_utils::size::{ByteSize, Bytes, Mebibytes, SizeExt};
 #[cfg(any(unix, windows))]

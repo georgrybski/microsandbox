@@ -11,6 +11,8 @@ use microsandbox_image::{PullProgressHandle, RegistryAuth};
 use microsandbox_network::builder::{NetworkBuilder, SecretBuilder};
 #[cfg(feature = "net")]
 use microsandbox_network::policy::Rule;
+#[cfg(feature = "net")]
+use microsandbox_network::{OutboundProxyBuilder, OutboundProxyConfig};
 use microsandbox_types::{
     CpuPlacement, EnvVar, PullPolicy, SandboxConfigPatch, VsockRouteSpec, VsockSocketType,
 };
@@ -686,6 +688,47 @@ impl SandboxBuilder {
         self
     }
 
+    /// Configure the single proxy used for outbound sandbox connections.
+    ///
+    /// Supports SOCKS4 for TCP and SOCKS5 for TCP and non-DNS UDP. The
+    /// proxy applies uniformly to TLS-intercepted and bypassed/plain TCP.
+    #[cfg(feature = "net")]
+    pub fn proxy<P>(mut self, configure: impl FnOnce(OutboundProxyBuilder) -> P) -> Self
+    where
+        P: OutboundProxyConfig,
+    {
+        use microsandbox_network::policy::BuildError::InvalidOutboundProxy;
+
+        let proxy = match configure(OutboundProxyBuilder::new()).build() {
+            Ok(proxy) => proxy,
+            Err(error) => {
+                if self.build_error.is_none() {
+                    self.build_error = Some(MicrosandboxError::from(InvalidOutboundProxy {
+                        reason: error.to_string(),
+                    }));
+                }
+                return self;
+            }
+        };
+
+        match self.config.local_network_config() {
+            Ok(mut network) => {
+                network.outbound_proxy = Some(proxy);
+                if let Err(err) = self.config.set_local_network_config(network)
+                    && self.build_error.is_none()
+                {
+                    self.build_error = Some(err);
+                }
+            }
+            Err(err) => {
+                if self.build_error.is_none() {
+                    self.build_error = Some(err);
+                }
+            }
+        }
+        self
+    }
+
     /// Prepend explicit rules while preserving a configured policy's defaults and existing rules.
     #[cfg(feature = "net")]
     #[doc(hidden)]
@@ -1242,6 +1285,39 @@ impl SandboxBuilder {
         super::Sandbox::create(config).await
     }
 
+    /// Connect to the persisted sandbox with this name, or create it.
+    ///
+    /// Existing sandboxes keep their persisted configuration: running ones
+    /// are connected and stopped ones are started. Builder configuration is
+    /// used only when this call creates the sandbox. A concurrent creator is
+    /// handled by connecting to and converging on the winner.
+    pub async fn connect_or_create(self) -> MicrosandboxResult<super::Sandbox> {
+        if self.config.replace_existing {
+            return Err(MicrosandboxError::InvalidConfig(
+                "connect_or_create cannot be combined with replace_existing".to_string(),
+            ));
+        }
+
+        let name = self.config.spec.name.clone();
+        let detached = self.detached;
+        match super::Sandbox::get(&name).await {
+            Ok(handle) => return handle.connect_or_start_with_mode(detached).await,
+            Err(MicrosandboxError::SandboxNotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+
+        match self.create().await {
+            Ok(sandbox) => Ok(sandbox),
+            Err(MicrosandboxError::SandboxAlreadyExists(_)) => {
+                super::Sandbox::get(&name)
+                    .await?
+                    .connect_or_start_with_mode(detached)
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Create the sandbox for detached/background use.
     pub async fn create_detached(self) -> MicrosandboxResult<super::Sandbox> {
         let config = self.build().await?;
@@ -1705,12 +1781,12 @@ mod tests {
     use crate::sandbox::{MAX_HOSTNAME_BYTES, MAX_SANDBOX_NAME_BYTES, RlimitResource};
     #[cfg(feature = "net")]
     use microsandbox_network::secrets::config::{HostPattern, SecretEntry, SecretInjection};
-    #[cfg(feature = "net")]
-    use microsandbox_types::PortProtocol;
     use microsandbox_types::{
         CpuPlacement, DeploymentProfile, SandboxLogLevel, TransparentHugePagePolicy, VolumeMount,
         VsockSocketType,
     };
+    #[cfg(feature = "net")]
+    use microsandbox_types::{PortProtocol, SecretSource};
     #[cfg(feature = "net")]
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -2180,6 +2256,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_or_create_rejects_replace_semantics() {
+        let result = SandboxBuilder::new("connect-or-replace")
+            .replace()
+            .connect_or_create()
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::MicrosandboxError::InvalidConfig(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn test_builder_defaults_to_persistent() {
         let config = SandboxBuilder::new("test")
             .image("alpine")
@@ -2400,6 +2489,26 @@ mod tests {
 
     #[cfg(feature = "net")]
     #[tokio::test]
+    async fn test_builder_sets_outbound_proxy() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .proxy(|p| p.socks5("127.0.0.1:1080"))
+            .build()
+            .await
+            .unwrap();
+
+        let network = config.local_network_config().unwrap();
+        assert_eq!(
+            network.outbound_proxy,
+            Some(microsandbox_network::OutboundProxy::Socks5 {
+                address: "127.0.0.1:1080".parse().unwrap(),
+                credentials: None,
+            })
+        );
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
     async fn test_builder_network_rate_limiters_land_in_the_spec() {
         use std::time::Duration;
 
@@ -2437,6 +2546,64 @@ mod tests {
         assert_eq!(bandwidth.one_time_burst, 512 * 1024);
         assert_eq!(egress.ops.as_ref().unwrap().one_time_burst, 500);
         assert!(rate_limiter.ingress.is_none());
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn test_builder_sets_socks5_credentials() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .proxy(|p| {
+                p.socks5("127.0.0.1:1080").credentials(
+                    "sandbox",
+                    SecretSource::Env {
+                        var: "SOCKS5_PASSWORD".into(),
+                    },
+                )
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let network = config.local_network_config().unwrap();
+        let json = serde_json::to_value(network.outbound_proxy).unwrap();
+        assert_eq!(json["credentials"]["username"], "sandbox");
+        assert_eq!(json["credentials"]["password"]["kind"], "env");
+        assert_eq!(json["credentials"]["password"]["var"], "SOCKS5_PASSWORD");
+        assert!(json["credentials"].get("value").is_none());
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn test_builder_sets_socks4_outbound_proxy_with_user_id() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .proxy(|p| p.socks4("127.0.0.1:1080").user_id("sandbox"))
+            .build()
+            .await
+            .unwrap();
+
+        let network = config.local_network_config().unwrap();
+        assert_eq!(
+            network.outbound_proxy,
+            Some(microsandbox_network::OutboundProxy::Socks4 {
+                address: "127.0.0.1:1080".parse().unwrap(),
+                user_id: Some("sandbox".to_string()),
+            })
+        );
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn test_builder_rejects_invalid_outbound_proxy() {
+        let error = SandboxBuilder::new("test")
+            .image("alpine")
+            .proxy(|p| p.socks5("not-an-address"))
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("invalid SOCKS5 proxy address"));
     }
 
     #[cfg(feature = "net")]

@@ -190,6 +190,7 @@ impl PassthroughFsBuilder {
             bind_identity_map: self.bind_identity_map,
             quota_bytes: self.quota_bytes,
             mask_policy: self.mask_policy,
+            quota_root: None,
         };
 
         // Open the root directory, contained beneath the anchor when one is set.
@@ -217,9 +218,14 @@ impl PassthroughFsBuilder {
 
         let cfg = cfg_probe;
 
-        let quota = cfg
-            .quota_bytes
-            .map(|limit| super::super::quota::DirQuota::new(cfg.root_dir.clone(), limit));
+        let quota = cfg.quota_bytes.map(|limit| {
+            super::super::quota::DirQuota::new(
+                cfg.quota_root
+                    .clone()
+                    .unwrap_or_else(|| cfg.root_dir.clone()),
+                limit,
+            )
+        });
         #[cfg(target_os = "linux")]
         let tags = cfg.new_tag_store();
 

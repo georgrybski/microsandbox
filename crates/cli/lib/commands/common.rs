@@ -4,13 +4,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{Arg, ArgAction, ArgMatches, Args, Command, FromArgMatches};
-use microsandbox::VolumeKind;
 use microsandbox::backend::{Backend, LocalBackend};
 use microsandbox::sandbox::{
     CpuPlacement, DeploymentProfile, DiskImageFormat, FlatClone, MountBuilder, Patch,
     RootDiskBuilder, Sandbox, SandboxBuilder, SandboxHandle, SecurityProfile,
     TransparentHugePagePolicy, VolumeMount, VsockSocketType,
 };
+use microsandbox::{OutboundProxy, VolumeKind};
+#[cfg(feature = "net")]
+use microsandbox_network::{OutboundProxyBuilder, OutboundProxyConfig};
 #[cfg(feature = "net")]
 use microsandbox_types::NetworkRateLimitDirection;
 
@@ -130,15 +132,15 @@ pub struct SandboxOpts {
 
     /// Explicitly mount a host directory into the sandbox (`SOURCE:DEST[:OPTIONS]`).
     ///
-    /// OPTIONS may include `uid=<N>,gid=<N>` to present host-created files (no
-    /// per-file stat override) as that guest owner; both are required together.
+    /// OPTIONS may include `quota=<size>` and `uid=<N>,gid=<N>` to present
+    /// host-created files as that guest owner; both IDs are required together.
     #[arg(long = "mount-dir", value_name = "SOURCE:DEST[:OPTIONS]")]
     pub mount_dir: Vec<String>,
 
     /// Explicitly mount a host file into the sandbox (`SOURCE:DEST[:OPTIONS]`).
     ///
-    /// OPTIONS may include `uid=<N>,gid=<N>` to present the host file (no
-    /// per-file stat override) as that guest owner; both are required together.
+    /// OPTIONS may include `quota=<size>` and `uid=<N>,gid=<N>` to present the
+    /// host file as that guest owner; both IDs are required together.
     #[arg(long = "mount-file", value_name = "SOURCE:DEST[:OPTIONS]")]
     pub mount_file: Vec<String>,
 
@@ -496,6 +498,35 @@ pub struct SandboxOpts {
     #[arg(long)]
     pub trust_host_cas: bool,
 
+    /// Dial all outbound sandbox connections through this proxy.
+    /// Supports the socks4:// and socks5:// protocols.
+    #[cfg(feature = "net")]
+    #[arg(long, value_name = "socks[4|5]://IP:PORT")]
+    pub proxy: Option<String>,
+
+    /// Optional user ID for a SOCKS4 proxy.
+    #[cfg(feature = "net")]
+    #[arg(long, value_name = "USER_ID", requires = "proxy")]
+    pub socks4_user_id: Option<String>,
+
+    /// Username for SOCKS5 username/password authentication.
+    #[cfg(feature = "net")]
+    #[arg(
+        long,
+        value_name = "USERNAME",
+        requires_all = ["proxy", "socks5_password_env"]
+    )]
+    pub socks5_username: Option<String>,
+
+    /// Host environment variable containing the SOCKS5 password.
+    #[cfg(feature = "net")]
+    #[arg(
+        long,
+        value_name = "ENV_VAR",
+        requires_all = ["proxy", "socks5_username"]
+    )]
+    pub socks5_password_env: Option<String>,
+
     // --- TLS interception ---
     /// Intercept and inspect HTTPS traffic via a built-in TLS proxy.
     #[cfg(feature = "net")]
@@ -618,6 +649,61 @@ enum CopyKind {
 //--------------------------------------------------------------------------------------------------
 
 impl SandboxOpts {
+    /// Builds the protocol-specific proxy selected by the CLI flags.
+    #[cfg(feature = "net")]
+    fn outbound_proxy(&self) -> anyhow::Result<Option<OutboundProxy>> {
+        let Some(raw) = self.proxy.as_deref() else {
+            if self.socks4_user_id.is_some()
+                || self.socks5_username.is_some()
+                || self.socks5_password_env.is_some()
+            {
+                anyhow::bail!("proxy authentication flags require --proxy");
+            }
+            return Ok(None);
+        };
+
+        match raw.parse::<OutboundProxy>()? {
+            OutboundProxy::Socks4 { address, .. } => {
+                if self.socks5_username.is_some() || self.socks5_password_env.is_some() {
+                    anyhow::bail!(
+                        "--socks5-username and --socks5-password-env require a socks5:// proxy"
+                    );
+                }
+
+                let proxy = OutboundProxyBuilder::new().socks4(address.to_string());
+                let proxy = match self.socks4_user_id.as_deref() {
+                    Some(user_id) => proxy.user_id(user_id),
+                    None => proxy,
+                };
+                Ok(Some(proxy.build()?))
+            }
+            OutboundProxy::Socks5 { address, .. } => {
+                if self.socks4_user_id.is_some() {
+                    anyhow::bail!("--socks4-user-id requires a socks4:// proxy");
+                }
+
+                let proxy = OutboundProxyBuilder::new().socks5(address.to_string());
+                let proxy = match (
+                    self.socks5_username.as_deref(),
+                    self.socks5_password_env.as_deref(),
+                ) {
+                    (Some(username), Some(password_env)) => {
+                        proxy.credentials(username, microsandbox::SecretSource::env(password_env))
+                    }
+                    (Some(_), None) => {
+                        anyhow::bail!("--socks5-username requires --socks5-password-env")
+                    }
+                    (None, Some(_)) => {
+                        anyhow::bail!("--socks5-password-env requires --socks5-username")
+                    }
+                    (None, None) => proxy,
+                };
+                Ok(Some(proxy.build()?))
+            }
+            _ => anyhow::bail!("unsupported outbound proxy protocol"),
+        }
+    }
+
     /// Returns true if any creation-time configuration flag was set.
     pub fn has_creation_flags(&self) -> bool {
         let base = self.cpus.is_some()
@@ -680,6 +766,10 @@ impl SandboxOpts {
             || self.net_ingress_ops_burst.is_some()
             || self.max_connections.is_some()
             || self.trust_host_cas
+            || self.proxy.is_some()
+            || self.socks4_user_id.is_some()
+            || self.socks5_username.is_some()
+            || self.socks5_password_env.is_some()
             || self.tls_intercept
             || !self.tls_intercept_port.is_empty()
             || !self.tls_bypass.is_empty()
@@ -1550,6 +1640,7 @@ pub fn apply_explicit_file_mount(
         spec,
         CliMountOptionSupport {
             policies: true,
+            quota: true,
             owner: true,
             ..CliMountOptionSupport::default()
         },
@@ -2037,6 +2128,8 @@ fn apply_network_opts(
         });
     }
 
+    let proxy = opts.outbound_proxy()?;
+
     // DNS, TLS, and other network configuration.
     let has_network_config = opts.no_dns_rebind_protection
         || !opts.dns_nameserver.is_empty()
@@ -2244,6 +2337,10 @@ fn apply_network_opts(
 
             n
         });
+    }
+
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(|_| proxy);
     }
 
     Ok(builder)
@@ -3253,6 +3350,93 @@ mod tests {
 
     #[cfg(feature = "net")]
     #[test]
+    fn outbound_proxy_builds_socks4_user_id() {
+        let opts = SandboxOpts {
+            proxy: Some("socks4://127.0.0.1:1080".into()),
+            socks4_user_id: Some("sandbox".into()),
+            ..Default::default()
+        };
+
+        let proxy = opts.outbound_proxy().unwrap().unwrap();
+        assert_eq!(
+            proxy,
+            OutboundProxy::Socks4 {
+                address: "127.0.0.1:1080".parse().unwrap(),
+                user_id: Some("sandbox".into()),
+            }
+        );
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn outbound_proxy_builds_socks5_environment_credentials() {
+        let opts = SandboxOpts {
+            proxy: Some("socks5://127.0.0.1:1080".into()),
+            socks5_username: Some("sandbox".into()),
+            socks5_password_env: Some("SOCKS5_PASSWORD".into()),
+            ..Default::default()
+        };
+
+        let proxy = opts.outbound_proxy().unwrap().unwrap();
+        let json = serde_json::to_value(proxy).unwrap();
+        assert_eq!(json["protocol"], "socks5");
+        assert_eq!(json["credentials"]["username"], "sandbox");
+        assert_eq!(json["credentials"]["password"]["kind"], "env");
+        assert_eq!(json["credentials"]["password"]["var"], "SOCKS5_PASSWORD");
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn outbound_proxy_rejects_protocol_specific_auth_on_the_wrong_protocol() {
+        let socks4 = SandboxOpts {
+            proxy: Some("socks4://127.0.0.1:1080".into()),
+            socks5_username: Some("sandbox".into()),
+            socks5_password_env: Some("SOCKS5_PASSWORD".into()),
+            ..Default::default()
+        };
+        assert!(
+            socks4
+                .outbound_proxy()
+                .unwrap_err()
+                .to_string()
+                .contains("require a socks5:// proxy")
+        );
+
+        let socks5 = SandboxOpts {
+            proxy: Some("socks5://127.0.0.1:1080".into()),
+            socks4_user_id: Some("sandbox".into()),
+            ..Default::default()
+        };
+        assert!(
+            socks5
+                .outbound_proxy()
+                .unwrap_err()
+                .to_string()
+                .contains("requires a socks4:// proxy")
+        );
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn outbound_proxy_rejects_incomplete_socks5_credentials() {
+        for opts in [
+            SandboxOpts {
+                proxy: Some("socks5://127.0.0.1:1080".into()),
+                socks5_username: Some("sandbox".into()),
+                ..Default::default()
+            },
+            SandboxOpts {
+                proxy: Some("socks5://127.0.0.1:1080".into()),
+                socks5_password_env: Some("SOCKS5_PASSWORD".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(opts.outbound_proxy().is_err());
+        }
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
     fn parse_scoped_upstream_ca_cert_accepts_pattern_and_path() {
         let (pattern, path) =
             parse_scoped_upstream_ca_cert("*.internal=/tmp/internal-ca.pem").unwrap();
@@ -3756,19 +3940,21 @@ mod tests {
     #[tokio::test]
     async fn test_apply_explicit_file_mount() {
         let file = write_temp("fixture");
-        let spec = format!("{}:/fixture:ro,noexec", file.display());
+        let spec = format!("{}:/fixture:ro,noexec,quota=32M", file.display());
         let mount = build_explicit(&spec, apply_explicit_file_mount).await;
         match mount {
             VolumeMount::Bind {
                 host,
                 guest,
                 options,
+                quota_mib,
                 ..
             } => {
                 assert_eq!(host, file);
                 assert_eq!(guest, "/fixture");
                 assert!(options.readonly);
                 assert!(options.noexec);
+                assert_eq!(quota_mib, Some(32));
             }
             other => panic!("expected Bind, got {other:?}"),
         }
