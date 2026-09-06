@@ -1416,6 +1416,21 @@ struct HostPlacement<'a> {
     numa_topology: Option<msb_krun::NumaTopology>,
 }
 
+/// Whether nested virtualization is enabled for guests. Gated on the
+/// `MSB_NESTED_VIRT` environment variable: only the exact value "1"
+/// enables it; absent or any other value leaves it OFF (the default).
+/// The orchestrator (workestrate) sets this per workload from its
+/// `virtualization.nested` decision; upstream #823 hardcoded it ON.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn nested_virt_enabled() -> bool {
+    nested_virt_flag(std::env::var("MSB_NESTED_VIRT").ok().as_deref())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn nested_virt_flag(value: Option<&str>) -> bool {
+    matches!(value, Some("1"))
+}
+
 fn build_vm(
     config: &Config,
     console_backend: AgentConsoleBackend,
@@ -1460,7 +1475,7 @@ fn build_vm(
             }
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             {
-                m.nested_virt(true).split_irqchip(true)
+                m.nested_virt(nested_virt_enabled()).split_irqchip(true)
             }
             #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
             {
@@ -2981,6 +2996,8 @@ fn thp_kernel_cmdline(policy: microsandbox_types::TransparentHugePagePolicy) -> 
 mod tests {
     #[cfg(feature = "net")]
     use super::to_krun_network_rate_limiters;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    use super::nested_virt_flag;
     #[cfg(unix)]
     use super::{
         BindIdentityMapRegistration, PARENT_WATCH_DETACH, ParentWatchdogSignal,
@@ -3449,6 +3466,17 @@ mod tests {
             guest_shutdown_flush_timeout(true),
             microsandbox_protocol::HANDOFF_SHUTDOWN_FLUSH_TIMEOUT
         );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn test_nested_virt_flag_only_accepts_exact_one() {
+        assert!(!nested_virt_flag(None));
+        assert!(!nested_virt_flag(Some("0")));
+        assert!(!nested_virt_flag(Some("true")));
+        assert!(!nested_virt_flag(Some("")));
+        assert!(nested_virt_flag(Some("1")));
+        assert!(!nested_virt_flag(Some(" 1")));
     }
 
     #[test]
