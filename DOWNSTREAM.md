@@ -31,6 +31,14 @@ maintained as the microVM substrate for workestrate.
 Upstream-bound changes must not contain downstream-owned files (flake.nix,
 nix/, downstream workflows, this file).
 
+## Nix state model
+
+The nix build keeps three state layers strictly separate: pure build inputs
+(flake.lock-pinned), ephemeral build/check state (`$TMPDIR/.microsandbox`),
+and user-owned runtime state (generation-keyed `$HOME/.microsandbox`). Full
+model, homeless-shelter rationale, and the fail-closed nix contract:
+`nix/README.md`.
+
 ## Licensing
 
 - Upstream code remains Apache-2.0; this fork preserves that license (LICENSE
