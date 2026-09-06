@@ -34,7 +34,7 @@ let
   # §3 corresponding-source offer obligation. The exact corresponding source
   # is the upstream fork repo https://github.com/superradcompany/libkrunfw
   # (branch krunfw; at the time of writing resolving to 21cb6dce), pinned as
-  # the fork's vendor/libkrunfw submodule (recorded gitlink c5503d82).
+  # the fork's vendor/libkrunfw submodule (recorded gitlink 21cb6dce19a615f63e41ecb913334d18560c1364).
   #
   # Branch A (default): fetch the upstream v0.6.8 release tarball and extract
   # ONLY libkrunfw.so* from it. The tar sha256 below is REAL and verified
@@ -43,12 +43,12 @@ let
   # becomes mandatory.
   #
   # Branch B (spike, NOT implemented): build libkrunfw from the fork's
-  # vendor/libkrunfw submodule (gitlink commit c5503d82, repo
+  # vendor/libkrunfw submodule (gitlink commit 21cb6dce19a615f63e41ecb913334d18560c1364, repo
   # https://github.com/superradcompany/libkrunfw.git branch krunfw). The
   # submodule is NOT populated locally. Building it requires kernel build
   # deps (gcc, make, flex, bison, libelf) and produces libkrunfw.so.5.6.1.
   # TODO: if Branch A fails, implement a libkrunfw.nix that fetchGit's the
-  # submodule repo at c5503d82 and builds via `make` (see fork justfile
+  # submodule repo at 21cb6dce19a615f63e41ecb913334d18560c1364 and builds via `make` (see fork justfile
   # build-libkrunfw recipe).
   #
   # The fork's LIBKRUNFW_VERSION is "5.6.1" (ABI "5") — NOT 5.2.1 as in the
