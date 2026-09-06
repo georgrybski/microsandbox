@@ -1,0 +1,5 @@
+# Pinned to match the fenix stable toolchain in flake.nix (via tooling follows).
+# Verified against devenv cargo/rustc 1.97.1. Lets dev rustup honor the same pin.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
