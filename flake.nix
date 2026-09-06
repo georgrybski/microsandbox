@@ -50,6 +50,13 @@
       # covered by checks.fmt (cargo fmt, which honors .rustfmt.toml).
       # Deferred: revisit after the tooling pin is bumped past a9bd083.
       imports = [
+        # NOTE(pure-eval): devenv.root defaults to $PWD, which is blank under
+        # pure evaluation, so plain `nix flake show/check` fails by design with
+        # "devenv was not able to determine the current directory" (upstream
+        # devenv behavior, see devenv.sh "using with flakes" guide). Use
+        # `nix flake show/check --impure` (or --override-input devenv-root
+        # with a file containing $PWD, as direnv does). Do NOT hard-code
+        # devenv.root to a fixed path — non-portable between machines.
         inputs.devenv.flakeModule
       ];
 
