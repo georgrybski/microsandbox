@@ -100,6 +100,12 @@
             cp ${agentd}/libexec/agentd build/agentd
             touch build/agentd
             export MSB_AGENTD_PATH="${agentd}/libexec/agentd"
+            # Sandbox-safe MSB_HOME for check gates only: nix sandbox sets
+            # HOME=/homeless-shelter, so resolve_home() (sdk/rust/build.rs via
+            # crates/utils resolve_home()) would fail creating bin/ and lib/ dirs.
+            # Point at writable TMPDIR instead. Scoped here — do NOT copy to
+            # devenv enterShell ergonomics.
+            export MSB_HOME="$TMPDIR/.microsandbox"
           '';
         in
         {
