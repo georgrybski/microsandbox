@@ -1,2 +1,12 @@
+# Downstream fork ownership (rybskiworks/microsandbox).
+# Upstream humans are intentionally absent; see DOWNSTREAM.md.
+
 # Default
-* @appcypher @toksdotdev
+* @georgrybski
+
+# Downstream-owned surfaces
+/.github/ @georgrybski
+/flake.nix @georgrybski
+/flake.lock @georgrybski
+/nix/ @georgrybski
+/deny.toml @georgrybski
