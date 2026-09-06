@@ -22,5 +22,9 @@ strip = false
 
 [dependencies]
 magnus = "0.8.2"
-microsandbox_core = { package = "microsandbox", version = "=0.6.16", default-features = false, features = ["net", "ssh"] }
+microsandbox_core = { package = "microsandbox", version = "=0.6.17", default-features = false, features = ["net", "ssh"] }
 tokio = { version = "1.52", features = ["rt-multi-thread", "time"] }
+
+[patch.crates-io]
+msb_krun = { git = "https://github.com/rybskiworks/libkrun", rev = "dc9f5f16a2384ab4c84d50c01f9613f9e1879705" }
+msb_krun_utils = { git = "https://github.com/rybskiworks/libkrun", rev = "dc9f5f16a2384ab4c84d50c01f9613f9e1879705" }
