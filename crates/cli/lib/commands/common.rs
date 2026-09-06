@@ -125,6 +125,14 @@ pub struct SandboxOpts {
     #[arg(long, value_name = "POLICY", value_parser = ["always", "madvise", "never"])]
     pub thp: Option<String>,
 
+    /// Enable nested virtualization for the guest (Linux x86_64 only).
+    ///
+    /// The guest receives the host's nested CPU virtualization capability.
+    /// Guest `/dev/kvm` additionally requires KVM support in the bundled
+    /// firmware; this flag alone yields CPU capability only.
+    #[arg(long)]
+    pub nested_virt: bool,
+
     /// Mount a host path or named volume into the sandbox (`SOURCE:DEST[:OPTIONS]`).
     /// OPTIONS may include paired `uid=<N>,gid=<N>` for directory-backed mounts.
     #[arg(short, long)]
@@ -713,6 +721,7 @@ impl SandboxOpts {
             || self.memory.is_some()
             || self.max_memory.is_some()
             || self.thp.is_some()
+            || self.nested_virt
             || !self.volume.is_empty()
             || !self.mount_dir.is_empty()
             || !self.mount_file.is_empty()
@@ -986,6 +995,9 @@ fn apply_sandbox_opts_inner(
             .parse::<TransparentHugePagePolicy>()
             .map_err(anyhow::Error::msg)?;
         builder = builder.thp(policy);
+    }
+    if opts.nested_virt {
+        builder = builder.nested_virt(true);
     }
     if let Some(ref workdir) = opts.workdir {
         builder = builder.workdir(workdir);
@@ -3598,6 +3610,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(config.spec.resources.thp, TransparentHugePagePolicy::Always);
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_opts_sets_nested_virt() {
+        let opts = SandboxOpts {
+            nested_virt: true,
+            ..Default::default()
+        };
+        let config = apply_sandbox_opts(SandboxBuilder::new("test").image("alpine"), &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        assert!(config.spec.resources.nested_virt);
+
+        let config = apply_sandbox_opts(
+            SandboxBuilder::new("test").image("alpine"),
+            &SandboxOpts::default(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+        assert!(!config.spec.resources.nested_virt);
     }
 
     #[tokio::test]

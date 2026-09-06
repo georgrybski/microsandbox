@@ -990,6 +990,10 @@ impl TryFrom<CloudSandboxSpec> for SandboxSpec {
             cpu_placement: CpuPlacement::Inherit,
             placement_profile: None,
             thp: TransparentHugePagePolicy::Madvise,
+            // Tenants cannot request nested virtualization over the cloud
+            // wire; a managed service applies its own host-VM policy (same
+            // posture as placement and THP above).
+            nested_virt: false,
         };
 
         // Fields not present on `CloudNetworkSpec` are defaulted here, listed

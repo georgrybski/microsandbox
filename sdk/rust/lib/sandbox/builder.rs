@@ -120,6 +120,14 @@ impl SandboxBuilder {
         self
     }
 
+    /// Returns the sandbox spec accumulated so far.
+    ///
+    /// Useful for inspecting the effective configuration before `create()`
+    /// and for tests that assert builder wiring without booting a VM.
+    pub fn spec(&self) -> &SandboxSpec {
+        &self.config.spec
+    }
+
     /// Load and apply defaults from the active global `config.json`.
     fn apply_global_config(mut self) -> Self {
         let backend = crate::backend::default_backend();
@@ -369,6 +377,18 @@ impl SandboxBuilder {
     /// the cost of coarser memory allocation, while `Never` disables THP.
     pub fn thp(mut self, policy: super::TransparentHugePagePolicy) -> Self {
         self.config.spec.resources.thp = policy;
+        self
+    }
+
+    /// Enable nested virtualization for the guest (default: off).
+    ///
+    /// When enabled, the VMM presents the host's nested CPU virtualization
+    /// capability to the guest (Linux x86_64 hosts only; ignored elsewhere).
+    /// The guest kernel additionally needs KVM support in the bundled
+    /// firmware (libkrunfw `CONFIG_KVM`) for `/dev/kvm` to appear; this
+    /// option alone yields CPU capability only.
+    pub fn nested_virt(mut self, enabled: bool) -> Self {
+        self.config.spec.resources.nested_virt = enabled;
         self
     }
 
@@ -1799,6 +1819,18 @@ mod tests {
             builder.config.spec.deployment_profile,
             DeploymentProfile::MultiTenant
         );
+    }
+
+    #[test]
+    fn nested_virt_defaults_off_and_opt_in_sets_the_spec() {
+        let default_builder = SandboxBuilder::new("nested-default");
+        assert!(!default_builder.spec().resources.nested_virt);
+
+        let on = SandboxBuilder::new("nested-on").nested_virt(true);
+        assert!(on.spec().resources.nested_virt);
+
+        let off = SandboxBuilder::new("nested-off").nested_virt(false);
+        assert!(!off.spec().resources.nested_virt);
     }
 
     #[tokio::test]

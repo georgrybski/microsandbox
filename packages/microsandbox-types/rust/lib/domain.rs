@@ -922,6 +922,16 @@ pub struct SandboxResources {
     /// Guest transparent huge-page policy selected at boot.
     #[serde(default, skip_serializing_if = "TransparentHugePagePolicy::is_madvise")]
     pub thp: TransparentHugePagePolicy,
+
+    /// Enable nested virtualization for the guest (Linux x86_64 only).
+    ///
+    /// Defaults to `false`: guests receive no nested CPU capability unless
+    /// the caller opts in. When `true`, the VMM presents the host's nested
+    /// virtualization capability to the guest CPU. The guest kernel still
+    /// needs KVM support in the bundled firmware (libkrunfw `CONFIG_KVM`)
+    /// to expose `/dev/kvm`; this flag alone yields CPU capability only.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub nested_virt: bool,
 }
 
 /// Controls how Microsandbox places vCPU threads on host processors.
@@ -1603,6 +1613,7 @@ impl Default for SandboxResources {
             cpu_placement: CpuPlacement::Inherit,
             placement_profile: None,
             thp: TransparentHugePagePolicy::Madvise,
+            nested_virt: false,
         }
     }
 }
@@ -1626,6 +1637,8 @@ impl<'de> Deserialize<'de> for SandboxResources {
             placement_profile: Option<String>,
             #[serde(default)]
             thp: TransparentHugePagePolicy,
+            #[serde(default)]
+            nested_virt: bool,
         }
 
         let raw = RawResources::deserialize(deserializer)?;
@@ -1640,6 +1653,7 @@ impl<'de> Deserialize<'de> for SandboxResources {
             cpu_placement: raw.cpu_placement,
             placement_profile: raw.placement_profile,
             thp: raw.thp,
+            nested_virt: raw.nested_virt,
         })
     }
 }
@@ -2069,6 +2083,11 @@ fn default_sandbox_cpus() -> u8 {
 
 fn default_sandbox_memory_mib() -> u32 {
     DEFAULT_SANDBOX_MEMORY_MIB
+}
+
+/// Serde skip predicate keeping default-off booleans out of serialized specs.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn decode_mount_options(options: Option<MountOptions>, readonly: bool) -> MountOptions {
@@ -3090,6 +3109,27 @@ mod tests {
             TransparentHugePagePolicy::Never
         );
         assert!("auto".parse::<TransparentHugePagePolicy>().is_err());
+    }
+
+    #[test]
+    fn nested_virt_defaults_off_and_roundtrips_when_enabled() {
+        // Legacy specs predate the field: absent means off.
+        let legacy: SandboxResources =
+            serde_json::from_str(r#"{"cpus":4,"memory_mib":2048}"#).unwrap();
+        assert!(!legacy.nested_virt);
+
+        // Default-off stays out of the serialized form (byte-stable default).
+        let serialized = serde_json::to_value(SandboxResources::default()).unwrap();
+        assert!(serialized.get("nested_virt").is_none());
+
+        // Opt-in round-trips.
+        let resources = SandboxResources {
+            nested_virt: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&resources).unwrap();
+        let decoded: SandboxResources = serde_json::from_str(&json).unwrap();
+        assert!(decoded.nested_virt);
     }
 
     #[test]

@@ -2468,6 +2468,7 @@ fn sandbox_cli_args(
         agent_sock: agent_sock_path.to_path_buf(),
         libkrunfw_path: libkrunfw_path.to_path_buf(),
         thp: config.spec.resources.thp,
+        nested_virt: config.spec.resources.nested_virt,
         startup: startup_command(config),
         lifecycle: Lifecycle {
             max_duration_secs: config.spec.lifecycle.max_duration_secs,
@@ -3305,6 +3306,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(render_launch(&config).sandbox_slot, 1);
+    }
+
+    #[tokio::test]
+    async fn launch_config_carries_nested_virt_from_spec() {
+        let mut config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .build()
+            .await
+            .unwrap();
+
+        // Default off: the spec default reaches the launch payload as false.
+        assert!(!render_launch(&config).nested_virt);
+
+        // Opt-in carries through the launch payload.
+        config.spec.resources.nested_virt = true;
+        assert!(render_launch(&config).nested_virt);
+
+        config.spec.resources.nested_virt = false;
+        assert!(!render_launch(&config).nested_virt);
     }
 
     /// Render only the `visible` argv (what shows up in `ps`).

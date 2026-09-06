@@ -85,6 +85,12 @@ pub struct LaunchConfig {
     #[serde(default)]
     pub thp: TransparentHugePagePolicy,
 
+    /// Whether the guest receives the host's nested CPU virtualization
+    /// capability (Linux x86_64 only). Defaults to off; absent in launch
+    /// payloads from older launchers means off.
+    #[serde(default)]
+    pub nested_virt: bool,
+
     /// Per-writable-raw-disk hard budget for buffered host dirty data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_writeback_limit_bytes: Option<u64>,

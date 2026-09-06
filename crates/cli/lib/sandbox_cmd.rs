@@ -214,6 +214,7 @@ pub fn run(args: SandboxArgs) -> ! {
     let vm_config = VmConfig {
         libkrunfw_path: launch.libkrunfw_path,
         thp: launch.thp,
+        nested_virt: launch.nested_virt,
         vcpus: args.vcpus,
         memory_mib: args.memory_mib,
         max_cpus: args.max_vcpus.unwrap_or(args.vcpus).max(args.vcpus),
