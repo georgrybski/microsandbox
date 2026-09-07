@@ -3853,6 +3853,7 @@ dependencies = [
  "microsandbox-network",
  "microsandbox-protocol",
  "microsandbox-runtime",
+ "microsandbox-scan",
  "microsandbox-types",
  "microsandbox-utils",
  "nix 0.31.3",
@@ -4169,6 +4170,7 @@ version = "0.6.16"
 dependencies = [
  "chrono",
  "ciborium",
+ "microsandbox-scan",
  "microsandbox-types",
  "serde",
  "serde_bytes",
