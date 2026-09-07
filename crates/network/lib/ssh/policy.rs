@@ -557,6 +557,13 @@ mod tests {
 
     #[test]
     fn passthrough_violation_coerces_to_block() {
+        // `Passthrough` names HTTP placeholder forwarding (send the
+        // placeholder unchanged to listed hosts). SSH routing has no
+        // placeholder to forward — the verdict only diverts, connects, or
+        // refuses — so the routing layer coerces to `Block` fail-closed.
+        // Count-only relay past divert is governed by the relay's own
+        // action set, which the wire carries faithfully and never strips
+        // (see the wire-fidelity test in `config::types`).
         let policy = SshPolicy::new(true, vec![SshGrant::exact("example.com", 22)]).with_violation(
             ViolationAction::Passthrough(vec![HostPattern::Exact("example.com".to_string())]),
         );
