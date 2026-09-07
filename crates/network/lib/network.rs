@@ -27,6 +27,7 @@ use crate::netstack::{
 };
 use crate::policy::{NetworkPolicy, NetworkProfile};
 use crate::secrets::handle::SecretsHandle;
+use crate::ssh::gateway::SshGatewayConfig;
 use crate::tls::state::{TlsState, TlsStateError};
 
 //--------------------------------------------------------------------------------------------------
@@ -331,6 +332,16 @@ impl SmoltcpNetwork {
         let max_connections = config.max_connections;
         let secrets = self.secrets.clone();
         let outbound_proxy = self.config.outbound_proxy().cloned().map(Arc::new);
+        // SSH gateway is host-side enforcement joined with the guest-visible
+        // policy. No broker endpoint exists in the declarative config (it
+        // must never appear in guest-visible state), so divert-intended
+        // flows deny fail-closed until broker wiring lands. Transport CID
+        // has no source in this tree yet, so it is stamped `0`
+        // (unspecified).
+        let ssh_gateway: Option<Arc<SshGatewayConfig>> = config
+            .ssh
+            .clone()
+            .map(|policy| Arc::new(SshGatewayConfig::new(policy, None, 0)));
 
         self.poll_handle = Some(
             std::thread::Builder::new()
@@ -348,6 +359,7 @@ impl SmoltcpNetwork {
                         tokio_handle,
                         secrets,
                         outbound_proxy,
+                        ssh_gateway,
                     );
                 })
                 .expect("failed to spawn smoltcp poll thread"),

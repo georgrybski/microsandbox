@@ -27,6 +27,13 @@ use crate::secrets::config::{SecretsConfig, SecretsConfigExt, ViolationAction};
 use crate::secrets::handler::{
     SecretsHandler, first_line_is_not_http_request, looks_like_http_request_prefix,
 };
+use crate::ssh::gateway::{
+    SSH_CLASSIFY_TIMEOUT, SSH_PRELUDE_BYTE_BUDGET, SshDivertPrelude, SshGatewayConfig,
+    classify_ssh_directions, current_epoch_secs, dial_broker_and_send_prelude,
+    relay_ssh_via_broker, ssh_flow_for_destination,
+};
+use crate::ssh::policy::decide_ssh_egress;
+use crate::ssh::{SshClassification, trailing_fragment_is_banner_prefix};
 use crate::tls::proxy::TlsProxy;
 use crate::tls::sni;
 use crate::tls::state::TlsState;
@@ -78,6 +85,7 @@ pub(crate) struct TcpProxy {
     tls_state: Option<Arc<TlsState>>,
     proxy_connect: Arc<ProxyConnectState>,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
+    ssh_gateway: Option<Arc<SshGatewayConfig>>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -143,6 +151,7 @@ impl TcpProxy {
         tls_state: Option<Arc<TlsState>>,
         proxy_connect: Arc<ProxyConnectState>,
         outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
+        ssh_gateway: Option<Arc<SshGatewayConfig>>,
     ) -> Self {
         Self {
             guest_dst,
@@ -155,6 +164,7 @@ impl TcpProxy {
             tls_state,
             proxy_connect,
             outbound_proxy,
+            ssh_gateway,
         }
     }
 
@@ -186,6 +196,7 @@ impl TcpProxy {
             tls_state,
             proxy_connect,
             outbound_proxy,
+            ssh_gateway,
         } = self;
 
         // Pre-connect peek is only for domain policy: the hostname has to be known
@@ -274,22 +285,113 @@ impl TcpProxy {
         // server→guest direction. When domain rules already peeked, `initial_buf`
         // is reused and this is cheap; with no secrets it is skipped entirely
         // (`is_tls` only matters for deciding whether to build the handler).
+        // SSH gating also needs this peek so the server banner reaches the
+        // guest immediately while both directions are sampled.
         let want_headers = secrets.has_plain_http_candidates() || secrets.has_host_scoped_secrets();
-        let (initial_buf, is_tls) = if !secrets.secrets.is_empty() {
-            classify_first_flight(
-                initial_buf,
-                &mut from_smoltcp,
-                &mut server_rx,
-                &to_smoltcp,
-                &shared,
-                want_headers,
-                PEEK_BUF_SIZE,
-                PEEK_BUDGET,
-            )
-            .await?
-        } else {
-            (initial_buf, false)
-        };
+        let (mut initial_buf, server_sample, is_tls) =
+            if !secrets.secrets.is_empty() || ssh_gateway.is_some() {
+                classify_first_flight(
+                    initial_buf,
+                    &mut from_smoltcp,
+                    &mut server_rx,
+                    &to_smoltcp,
+                    &shared,
+                    want_headers,
+                    ssh_gateway.is_some(),
+                    PEEK_BUF_SIZE,
+                    PEEK_BUDGET,
+                )
+                .await?
+            } else {
+                (initial_buf, Vec::new(), false)
+            };
+
+        // SSH gateway decision on both directions' bytes. The direct
+        // upstream socket is already open and the server banner already
+        // relayed; classification never withholds the banner. The peek
+        // above ran under `PEEK_BUDGET`, which intentionally matches
+        // `SSH_CLASSIFY_TIMEOUT` so SSH gating adds no extra worst-case
+        // latency beyond the current first-flight peek.
+        if let Some(gateway) = ssh_gateway.clone() {
+            debug_assert_eq!(
+                PEEK_BUDGET, SSH_CLASSIFY_TIMEOUT,
+                "SSH classify window must match the first-flight peek budget"
+            );
+            let flow = ssh_flow_for_destination(guest_dst, &shared, sni.as_deref());
+            let egress = network_policy.evaluate_egress(guest_dst, Protocol::Tcp, &shared);
+            let classification = classify_ssh_directions(&initial_buf, &server_sample);
+            if classification == SshClassification::NeedMoreData {
+                // The banner is short (at most 255 bytes plus a few comment
+                // lines), so 512 bytes is generous; an incomplete banner
+                // after the 5 s peek budget falls through to the generic
+                // egress verdict rather than stalling the connection. This
+                // is the one deliberate fail-open hole.
+                tracing::info!(
+                    dst = %guest_dst,
+                    guest_bytes = initial_buf.len(),
+                    server_bytes = server_sample.len(),
+                    "ssh classification incomplete after budget; falling through to egress",
+                );
+            }
+            match decide_ssh_egress(
+                &flow,
+                classification,
+                egress,
+                &gateway.policy,
+                gateway.broker.as_ref(),
+            ) {
+                crate::ssh::policy::SshDecision::Direct => {}
+                crate::ssh::policy::SshDecision::Deny { action } => {
+                    tracing::debug!(dst = %guest_dst, violation = ?action, "ssh egress denied");
+                    if matches!(action, ViolationAction::BlockAndTerminate) {
+                        shared.trigger_termination();
+                    }
+                    drop(server_rx);
+                    drop(server_tx);
+                    proxy_connect.mark_policy_denied();
+                    shared.proxy_wake.wake();
+                    return Ok(());
+                }
+                crate::ssh::policy::SshDecision::Divert { endpoint } => {
+                    // Close the direct upstream socket and discard buffered
+                    // direct-server bytes; the broker reoriginates a fresh
+                    // upstream dial. The guest already saw the direct banner,
+                    // so it observes a second banner through the broker relay:
+                    // that double banner is the visible fingerprint of a
+                    // diverted session.
+                    drop(server_rx);
+                    drop(server_tx);
+                    let prelude =
+                        SshDivertPrelude::new(&flow, gateway.transport_cid, current_epoch_secs());
+                    match dial_broker_and_send_prelude(&endpoint, &prelude).await {
+                        Ok(broker_stream) => {
+                            proxy_connect.mark_connected();
+                            return relay_ssh_via_broker(
+                                broker_stream,
+                                std::mem::take(&mut initial_buf),
+                                from_smoltcp,
+                                to_smoltcp,
+                                shared,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            // Divert-intended without a reachable broker
+                            // denies fail-closed; falling back to direct
+                            // would silently bypass broker authentication.
+                            tracing::debug!(
+                                dst = %guest_dst,
+                                %error,
+                                "ssh broker dial failed; denying divert-intended flow",
+                            );
+                            proxy_connect.mark_policy_denied();
+                            shared.proxy_wake.wake();
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
 
         if let Some(tls_state) = tls_state.clone()
             && could_be_connect_request(&initial_buf)
@@ -491,6 +593,7 @@ pub fn spawn_tcp_proxy(
     tls_state: Option<Arc<TlsState>>,
     proxy_connect: Arc<ProxyConnectState>,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
+    ssh_gateway: Option<Arc<SshGatewayConfig>>,
 ) {
     let proxy = TcpProxy::new(
         guest_dst,
@@ -503,6 +606,7 @@ pub fn spawn_tcp_proxy(
         tls_state,
         proxy_connect,
         outbound_proxy,
+        ssh_gateway,
     );
 
     handle.spawn(proxy.run());
@@ -966,6 +1070,13 @@ fn extract_http_host(buf: &[u8]) -> Option<String> {
 /// banner; draining the server side here lets the banner reach the guest
 /// immediately, so the guest's eventual first flight — not a 5s timeout — is
 /// what ends the peek.
+///
+/// `await_ssh_banner` keeps the peek open while the buffered guest bytes end
+/// in a strict banner prefix (for example `SSH-2.0-O` split across TCP
+/// segments) so a segmented client banner still settles instead of falling
+/// through on the first chunk. The wait stays within the SSH prelude byte
+/// budget; decided buffers, completed lines, and binary flights fall through
+/// immediately, so non-SSH flows see no extra delay.
 #[allow(clippy::too_many_arguments)]
 async fn classify_first_flight(
     mut buf: Vec<u8>,
@@ -974,10 +1085,15 @@ async fn classify_first_flight(
     to_smoltcp: &mpsc::Sender<Bytes>,
     shared: &SharedState,
     want_headers: bool,
+    await_ssh_banner: bool,
     max: usize,
     budget: Duration,
-) -> io::Result<(Vec<u8>, bool)> {
+) -> io::Result<(Vec<u8>, Vec<u8>, bool)> {
     let mut server_buf = vec![0u8; SERVER_READ_BUF_SIZE];
+    // Sample of server bytes relayed during the peek for SSH classification,
+    // capped at the SSH prelude budget. All server bytes are still relayed;
+    // only the sample is retained for the divert decision.
+    let mut server_sample = Vec::new();
     let timeout_fut = tokio::time::sleep(budget);
     tokio::pin!(timeout_fut);
 
@@ -991,13 +1107,20 @@ async fn classify_first_flight(
             let is_tls = buf.first() == Some(&0x16);
             let not_http = !is_tls
                 && (!looks_like_http_request_prefix(&buf) || first_line_is_not_http_request(&buf));
-            let done = !want_headers
+            // A trailing banner prefix keeps the peek open within the SSH
+            // prelude budget so a segmented client banner settles; the
+            // budget cap and the outer timeout still bound the wait.
+            let ssh_settling = await_ssh_banner
+                && buf.len() < SSH_PRELUDE_BYTE_BUDGET
+                && trailing_fragment_is_banner_prefix(&buf);
+            let done = (!want_headers
                 || is_tls
                 || not_http
                 || buf.len() >= max
-                || buf.windows(4).any(|w| w == b"\r\n\r\n");
+                || buf.windows(4).any(|w| w == b"\r\n\r\n"))
+                && !ssh_settling;
             if done {
-                return Ok((buf, is_tls));
+                return Ok((buf, server_sample, is_tls));
             }
         }
 
@@ -1005,7 +1128,7 @@ async fn classify_first_flight(
             biased;
             _ = &mut timeout_fut => {
                 let is_tls = buf.first() == Some(&0x16);
-                return Ok((buf, is_tls));
+                return Ok((buf, server_sample, is_tls));
             }
             // Guest → buffer (not forwarded here; the caller replays it once the
             // handler is built, so substitution applies to the first flight too).
@@ -1013,7 +1136,7 @@ async fn classify_first_flight(
                 Some(bytes) => buf.extend_from_slice(&bytes),
                 None => {
                     let is_tls = buf.first() == Some(&0x16);
-                    return Ok((buf, is_tls));
+                    return Ok((buf, server_sample, is_tls));
                 }
             },
             // Server → guest: relay immediately so a server-first banner is never
@@ -1021,13 +1144,17 @@ async fn classify_first_flight(
             server = server_rx.read(&mut server_buf) => match server {
                 Ok(0) => {
                     let is_tls = buf.first() == Some(&0x16);
-                    return Ok((buf, is_tls));
+                    return Ok((buf, server_sample, is_tls));
                 }
                 Ok(n) => {
+                    if server_sample.len() < SSH_PRELUDE_BYTE_BUDGET {
+                        let take = (SSH_PRELUDE_BYTE_BUDGET - server_sample.len()).min(n);
+                        server_sample.extend_from_slice(&server_buf[..take]);
+                    }
                     let data = Bytes::copy_from_slice(&server_buf[..n]);
                     if to_smoltcp.send(data).await.is_err() {
                         let is_tls = buf.first() == Some(&0x16);
-                        return Ok((buf, is_tls));
+                        return Ok((buf, server_sample, is_tls));
                     }
                     shared.proxy_wake.wake();
                 }
@@ -1835,6 +1962,7 @@ mod tests {
             None,
             proxy_connect,
             None,
+            None,
         )
         .try_run()
         .await
@@ -1876,6 +2004,7 @@ mod tests {
             Arc::new(secrets),
             None,
             proxy_connect,
+            None,
             None,
         )
         .try_run()
@@ -1948,6 +2077,7 @@ mod tests {
             Arc::new(secrets),
             None,
             proxy_connect,
+            None,
             None,
         )
         .try_run()
@@ -2050,6 +2180,7 @@ mod tests {
             Arc::new(secrets),
             None,
             proxy_connect,
+            None,
             None,
         )
         .try_run()

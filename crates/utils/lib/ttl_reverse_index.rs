@@ -121,6 +121,25 @@ where
         })
     }
 
+    /// Return the non-expired keys currently associated with `member`.
+    ///
+    /// Used to recover a representative hostname for an IP without
+    /// exposing the full reverse index; callers pick one entry (for
+    /// example the lexicographically smallest) for policy display.
+    pub fn keys_for_member(&self, member: &M, now: Instant) -> Vec<K> {
+        let Some(keys) = self.by_member.get(member) else {
+            return Vec::new();
+        };
+        keys.iter()
+            .filter(|key| {
+                self.by_key
+                    .get(*key)
+                    .is_some_and(|entry| entry.expires_at > now)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Evict all entries whose TTL has expired by `now`.
     pub fn evict_expired(&mut self, now: Instant) {
         while let Some(Reverse(expiry)) = self.expirations.peek() {

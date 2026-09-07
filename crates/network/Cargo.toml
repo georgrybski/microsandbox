@@ -13,6 +13,7 @@ path = "lib/lib.rs"
 [dependencies]
 base64 = "0.22"
 bytes = { workspace = true }
+ciborium.workspace = true
 crossbeam-queue = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }

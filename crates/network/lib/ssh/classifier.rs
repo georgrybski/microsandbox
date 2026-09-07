@@ -182,6 +182,41 @@ pub fn classify_ssh_bytes(data: &[u8]) -> SshClassification {
     classifier.feed(data)
 }
 
+/// Returns `true` when the trailing line fragment could still grow into
+/// a line-start SSH banner.
+///
+/// Holds the peek only while the whole buffer is still
+/// [`SshClassification::NeedMoreData`] and the bytes after the last `\n`
+/// stay banner-compatible: either a strict prefix of [`SSH_20_PREFIX`] or
+/// [`SSH_199_PREFIX`] (for example `SSH-2.0-O` split across TCP segments)
+/// or one of those prefixes followed by printable banner bytes (a banner
+/// split past the prefix). A completed first line, binary bytes, or a
+/// diverged prefix (`SSH-foo`) fall through immediately. The proxy uses
+/// this so a segmented client banner still settles instead of falling
+/// through on the first chunk, without stalling non-SSH flows.
+pub fn trailing_fragment_is_banner_prefix(buf: &[u8]) -> bool {
+    if evaluate_buffer(buf) != SshClassification::NeedMoreData {
+        return false;
+    }
+    let fragment = match buf.iter().rposition(|b| *b == b'\n') {
+        Some(pos) => &buf[pos + 1..],
+        None => buf,
+    };
+    if fragment.is_empty() {
+        return false;
+    }
+    if SSH_20_PREFIX.starts_with(fragment) || SSH_199_PREFIX.starts_with(fragment) {
+        return true;
+    }
+    [SSH_20_PREFIX, SSH_199_PREFIX].iter().any(|prefix| {
+        fragment.len() > prefix.len()
+            && fragment.starts_with(prefix)
+            && fragment[prefix.len()..]
+                .iter()
+                .all(|b| (0x20..=0x7e).contains(b))
+    })
+}
+
 /// Evaluate the buffered prefix.
 fn evaluate_buffer(buf: &[u8]) -> SshClassification {
     if buf.is_empty() {
