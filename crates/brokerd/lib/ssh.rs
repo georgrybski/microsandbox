@@ -16,20 +16,30 @@
 //! Upstream password or keyboard-interactive authentication has no path
 //! through the broker (there is no password custody), so only upstream
 //! public-key authentication is attempted.
+//!
+//! Relayed bytes pass through the DLP scanner: guest-to-upstream channel
+//! data, extended data, and exec commands enforce the session's match
+//! library (block closes the channel, block-and-terminate tears down the
+//! session), while upstream-to-guest relayed data is audit/count-only in
+//! P0 and always forwards.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use microsandbox_scan::{PatternLibrary, ScanReport, ScanState, Severity};
 use russh::keys::{Algorithm, PrivateKeyWithHashAlg, PublicKey, PublicKeyBase64};
 use russh::server::{Auth, ChannelOpenHandle, Session};
 use russh::{ChannelId, ChannelMsg, Sig};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, Notify, oneshot};
 
 use microsandbox_protocol::bootstrap::BrokerUpstreamHost;
 
+use crate::audit::{AuditRecord, ChannelDirection};
 use crate::error::{BrokerError, BrokerResult};
 use crate::keys::BrokerKey;
+use crate::prelude::SessionIdentity;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -62,6 +72,56 @@ struct RelayShared {
 
     /// In-flight relay tasks, aborted when the guest session ends.
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+
+    /// Validated session identity threaded from the divert prelude.
+    identity: SessionIdentity,
+
+    /// Compiled DLP match library shared across sessions.
+    library: Arc<PatternLibrary>,
+
+    /// Guest-to-upstream scan state (channel data, extended data, exec).
+    scan_request: Mutex<ScanState>,
+
+    /// Upstream-to-guest scan state (relayed data only).
+    scan_response: Mutex<ScanState>,
+
+    /// Per-session teardown trigger for block-and-terminate enforcement.
+    termination: TerminationHandle,
+
+    /// Guest-to-upstream chunks that hit with counting enabled.
+    request_hits: AtomicU64,
+
+    /// Upstream-to-guest chunks that hit with counting enabled.
+    response_hits: AtomicU64,
+}
+
+/// Per-session teardown trigger for block-and-terminate enforcement.
+///
+/// Cloned into the shared relay state so any guest-to-upstream handler
+/// can terminate its own session. Termination cancels that session's relay
+/// tasks and disconnects both SSH legs; the global vsock accept loop is
+/// untouched — per-session teardown never stops other sessions. (The only
+/// global stop is console shutdown, which powers off the guest.)
+#[derive(Debug, Clone)]
+pub struct TerminationHandle {
+    /// Set before notifying, so late waiters observe termination.
+    flag: Arc<AtomicBool>,
+
+    /// Wakes the reoriginate teardown select.
+    notify: Arc<Notify>,
+}
+
+/// Relay decision for one scanned chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanEnforcement {
+    /// Forward the chunk unchanged.
+    Forward,
+
+    /// Drop the chunk and close the channel on both legs; the session lives.
+    CloseChannel,
+
+    /// Drop the chunk and tear down the whole relay session.
+    TerminateSession,
 }
 
 /// One relayed channel: the upstream write half plus its pending reply.
@@ -97,6 +157,36 @@ impl UpstreamPin {
     }
 }
 
+impl TerminationHandle {
+    /// Create an untriggered termination handle.
+    pub fn new() -> Self {
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Terminate the session: prompt waiters and mark late checks.
+    pub fn terminate(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    /// Whether termination was triggered.
+    pub fn is_terminated(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    /// Wait until termination is triggered.
+    pub async fn terminated(&self) {
+        loop {
+            if self.is_terminated() {
+                return;
+            }
+            self.notify.notified().await;
+        }
+    }
+}
 impl GuestServer {
     /// Run `f` against the upstream channel for `channel`, if still present.
     ///
@@ -111,6 +201,73 @@ impl GuestServer {
             return false;
         };
         f(state).await
+    }
+
+    /// Count and audit a guest-to-upstream scan report, then return whether
+    /// the chunk may forward.
+    async fn observe_request(&self, channel: ChannelId, report: &ScanReport) -> ScanEnforcement {
+        self.shared
+            .observe(
+                channel,
+                ChannelDirection::GuestToUpstream,
+                report,
+                &self.shared.request_hits,
+            )
+            .await
+    }
+
+    /// Close a blocked channel on both legs; the session lives.
+    ///
+    /// Best-effort: either leg may already be closing when enforcement
+    /// fires, and a failed close carries no further action.
+    async fn close_blocked_channel(&self, channel: ChannelId, session: &mut Session) {
+        if let Some(state) = self.shared.channels.lock().await.remove(&channel) {
+            let tx = state.tx.lock().await;
+            let _ = tx.close().await;
+        }
+        let _ = session.close(channel);
+    }
+}
+
+impl RelayShared {
+    /// Count and audit one scan report, returning the relay decision.
+    ///
+    /// Counting and audit lines follow the report's strictest action
+    /// flags; the decision follows its enforcement. Upstream-to-guest
+    /// callers pass reports through this for audit/count only and forward
+    /// regardless of the returned decision.
+    async fn observe(
+        &self,
+        channel: ChannelId,
+        direction: ChannelDirection,
+        report: &ScanReport,
+        counter: &AtomicU64,
+    ) -> ScanEnforcement {
+        let Some(action) = report.strictest_action else {
+            return ScanEnforcement::Forward;
+        };
+        if action.count {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        if action.audit {
+            for hit in &report.hits {
+                let credential_id = self
+                    .library
+                    .lookup(&hit.pattern_id)
+                    .map(|meta| meta.credential_id.to_string());
+                AuditRecord::new(
+                    self.identity,
+                    channel.number(),
+                    direction,
+                    credential_id,
+                    hit.pattern_id,
+                    hit.digest,
+                    action,
+                )
+                .emit();
+            }
+        }
+        enforcement_for(report)
     }
 }
 
@@ -204,6 +361,13 @@ impl UpstreamChannel {
 //--------------------------------------------------------------------------------------------------
 // Trait Implementations
 //--------------------------------------------------------------------------------------------------
+
+impl Default for TerminationHandle {
+    /// An untriggered termination handle.
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl russh::server::Handler for GuestServer {
     type Error = BrokerError;
@@ -351,6 +515,21 @@ impl russh::server::Handler for GuestServer {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        // Exec commands are guest-to-upstream bytes: scan the command and
+        // enforce before anything reaches the upstream channel.
+        let report = self.shared.scan_request.lock().await.scan_chunk(data);
+        match self.observe_request(channel, &report).await {
+            ScanEnforcement::Forward => {}
+            ScanEnforcement::CloseChannel => {
+                self.close_blocked_channel(channel, session).await;
+                return Ok(());
+            }
+            ScanEnforcement::TerminateSession => {
+                self.close_blocked_channel(channel, session).await;
+                self.shared.termination.terminate();
+                return Ok(());
+            }
+        }
         let command = data.to_vec();
         let ok = self
             .with_channel(channel, |state| async move {
@@ -405,11 +584,23 @@ impl russh::server::Handler for GuestServer {
         &mut self,
         channel: ChannelId,
         data: &[u8],
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(state) = self.shared.channels.lock().await.get(&channel).cloned() {
-            let tx = state.tx.lock().await;
-            let _ = tx.data_bytes(data.to_vec()).await;
+        let report = self.shared.scan_request.lock().await.scan_chunk(data);
+        match self.observe_request(channel, &report).await {
+            ScanEnforcement::Forward => {
+                if let Some(state) = self.shared.channels.lock().await.get(&channel).cloned() {
+                    let tx = state.tx.lock().await;
+                    let _ = tx.data_bytes(data.to_vec()).await;
+                }
+            }
+            ScanEnforcement::CloseChannel => {
+                self.close_blocked_channel(channel, session).await;
+            }
+            ScanEnforcement::TerminateSession => {
+                self.close_blocked_channel(channel, session).await;
+                self.shared.termination.terminate();
+            }
         }
         Ok(())
     }
@@ -419,11 +610,23 @@ impl russh::server::Handler for GuestServer {
         channel: ChannelId,
         code: u32,
         data: &[u8],
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(state) = self.shared.channels.lock().await.get(&channel).cloned() {
-            let tx = state.tx.lock().await;
-            let _ = tx.extended_data_bytes(code, data.to_vec()).await;
+        let report = self.shared.scan_request.lock().await.scan_chunk(data);
+        match self.observe_request(channel, &report).await {
+            ScanEnforcement::Forward => {
+                if let Some(state) = self.shared.channels.lock().await.get(&channel).cloned() {
+                    let tx = state.tx.lock().await;
+                    let _ = tx.extended_data_bytes(code, data.to_vec()).await;
+                }
+            }
+            ScanEnforcement::CloseChannel => {
+                self.close_blocked_channel(channel, session).await;
+            }
+            ScanEnforcement::TerminateSession => {
+                self.close_blocked_channel(channel, session).await;
+                self.shared.termination.terminate();
+            }
         }
         Ok(())
     }
@@ -478,13 +681,29 @@ impl russh::client::Handler for UpstreamVerifier {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
+/// Map a scan report's strictest action to a relay decision.
+///
+/// No hits — or a passthrough strictest action — forwards. Block and
+/// block-and-log close the offending channel on both legs while the
+/// session lives; block-and-terminate tears down the whole relay session.
+/// Pure over the report, so the mapping is unit-testable without SSH.
+pub fn enforcement_for(report: &ScanReport) -> ScanEnforcement {
+    match report.strictest_action.and_then(|action| action.enforce) {
+        None => ScanEnforcement::Forward,
+        Some(Severity::Block | Severity::BlockAndLog) => ScanEnforcement::CloseChannel,
+        Some(Severity::BlockAndTerminate) => ScanEnforcement::TerminateSession,
+    }
+}
+
 /// Reoriginate one diverted guest session toward its pinned upstream.
 ///
 /// `guest` is the accepted divert stream (starting with the guest's first
 /// flight); `upstream` is the egress-tunneled stream to the pinned
 /// destination. brokerd runs the SSH server side on `guest` and the SSH
 /// client side on `upstream`, relaying channels until the guest session
-/// ends.
+/// ends or DLP enforcement terminates it. `identity` is the validated
+/// prelude identity attributed to every scan hit; `library` is the
+/// compiled DLP match library shared across sessions.
 ///
 /// Double-banner fingerprint, stated as a technical fact: the guest
 /// already saw the direct upstream banner (relayed pre-divert by the host
@@ -496,6 +715,8 @@ pub async fn reoriginate<G, U>(
     key: &BrokerKey,
     pin: &UpstreamPin,
     server_config: Arc<russh::server::Config>,
+    identity: SessionIdentity,
+    library: Arc<PatternLibrary>,
 ) -> BrokerResult<()>
 where
     G: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -536,6 +757,13 @@ where
         upstream: client,
         channels: Mutex::new(HashMap::new()),
         tasks: Mutex::new(Vec::new()),
+        identity,
+        scan_request: Mutex::new(ScanState::new(&library)),
+        scan_response: Mutex::new(ScanState::new(&library)),
+        library,
+        termination: TerminationHandle::new(),
+        request_hits: AtomicU64::new(0),
+        response_hits: AtomicU64::new(0),
     });
     let session = russh::server::run_stream(
         server_config,
@@ -546,17 +774,44 @@ where
     )
     .await
     .map_err(|e| BrokerError::Ssh(format!("guest handshake: {e}")))?;
-    session
-        .await
-        .map_err(|e| BrokerError::Ssh(format!("guest session failed: {e}")))?;
 
-    for task in shared.tasks.lock().await.drain(..) {
-        task.abort();
+    // The guest session and per-session termination race: whichever wins
+    // tears down this session's relay tasks and upstream leg. Other
+    // sessions and the global vsock accept loop are unaffected.
+    let guest_handle = session.handle();
+    let termination = shared.termination.clone();
+    tokio::select! {
+        result = session => {
+            for task in shared.tasks.lock().await.drain(..) {
+                task.abort();
+            }
+            let _ = shared
+                .upstream
+                .disconnect(russh::Disconnect::ByApplication, "", "")
+                .await;
+            result.map_err(|e| BrokerError::Ssh(format!("guest session failed: {e}")))?;
+        }
+        _ = termination.terminated() => {
+            eprintln!(
+                "brokerd: dlp terminated session (cid {} epoch {})",
+                shared.identity.cid, shared.identity.epoch
+            );
+            for task in shared.tasks.lock().await.drain(..) {
+                task.abort();
+            }
+            let _ = guest_handle
+                .disconnect(
+                    russh::Disconnect::ByApplication,
+                    "dlp terminate".to_string(),
+                    String::new(),
+                )
+                .await;
+            let _ = shared
+                .upstream
+                .disconnect(russh::Disconnect::ByApplication, "", "")
+                .await;
+        }
     }
-    let _ = shared
-        .upstream
-        .disconnect(russh::Disconnect::ByApplication, "", "")
-        .await;
     Ok(())
 }
 
@@ -625,6 +880,9 @@ fn answer(session: &mut Session, channel: ChannelId, ok: bool) -> Result<(), Bro
 }
 
 /// Pump one upstream channel into its guest channel until either side ends.
+///
+/// Upstream-to-guest bytes are audit/count-only in P0: hits are observed
+/// for attribution and the bytes always forward, with no enforcement.
 async fn pump_upstream_to_guest(
     guest: russh::server::Handle,
     guest_channel: ChannelId,
@@ -635,11 +893,29 @@ async fn pump_upstream_to_guest(
     loop {
         match rx.wait().await {
             Some(ChannelMsg::Data { data }) => {
+                let report = shared.scan_response.lock().await.scan_chunk(&data);
+                shared
+                    .observe(
+                        guest_channel,
+                        ChannelDirection::UpstreamToGuest,
+                        &report,
+                        &shared.response_hits,
+                    )
+                    .await;
                 if guest.data(guest_channel, data).await.is_err() {
                     break;
                 }
             }
             Some(ChannelMsg::ExtendedData { data, ext }) => {
+                let report = shared.scan_response.lock().await.scan_chunk(&data);
+                shared
+                    .observe(
+                        guest_channel,
+                        ChannelDirection::UpstreamToGuest,
+                        &report,
+                        &shared.response_hits,
+                    )
+                    .await;
                 if guest.extended_data(guest_channel, ext, data).await.is_err() {
                     break;
                 }
@@ -703,6 +979,19 @@ async fn fail_pending(state: &UpstreamChannel) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use microsandbox_scan::ActionSet;
+
+    /// A scan report reduced to one enforcement level.
+    fn report_with(enforce: Option<Severity>) -> ScanReport {
+        ScanReport {
+            hits: Vec::new(),
+            strictest_action: enforce.map(|enforce| ActionSet {
+                enforce: Some(enforce),
+                audit: true,
+                count: true,
+            }),
+        }
+    }
 
     /// A pin entry with a real (fixed test-only) Ed25519 key.
     fn pin_entry() -> BrokerUpstreamHost {
@@ -772,5 +1061,81 @@ mod tests {
             second.keys[0].public_key().public_key_base64(),
             "each boot must mint a fresh host key"
         );
+    }
+
+    #[test]
+    fn enforcement_forwards_hits_without_enforcement() {
+        assert_eq!(
+            enforcement_for(&report_with(None)),
+            ScanEnforcement::Forward
+        );
+        assert_eq!(
+            enforcement_for(&ScanReport {
+                hits: Vec::new(),
+                strictest_action: None,
+            }),
+            ScanEnforcement::Forward
+        );
+    }
+
+    #[test]
+    fn enforcement_closes_the_channel_on_block() {
+        assert_eq!(
+            enforcement_for(&report_with(Some(Severity::BlockAndLog))),
+            ScanEnforcement::CloseChannel
+        );
+        assert_eq!(
+            enforcement_for(&report_with(Some(Severity::Block))),
+            ScanEnforcement::CloseChannel
+        );
+    }
+
+    #[test]
+    fn enforcement_terminates_the_session_on_block_and_terminate() {
+        assert_eq!(
+            enforcement_for(&report_with(Some(Severity::BlockAndTerminate))),
+            ScanEnforcement::TerminateSession
+        );
+    }
+
+    #[test]
+    fn termination_handle_starts_untriggered() {
+        assert!(!TerminationHandle::new().is_terminated());
+        assert!(!TerminationHandle::default().is_terminated());
+    }
+
+    #[test]
+    fn termination_marks_the_handle() {
+        let handle = TerminationHandle::new();
+        handle.terminate();
+        assert!(handle.is_terminated());
+        // Terminating twice stays terminated.
+        handle.terminate();
+        assert!(handle.is_terminated());
+    }
+
+    #[test]
+    fn termination_is_shared_across_clones() {
+        let handle = TerminationHandle::new();
+        let relay = handle.clone();
+        relay.terminate();
+        assert!(handle.is_terminated());
+        assert!(relay.is_terminated());
+    }
+
+    #[tokio::test]
+    async fn terminated_resolves_once_triggered() {
+        let handle = TerminationHandle::new();
+        let waiter = handle.clone();
+        let done = tokio::spawn(async move { waiter.terminated().await });
+        handle.terminate();
+        tokio::time::timeout(Duration::from_secs(5), done)
+            .await
+            .expect("termination wait must resolve")
+            .unwrap();
+        // Late waiters observe termination without blocking.
+        tokio::time::timeout(Duration::from_secs(5), handle.terminated())
+            .await
+            .expect("late termination wait must resolve immediately");
     }
 }

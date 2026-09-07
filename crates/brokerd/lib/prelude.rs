@@ -39,6 +39,21 @@ pub struct SshDivertPrelude {
     pub epoch: u64,
 }
 
+/// Validated relay-session identity: the prelude's transport CID and divert
+/// epoch after [`SshDivertPrelude::validate_against`] accepted them.
+///
+/// No host lookup happens inside brokerd: these raw values plus the
+/// compiled patterns are everything the relay scanner attributes hits to.
+/// Every scan hit on the session carries `{cid, epoch, channel, direction}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionIdentity {
+    /// Sandbox transport identifier from the validated prelude.
+    pub cid: u64,
+
+    /// Divert epoch from the validated prelude.
+    pub epoch: u64,
+}
+
 /// Every way a divert prelude frame can fail to decode.
 #[derive(Debug, Error)]
 pub enum PreludeError {
@@ -112,6 +127,17 @@ impl SshDivertPrelude {
             });
         }
         Ok(())
+    }
+
+    /// Bind the validated prelude's identity for scan attribution.
+    ///
+    /// Call only after [`SshDivertPrelude::validate_against`] succeeds:
+    /// the values are trusted exactly because validation accepted them.
+    pub fn session_identity(&self) -> SessionIdentity {
+        SessionIdentity {
+            cid: self.transport_cid,
+            epoch: self.epoch,
+        }
     }
 }
 
@@ -299,5 +325,14 @@ mod tests {
                 not_before: state.not_before
             }
         );
+    }
+
+    #[test]
+    fn session_identity_binds_the_validated_prelude_values() {
+        let prelude = sample_prelude();
+        prelude.validate_against(Some(&sample_state())).unwrap();
+        let identity = prelude.session_identity();
+        assert_eq!(identity.cid, prelude.transport_cid);
+        assert_eq!(identity.epoch, prelude.epoch);
     }
 }

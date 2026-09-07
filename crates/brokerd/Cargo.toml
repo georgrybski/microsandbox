@@ -18,6 +18,7 @@ path = "lib/lib.rs"
 ciborium.workspace = true
 libc.workspace = true
 microsandbox-protocol.workspace = true
+microsandbox-scan.workspace = true
 nix = { workspace = true, features = ["fs", "mount"] }
 russh.workspace = true
 serde.workspace = true

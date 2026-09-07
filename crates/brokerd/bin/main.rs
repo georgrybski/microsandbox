@@ -46,6 +46,7 @@ fn run() -> Result<(), BrokerError> {
         block_root,
         broker_key,
         broker_upstream,
+        broker_patterns,
         ..
     } = bootstrap;
     let key = keys::require_bootstrap_key(broker_key)?;
@@ -58,7 +59,10 @@ fn run() -> Result<(), BrokerError> {
         microsandbox_brokerd::config::SSH_DIVERT_LISTEN_PORT,
         microsandbox_brokerd::config::EGRESS_CONNECT_PORT,
         broker_upstream,
-    );
+    )
+    .with_patterns(microsandbox_brokerd::patterns::ingest_bootstrap_patterns(
+        broker_patterns,
+    ));
     // The remaining bootstrap fields are dropped here; custody owns the
     // only retained keypair.
     drop(block_root);
