@@ -37,8 +37,7 @@ let
   # the fork's vendor/libkrunfw submodule (recorded gitlink 21cb6dce19a615f63e41ecb913334d18560c1364).
   #
   # Branch A (default): fetch the upstream v0.6.8 release tarball and extract
-  # ONLY libkrunfw.so* from it. Verified 2026-09-06: curl -fSL the URL below
-  # → HTTP 200 (22035553 bytes); `tar tzf` lists flat layout `msb` +
+  # ONLY libkrunfw.so* from it. Tarball has flat layout `msb` +
   # `libkrunfw.so.5.6.1` (no lib/ dir — installPhase handles both); sha256 hex
   # 992be66ce8a61965b3ac7733bce58d6a98a8292a172e85c8751074a2ad16f69d matches
   # the SRI below; embedded kernel is Linux 6.12.98 (Fri Jul 24 13:01:52 WAT
