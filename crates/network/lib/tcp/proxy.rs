@@ -2204,12 +2204,18 @@ mod tests {
 
     /// Wrap a policy into the per-connection gateway config the proxy takes.
     /// The broker endpoint is host-side only; `None` denies divert-intended
-    /// flows fail-closed.
+    /// flows fail-closed. A present endpoint travels through the host-side
+    /// binding, the same type spawn threads from builder input.
     fn ssh_gateway_for(
         policy: SshPolicy,
         broker: Option<BrokerEndpoint>,
     ) -> Option<Arc<SshGatewayConfig>> {
-        Some(Arc::new(SshGatewayConfig::new(policy, broker, 7)))
+        use crate::ssh::SshBrokerBinding;
+
+        Some(Arc::new(match broker {
+            Some(endpoint) => SshBrokerBinding::new(endpoint, 7).gateway_config(policy),
+            None => SshGatewayConfig::new(policy, None, 7),
+        }))
     }
 
     /// Unique unix-socket path for broker test doubles in this process.

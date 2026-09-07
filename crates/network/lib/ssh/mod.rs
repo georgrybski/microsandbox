@@ -19,8 +19,8 @@ pub use classifier::{
     SshClassification, SshClassifier, classify_ssh_bytes, trailing_fragment_is_banner_prefix,
 };
 pub use gateway::{
-    SSH_CLASSIFY_TIMEOUT, SSH_PRELUDE_BYTE_BUDGET, SshDivertPrelude, SshGatewayConfig,
-    classify_ssh_directions, combined_ssh_classification, current_epoch_secs,
+    SSH_CLASSIFY_TIMEOUT, SSH_PRELUDE_BYTE_BUDGET, SshBrokerBinding, SshDivertPrelude,
+    SshGatewayConfig, classify_ssh_directions, combined_ssh_classification, current_epoch_secs,
     decode_ssh_divert_prelude, dial_broker_and_send_prelude, encode_ssh_divert_prelude,
     relay_ssh_via_broker, ssh_flow_for_destination,
 };

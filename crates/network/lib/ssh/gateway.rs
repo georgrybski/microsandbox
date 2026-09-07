@@ -88,8 +88,27 @@ pub struct SshGatewayConfig {
     pub broker: Option<BrokerEndpoint>,
     /// Sandbox transport identifier stamped into the divert prelude.
     ///
-    /// No vsock CID exists in this tree, so the runtime currently passes
-    /// `0` (unspecified); future work wires the real VMM CID here.
+    /// Carried by the host-side [`SshBrokerBinding`] (derived at spawn
+    /// from the leased network slot). `0` (unspecified) only when no
+    /// binding exists, in which case no divert can happen.
+    pub transport_cid: u64,
+}
+
+/// Host-side SSH broker binding for one sandbox launch.
+///
+/// The private launch contract carries this on
+/// [`crate::config::ResolvedNetworkConfig`]; it never appears in
+/// guest-visible `NetworkConfig.ssh` / `NetworkSpec.ssh` serialization.
+/// The endpoint names the broker unix socket diverted flows dial and
+/// `transport_cid` attributes the session to one sandbox transport.
+/// Spawn derives the transport identifier from the leased network slot,
+/// the per-sandbox discriminator available in this tree, and stamps it
+/// into every divert prelude alongside the wall-clock epoch.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SshBrokerBinding {
+    /// Divert target for broker-mediated SSH sessions.
+    pub endpoint: BrokerEndpoint,
+    /// Sandbox transport identifier stamped into the divert prelude.
     pub transport_cid: u64,
 }
 
@@ -124,6 +143,22 @@ impl SshGatewayConfig {
     /// Convenience for sharing across proxy tasks.
     pub fn shared(self) -> Arc<Self> {
         Arc::new(self)
+    }
+}
+
+impl SshBrokerBinding {
+    /// Create a binding from a broker endpoint and transport identifier.
+    pub fn new(endpoint: BrokerEndpoint, transport_cid: u64) -> Self {
+        Self {
+            endpoint,
+            transport_cid,
+        }
+    }
+
+    /// Join this host-side binding with the guest-visible policy into
+    /// the per-sandbox gateway configuration the proxy enforces.
+    pub fn gateway_config(&self, policy: SshPolicy) -> SshGatewayConfig {
+        SshGatewayConfig::new(policy, Some(self.endpoint.clone()), self.transport_cid)
     }
 }
 
@@ -389,5 +424,34 @@ mod tests {
         let framed = encode_ssh_divert_prelude(&prelude);
         assert!(decode_ssh_divert_prelude(&framed[..2]).is_err());
         assert!(decode_ssh_divert_prelude(&framed[..framed.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn broker_binding_builds_live_gateway_config() {
+        let binding = SshBrokerBinding::new(
+            BrokerEndpoint::new("/run/msb/ssh-broker.sock").expect("test broker must validate"),
+            9,
+        );
+        let gateway = binding.gateway_config(SshPolicy::default());
+        assert_eq!(gateway.transport_cid, 9);
+        assert_eq!(
+            gateway
+                .broker
+                .as_ref()
+                .expect("binding must populate the broker"),
+            &BrokerEndpoint::new("unix:///run/msb/ssh-broker.sock").unwrap(),
+        );
+    }
+
+    #[test]
+    fn broker_binding_survives_the_launch_contract_round_trip() {
+        let binding = SshBrokerBinding::new(
+            BrokerEndpoint::new("/run/msb/ssh-broker.sock").expect("test broker must validate"),
+            9,
+        );
+        let json = serde_json::to_string(&binding).unwrap();
+        assert!(json.contains("ssh-broker.sock"));
+        let back: SshBrokerBinding = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, binding);
     }
 }

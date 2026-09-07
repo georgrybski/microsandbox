@@ -39,6 +39,8 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 use crate::policy::{Action, PortRange};
 use crate::secrets::config::{HostPattern, ViolationAction};
 
@@ -305,6 +307,24 @@ impl Default for SshPolicy {
             grants: Vec::new(),
             on_violation: ViolationAction::default(),
         }
+    }
+}
+
+impl Serialize for BrokerEndpoint {
+    /// Serialize as the `unix:///absolute/path` string form so the
+    /// host-side launch contract can carry the endpoint as JSON.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&format!("unix://{}", self.path.display()))
+    }
+}
+
+impl<'de> Deserialize<'de> for BrokerEndpoint {
+    /// Deserialize through [`BrokerEndpoint::new`] so a stored payload
+    /// revalidates fail-closed: relative paths and non-`unix` schemes
+    /// reject instead of diverting to an attacker-influenced socket.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        BrokerEndpoint::new(&raw).map_err(serde::de::Error::custom)
     }
 }
 
@@ -578,6 +598,19 @@ mod tests {
         let grant = SshGrant::new(HostPattern::Exact("example.com".to_string()), vec![]);
         assert!(grant.matches(&flow("example.com", 22)));
         assert!(grant.matches(&flow("example.com", 2222)));
+    }
+
+    #[test]
+    fn broker_endpoint_serde_round_trips_as_unix_string() {
+        let endpoint =
+            BrokerEndpoint::new("/run/msb/ssh-broker.sock").expect("test broker must validate");
+        let json = serde_json::to_string(&endpoint).unwrap();
+        assert_eq!(json, "\"unix:///run/msb/ssh-broker.sock\"");
+        let back: BrokerEndpoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, endpoint);
+        // Stored payloads revalidate fail-closed on the way back in.
+        assert!(serde_json::from_str::<BrokerEndpoint>("\"relative/broker.sock\"").is_err());
+        assert!(serde_json::from_str::<BrokerEndpoint>("\"tcp://127.0.0.1:22\"").is_err());
     }
 
     #[test]

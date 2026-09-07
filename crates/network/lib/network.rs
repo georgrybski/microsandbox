@@ -332,16 +332,21 @@ impl SmoltcpNetwork {
         let max_connections = config.max_connections;
         let secrets = self.secrets.clone();
         let outbound_proxy = self.config.outbound_proxy().cloned().map(Arc::new);
-        // SSH gateway is host-side enforcement joined with the guest-visible
-        // policy. No broker endpoint exists in the declarative config (it
-        // must never appear in guest-visible state), so divert-intended
-        // flows deny fail-closed until broker wiring lands. Transport CID
-        // has no source in this tree yet, so it is stamped `0`
-        // (unspecified).
-        let ssh_gateway: Option<Arc<SshGatewayConfig>> = config
-            .ssh
-            .clone()
-            .map(|policy| Arc::new(SshGatewayConfig::new(policy, None, 0)));
+        // SSH gateway is host-side enforcement joining the guest-visible
+        // policy with the host-side broker binding carried on the
+        // resolved config. An absent binding keeps the fail-closed stub:
+        // divert-intended flows deny. The transport identifier arrives
+        // with the binding, derived at spawn time from the leased
+        // network slot; `0` (unspecified) only when no binding exists
+        // and no divert can happen.
+        let ssh_gateway: Option<Arc<SshGatewayConfig>> =
+            config
+                .ssh
+                .clone()
+                .map(|policy| match self.config.ssh_broker() {
+                    Some(binding) => Arc::new(binding.gateway_config(policy)),
+                    None => Arc::new(SshGatewayConfig::new(policy, None, 0)),
+                });
 
         self.poll_handle = Some(
             std::thread::Builder::new()
