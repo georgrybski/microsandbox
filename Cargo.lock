@@ -4231,6 +4231,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "microsandbox-scan"
+version = "0.6.16"
+dependencies = [
+ "base64 0.23.1",
+ "hex",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "zeroize",
+]
+
+[[package]]
 name = "microsandbox-types"
 version = "0.6.16"
 dependencies = [
