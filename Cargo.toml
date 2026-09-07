@@ -3,6 +3,7 @@ resolver = "3"
 exclude = ["sdk/rust/fuzz"]
 members = [
     "crates/agentd",
+    "crates/brokerd",
     "crates/cli",
     "crates/db",
     "crates/filesystem",
