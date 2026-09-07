@@ -57,7 +57,9 @@ use windows_sys::Win32::System::Threading::{
 use microsandbox_image::{Digest, GlobalCache};
 use microsandbox_metrics::{MetricsRegistry, ReserveSlot, SlotReservation};
 #[cfg(feature = "net")]
-use microsandbox_network::{ResolvedNetworkConfig, config::EnvNetworkSecretResolver};
+use microsandbox_network::{
+    ResolvedNetworkConfig, config::EnvNetworkSecretResolver, ssh::SshBrokerBinding,
+};
 use microsandbox_protocol::{
     bootstrap::{
         BootstrapBlockRoot, BootstrapBlockRootUpper, BootstrapDirMount, BootstrapDiskMount,
@@ -2388,7 +2390,7 @@ fn sandbox_cli_args(
     config: &SandboxConfig,
     sandbox_id: i32,
     #[cfg(feature = "net")] network_slot: NetworkSlot,
-    #[cfg(feature = "net")] resolved_network: ResolvedNetworkConfig,
+    #[cfg(feature = "net")] mut resolved_network: ResolvedNetworkConfig,
     db_path: &Path,
     db_connect_timeout_secs: u64,
     log_dir: &Path,
@@ -2777,6 +2779,18 @@ fn sandbox_cli_args(
     // Network configuration travels as a typed value inside the JSON payload.
     #[cfg(feature = "net")]
     {
+        // Host-side SSH broker binding: the endpoint arrives as
+        // builder-only input on the sandbox config (never in the
+        // guest-visible spec). The transport identifier is the leased
+        // network slot for this launch, the per-sandbox discriminator
+        // available in this tree; the libkrun guest CID is a constant
+        // across sandboxes and is not reachable before VM build.
+        if let Some(endpoint) = config.ssh_broker_endpoint.clone() {
+            resolved_network.set_ssh_broker(Some(SshBrokerBinding::new(
+                endpoint,
+                u64::from(network_slot.get()),
+            )));
+        }
         launch.network = Some(resolved_network);
         launch.sandbox_slot = network_slot.get();
     }
@@ -3306,6 +3320,57 @@ mod tests {
             .unwrap();
 
         assert_eq!(render_launch(&config).sandbox_slot, 1);
+    }
+
+    /// Builder broker input reaches the launch payload as a binding keyed
+    /// by the leased slot, while the guest-visible spec stays clean.
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn sandbox_cli_args_threads_ssh_broker_binding() {
+        let config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .ssh_broker_endpoint("/run/msb/ssh-broker.sock")
+            .build()
+            .await
+            .unwrap();
+
+        let launch = render_launch(&config);
+        let network = launch.network.as_ref().expect("network launch config");
+        let binding = network.ssh_broker().expect("broker binding threaded");
+        assert_eq!(binding.transport_cid, u64::from(test_network_slot().get()));
+        assert_eq!(
+            binding.endpoint.path(),
+            Path::new("/run/msb/ssh-broker.sock")
+        );
+        assert_eq!(launch.sandbox_slot, test_network_slot().get());
+
+        let spec_json = serde_json::to_value(&config.spec).unwrap().to_string();
+        assert!(
+            !spec_json.contains("ssh-broker.sock"),
+            "guest-visible spec must not name the host broker socket"
+        );
+    }
+
+    /// Without builder input the launch payload carries no binding and
+    /// the gateway keeps denying divert-intended flows fail-closed.
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn sandbox_cli_args_omits_ssh_broker_binding_by_default() {
+        let config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .build()
+            .await
+            .unwrap();
+
+        let launch = render_launch(&config);
+        assert!(
+            launch
+                .network
+                .as_ref()
+                .expect("network launch config")
+                .ssh_broker()
+                .is_none()
+        );
     }
 
     #[tokio::test]

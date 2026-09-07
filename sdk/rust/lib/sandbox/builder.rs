@@ -749,6 +749,29 @@ impl SandboxBuilder {
         self
     }
 
+    /// Set the host-side SSH broker endpoint divert-intended flows dial.
+    ///
+    /// Host-side only: the endpoint never enters the guest-visible
+    /// network spec. Spawn joins it with the leased-slot transport
+    /// identifier on the resolved config; without it, divert-intended
+    /// flows deny fail-closed.
+    ///
+    /// ```ignore
+    /// .ssh_broker_endpoint("/run/msb/ssh-broker.sock")
+    /// ```
+    #[cfg(feature = "net")]
+    pub fn ssh_broker_endpoint(mut self, address: impl AsRef<str>) -> Self {
+        match microsandbox_network::ssh::BrokerEndpoint::new(address.as_ref()) {
+            Ok(endpoint) => self.config.ssh_broker_endpoint = Some(endpoint),
+            Err(error) => {
+                if self.build_error.is_none() {
+                    self.build_error = Some(MicrosandboxError::InvalidConfig(error.to_string()));
+                }
+            }
+        }
+        self
+    }
+
     /// Prepend explicit rules while preserving a configured policy's defaults and existing rules.
     #[cfg(feature = "net")]
     #[doc(hidden)]
@@ -2636,6 +2659,48 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("invalid SOCKS5 proxy address"));
+    }
+
+    /// The broker endpoint is host-side builder input: retained on the
+    /// config for spawn, but absent from the guest-visible spec JSON.
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn test_builder_sets_ssh_broker_endpoint_off_spec() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .ssh_broker_endpoint("/run/msb/ssh-broker.sock")
+            .build()
+            .await
+            .unwrap();
+
+        let endpoint = config
+            .ssh_broker_endpoint
+            .as_ref()
+            .expect("broker endpoint retained for spawn");
+        assert_eq!(
+            endpoint.path().as_os_str(),
+            std::ffi::OsStr::new("/run/msb/ssh-broker.sock")
+        );
+        assert!(
+            !serde_json::to_value(&config.spec)
+                .unwrap()
+                .to_string()
+                .contains("ssh-broker.sock"),
+            "guest-visible spec must not name the host broker socket"
+        );
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn test_builder_rejects_invalid_ssh_broker_endpoint() {
+        let error = SandboxBuilder::new("test")
+            .image("alpine")
+            .ssh_broker_endpoint("relative/broker.sock")
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("must be absolute"));
     }
 
     #[cfg(feature = "net")]
