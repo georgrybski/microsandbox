@@ -2191,4 +2191,414 @@ mod tests {
         assert!(wire.contains(&body), "got {} bytes", wire.len());
         assert!(!wire.contains("$MSB_KEY"), "got: {wire:?}");
     }
+
+    // ── SSH gateway proxy-path tests ─────────────────────────────────────────
+
+    use crate::ssh::gateway::decode_ssh_divert_prelude;
+    use crate::ssh::policy::{BrokerEndpoint, SshGrant, SshPolicy};
+
+    /// Strict SSH policy granting `host:port`.
+    fn ssh_strict_grant(host: &str, port: u16) -> SshPolicy {
+        SshPolicy::new(true, vec![SshGrant::exact(host, port)])
+    }
+
+    /// Wrap a policy into the per-connection gateway config the proxy takes.
+    /// The broker endpoint is host-side only; `None` denies divert-intended
+    /// flows fail-closed.
+    fn ssh_gateway_for(
+        policy: SshPolicy,
+        broker: Option<BrokerEndpoint>,
+    ) -> Option<Arc<SshGatewayConfig>> {
+        Some(Arc::new(SshGatewayConfig::new(policy, broker, 7)))
+    }
+
+    /// Unique unix-socket path for broker test doubles in this process.
+    fn ssh_test_broker_path(case: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        format!(
+            "/tmp/msb-ssh-gateway-test-{case}-{}-{id}.sock",
+            std::process::id()
+        )
+    }
+
+    /// Fake SSH server: sends `banner` on accept, then records everything
+    /// the proxy forwards until the upstream socket closes.
+    async fn spawn_ssh_server(banner: Vec<u8>) -> (SocketAddr, JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(&banner).await.unwrap();
+            stream.flush().await.unwrap();
+            let mut received = Vec::new();
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => received.extend_from_slice(&buf[..n]),
+                }
+            }
+            received
+        });
+        (addr, handle)
+    }
+
+    /// Drive one proxy run with `gateway`, feeding `guest_chunks` in order
+    /// and then closing the guest side. Returns the terminal status and the
+    /// bytes the guest observed.
+    async fn run_ssh_proxy_once(
+        guest_dst: SocketAddr,
+        guest_chunks: &[&[u8]],
+        gateway: Option<Arc<SshGatewayConfig>>,
+    ) -> (ProxyConnectStatus, Vec<u8>) {
+        let (from_tx, from_rx) = mpsc::channel::<Bytes>(32);
+        let (to_tx, mut to_rx) = mpsc::channel::<Bytes>(32);
+        let proxy_connect = Arc::new(ProxyConnectState::new());
+
+        for chunk in guest_chunks {
+            from_tx.send(Bytes::copy_from_slice(chunk)).await.unwrap();
+        }
+        drop(from_tx);
+
+        TcpProxy::new(
+            guest_dst,
+            UpstreamTcpTarget::direct(guest_dst),
+            from_rx,
+            to_tx,
+            Arc::new(SharedState::new(4)),
+            Arc::new(NetworkPolicy::allow_all()),
+            Arc::new(SecretsConfig::default()),
+            None,
+            proxy_connect.clone(),
+            None,
+            gateway,
+        )
+        .try_run()
+        .await
+        .unwrap();
+
+        let mut guest_bytes = Vec::new();
+        while let Ok(data) = to_rx.try_recv() {
+            guest_bytes.extend_from_slice(&data);
+        }
+        (proxy_connect.status(), guest_bytes)
+    }
+
+    #[tokio::test]
+    async fn ssh_chunk_split_banner_diverts_through_proxy() {
+        // Direct upstream SSH server: the guest must see its banner first —
+        // classification never withholds the banner — even though the flow
+        // diverts away afterwards.
+        let (upstream_addr, upstream_task) =
+            spawn_ssh_server(b"SSH-2.0-Upstream_1.0\r\n".to_vec()).await;
+
+        // Broker double: asserts the u32-BE + CBOR prelude framing, then
+        // behaves as the reoriginated SSH server behind the divert.
+        let broker_path = ssh_test_broker_path("divert");
+        let _ = std::fs::remove_file(&broker_path);
+        let broker_listener = tokio::net::UnixListener::bind(&broker_path).unwrap();
+        let broker_task = tokio::spawn(async move {
+            let (mut sock, _) = broker_listener.accept().await.unwrap();
+            let mut len_buf = [0u8; 4];
+            sock.read_exact(&mut len_buf).await.unwrap();
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            sock.read_exact(&mut payload).await.unwrap();
+            let mut framed = len_buf.to_vec();
+            framed.extend_from_slice(&payload);
+            let (prelude, consumed) = decode_ssh_divert_prelude(&framed).unwrap();
+            assert_eq!(consumed, framed.len(), "prelude must be exactly one frame");
+            sock.write_all(b"SSH-2.0-Broker_1.0\r\n").await.unwrap();
+            sock.flush().await.unwrap();
+            let mut ssh_bytes = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf)).await {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                    Ok(Ok(n)) => ssh_bytes.extend_from_slice(&buf[..n]),
+                }
+            }
+            (prelude, ssh_bytes)
+        });
+
+        let gateway = ssh_gateway_for(
+            ssh_strict_grant("127.0.0.1", upstream_addr.port()),
+            Some(BrokerEndpoint::new(&broker_path).unwrap()),
+        );
+
+        // Client banner split across two segments, as TCP may deliver it.
+        // The banner-gated peek must settle instead of falling through on
+        // the first chunk. The second chunk is sent only after the direct
+        // banner arrives, so the double-banner fingerprint is deterministic:
+        // the peek provably relayed the banner before the divert.
+        let (from_tx, from_rx) = mpsc::channel::<Bytes>(32);
+        let (to_tx, mut to_rx) = mpsc::channel::<Bytes>(32);
+        let proxy_connect = Arc::new(ProxyConnectState::new());
+        let proxy_task = tokio::spawn(
+            TcpProxy::new(
+                upstream_addr,
+                UpstreamTcpTarget::direct(upstream_addr),
+                from_rx,
+                to_tx,
+                Arc::new(SharedState::new(4)),
+                Arc::new(NetworkPolicy::allow_all()),
+                Arc::new(SecretsConfig::default()),
+                None,
+                proxy_connect.clone(),
+                None,
+                gateway,
+            )
+            .try_run(),
+        );
+
+        from_tx
+            .send(Bytes::from_static(b"SSH-2.0-O"))
+            .await
+            .unwrap();
+        let direct_banner = tokio::time::timeout(Duration::from_secs(5), to_rx.recv())
+            .await
+            .expect("direct banner must arrive during the peek")
+            .expect("guest channel must stay open");
+        assert_eq!(
+            direct_banner.as_ref(),
+            b"SSH-2.0-Upstream_1.0\r\n",
+            "classification must never withhold the banner"
+        );
+        from_tx
+            .send(Bytes::from_static(b"penSSH_9.6\r\n"))
+            .await
+            .unwrap();
+        drop(from_tx);
+        proxy_task.await.unwrap().unwrap();
+
+        assert_eq!(proxy_connect.status(), ProxyConnectStatus::Connected);
+        let mut guest_bytes = direct_banner.to_vec();
+        while let Ok(data) = to_rx.try_recv() {
+            guest_bytes.extend_from_slice(&data);
+        }
+        let guest_text = String::from_utf8_lossy(&guest_bytes).into_owned();
+        assert!(
+            guest_text.contains("SSH-2.0-Broker_1.0"),
+            "guest must observe the broker banner after the divert (double-banner fingerprint), got: {guest_text:?}"
+        );
+
+        let (prelude, ssh_bytes) = broker_task.await.unwrap();
+        assert_eq!(prelude.dest_host, "127.0.0.1");
+        assert_eq!(prelude.dest_port, upstream_addr.port());
+        assert_eq!(prelude.transport_cid, 7);
+        assert!(prelude.epoch > 0, "prelude must carry a wall-clock epoch");
+        assert_eq!(
+            ssh_bytes, b"SSH-2.0-OpenSSH_9.6\r\n",
+            "buffered client banner must be forwarded to the broker verbatim"
+        );
+
+        // The diverted-away direct upstream socket closes without replay:
+        // the buffered first flight went to the broker, not upstream.
+        assert!(
+            upstream_task.await.unwrap().is_empty(),
+            "divert must not replay guest bytes to the direct upstream"
+        );
+        let _ = std::fs::remove_file(&broker_path);
+    }
+
+    #[tokio::test]
+    async fn ssh_strict_non_granted_port_denies_without_upstream_replay() {
+        let (upstream_addr, upstream_task) =
+            spawn_ssh_server(b"SSH-2.0-Upstream_1.0\r\n".to_vec()).await;
+
+        // Port 22 is granted, but the flow targets the ephemeral test port:
+        // strict mode denies SSH to non-granted ports even when generic
+        // egress allows.
+        let gateway = ssh_gateway_for(ssh_strict_grant("127.0.0.1", 22), None);
+
+        let (status, _guest_bytes) =
+            run_ssh_proxy_once(upstream_addr, &[b"SSH-2.0-OpenSSH_9.6\r\n"], gateway).await;
+
+        assert_eq!(status, ProxyConnectStatus::PolicyDenied);
+        assert!(
+            upstream_task.await.unwrap().is_empty(),
+            "denied flow must close the upstream socket without replaying guest bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_divert_broker_dial_failure_denies_fail_closed() {
+        let (upstream_addr, upstream_task) =
+            spawn_ssh_server(b"SSH-2.0-Upstream_1.0\r\n".to_vec()).await;
+
+        // Granted flow, but the broker socket does not exist: divert-intended
+        // without a reachable broker denies instead of falling back to
+        // direct, which would silently bypass broker authentication.
+        let missing = ssh_test_broker_path("missing");
+        let _ = std::fs::remove_file(&missing);
+        let gateway = ssh_gateway_for(
+            ssh_strict_grant("127.0.0.1", upstream_addr.port()),
+            Some(BrokerEndpoint::new(&missing).unwrap()),
+        );
+
+        let (status, _guest_bytes) =
+            run_ssh_proxy_once(upstream_addr, &[b"SSH-2.0-OpenSSH_9.6\r\n"], gateway).await;
+
+        assert_eq!(
+            status,
+            ProxyConnectStatus::PolicyDenied,
+            "unreachable broker must deny fail-closed, never direct"
+        );
+        assert!(
+            upstream_task.await.unwrap().is_empty(),
+            "denied flow must close the upstream socket without replaying guest bytes"
+        );
+    }
+
+    /// Minimal capturing subscriber so the fall-through test can assert the
+    /// observable log line without extra dependencies.
+    #[derive(Debug, Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for CapturedLogs {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Message(Option<String>);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = Some(format!("{value:?}"));
+                    }
+                }
+            }
+            let mut visitor = Message(None);
+            event.record(&mut visitor);
+            if let Some(message) = visitor.0 {
+                self.0.lock().unwrap().push(message);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ssh_incomplete_banner_falls_through_to_egress_with_log() {
+        // An incomplete banner at guest EOF stays NeedMoreData: the one
+        // deliberate fail-open hole falls through to the generic egress
+        // verdict (allow here) with an observable log line, rather than
+        // stalling the connection.
+        let (upstream_addr, upstream_task) = spawn_sink().await;
+        let gateway = ssh_gateway_for(ssh_strict_grant("127.0.0.1", 22), None);
+
+        let logs = CapturedLogs::default();
+        let dispatch = tracing::dispatcher::Dispatch::new(logs.clone());
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        let (from_tx, from_rx) = mpsc::channel::<Bytes>(32);
+        let (to_tx, _to_rx) = mpsc::channel::<Bytes>(32);
+        let proxy_connect = Arc::new(ProxyConnectState::new());
+        from_tx
+            .send(Bytes::from_static(b"SSH-2.0-O"))
+            .await
+            .unwrap();
+        drop(from_tx);
+
+        TcpProxy::new(
+            upstream_addr,
+            UpstreamTcpTarget::direct(upstream_addr),
+            from_rx,
+            to_tx,
+            Arc::new(SharedState::new(4)),
+            Arc::new(NetworkPolicy::allow_all()),
+            Arc::new(SecretsConfig::default()),
+            None,
+            proxy_connect.clone(),
+            None,
+            gateway,
+        )
+        .try_run()
+        .await
+        .unwrap();
+
+        assert_eq!(proxy_connect.status(), ProxyConnectStatus::Connected);
+        assert_eq!(
+            upstream_task.await.unwrap(),
+            b"SSH-2.0-O",
+            "undecided bytes must still reach upstream under egress allow"
+        );
+        assert!(
+            logs.0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.contains("falling through to egress")),
+            "incomplete classification must emit the fall-through log line"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_incomplete_banner_timeout_falls_through_to_egress() {
+        // Same fall-through, but driven by the real 5 s peek budget with the
+        // guest sender held open: the banner never completes, so the
+        // connection proceeds under the generic egress verdict instead of
+        // stalling.
+        let (upstream_addr, upstream_task) = spawn_sink().await;
+        let gateway = ssh_gateway_for(ssh_strict_grant("127.0.0.1", 22), None);
+
+        let (from_tx, from_rx) = mpsc::channel::<Bytes>(32);
+        let (to_tx, _to_rx) = mpsc::channel::<Bytes>(32);
+        let proxy_connect = Arc::new(ProxyConnectState::new());
+        from_tx
+            .send(Bytes::from_static(b"SSH-2.0-O"))
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let run = tokio::spawn(
+            TcpProxy::new(
+                upstream_addr,
+                UpstreamTcpTarget::direct(upstream_addr),
+                from_rx,
+                to_tx,
+                Arc::new(SharedState::new(4)),
+                Arc::new(NetworkPolicy::allow_all()),
+                Arc::new(SecretsConfig::default()),
+                None,
+                proxy_connect.clone(),
+                None,
+                gateway,
+            )
+            .try_run(),
+        );
+        // Outlive the 5 s peek budget, then half-close the guest so the
+        // relay loop can drain.
+        tokio::time::sleep(Duration::from_millis(5500)).await;
+        drop(from_tx);
+        run.await.unwrap().unwrap();
+
+        assert!(
+            started.elapsed() >= Duration::from_secs(5),
+            "the peek budget must expire before fall-through"
+        );
+        assert_eq!(proxy_connect.status(), ProxyConnectStatus::Connected);
+        assert_eq!(
+            upstream_task.await.unwrap(),
+            b"SSH-2.0-O",
+            "undecided bytes must still reach upstream under egress allow"
+        );
+    }
 }

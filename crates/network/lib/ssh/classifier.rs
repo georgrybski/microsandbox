@@ -519,6 +519,26 @@ mod tests {
     }
 
     #[test]
+    fn trailing_banner_prefix_holds_only_partial_prefixes() {
+        assert!(trailing_fragment_is_banner_prefix(b"SSH-2.0-O"));
+        assert!(trailing_fragment_is_banner_prefix(b"S"));
+        assert!(trailing_fragment_is_banner_prefix(b"SSH-1.99"));
+        assert!(trailing_fragment_is_banner_prefix(b"SSH-2.0-OpenSSH_9.6"));
+        // Decided buffers never hold the peek, even with a banner-like tail.
+        assert!(!trailing_fragment_is_banner_prefix(b""));
+        assert!(!trailing_fragment_is_banner_prefix(
+            b"SSH-2.0-OpenSSH_9.6\r\n"
+        ));
+        assert!(!trailing_fragment_is_banner_prefix(b"PING\r\n"));
+        assert!(!trailing_fragment_is_banner_prefix(b"SSH-foo"));
+        assert!(!trailing_fragment_is_banner_prefix(b"GET / HTTP/1.1\r\n"));
+        assert!(!trailing_fragment_is_banner_prefix(&[0x01, 0x02, 0x03]));
+        // A completed line followed by a fresh partial prefix still holds:
+        // only the trailing fragment matters.
+        assert!(trailing_fragment_is_banner_prefix(b"comment\r\nSSH-2.0-"));
+    }
+
+    #[test]
     fn reset_clears_sticky_verdict_for_test_reuse() {
         let mut classifier = SshClassifier::new();
         assert_eq!(
