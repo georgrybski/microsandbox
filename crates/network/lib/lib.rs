@@ -22,6 +22,7 @@ pub mod network;
 pub mod policy;
 pub mod ports;
 pub mod secrets;
+pub mod ssh;
 pub mod tcp;
 pub mod tls;
 pub mod udp;

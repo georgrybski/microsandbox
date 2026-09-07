@@ -124,6 +124,16 @@ pub struct SandboxConfig {
     #[serde(skip)]
     pub(crate) ca_certs: Vec<Vec<u8>>,
 
+    /// Host-side SSH broker endpoint divert-intended flows dial.
+    ///
+    /// Set via the sandbox builder. Host-side only: never serialized
+    /// into the spec or the database; applied to the resolved network
+    /// config at spawn time alongside the leased-slot transport
+    /// identifier. Follows the `insecure`/`ca_certs` local-state pattern.
+    #[cfg(feature = "net")]
+    #[serde(skip)]
+    pub(crate) ssh_broker_endpoint: Option<microsandbox_network::ssh::BrokerEndpoint>,
+
     /// Replace an existing sandbox with the same name during create.
     ///
     /// If the existing sandbox is still active, microsandbox stops it and
@@ -641,6 +651,8 @@ impl Default for SandboxConfig {
             registry_auth: None,
             insecure: false,
             ca_certs: Vec::new(),
+            #[cfg(feature = "net")]
+            ssh_broker_endpoint: None,
             replace_existing: false,
             replace_with_timeout: DEFAULT_REPLACE_TIMEOUT,
             slug: None,

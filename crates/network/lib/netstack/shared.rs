@@ -195,6 +195,25 @@ impl SharedState {
             .member_matches(&addr, Instant::now(), |key| predicate(&key.hostname))
     }
 
+    /// Best-effort representative hostname previously resolved to `addr`.
+    ///
+    /// Returns the lexicographically smallest live hostname so SSH flow
+    /// attribution is deterministic when several names share an IP (for
+    /// example a shared CDN address). `None` means no cached binding;
+    /// callers fall back to the stringified destination IP.
+    pub fn preferred_hostname_for_ip(&self, addr: IpAddr) -> Option<String> {
+        let addr = normalize_ip_addr(addr);
+        let mut names: Vec<String> = self
+            .resolved_hostnames
+            .read()
+            .keys_for_member(&addr, Instant::now())
+            .into_iter()
+            .map(|key| key.hostname)
+            .collect();
+        names.sort();
+        names.into_iter().next()
+    }
+
     /// Best-effort expiry maintenance for resolved hostnames.
     ///
     /// This runs outside the hot egress read path. If the index is currently

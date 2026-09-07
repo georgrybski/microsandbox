@@ -4090,6 +4090,7 @@ version = "0.6.16"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "ciborium",
  "core-foundation 0.9.4",
  "crossbeam-queue",
  "dirs",

@@ -32,6 +32,7 @@ use crate::policy::{EgressEvaluation, HostnameSource, NetworkPolicy, Protocol};
 use crate::ports::PortPublisher;
 use crate::proxy::ResolvedOutboundProxy;
 use crate::secrets::handle::SecretsHandle;
+use crate::ssh::gateway::SshGatewayConfig;
 use crate::tcp::{connection::ConnectionTracker, proxy::TcpProxy, upstream::UpstreamTcpTarget};
 use crate::tls::{proxy::TlsProxy, state::TlsState};
 use crate::udp::fragments::{
@@ -223,6 +224,8 @@ pub fn create_interface(device: &mut SmoltcpDevice, config: &PollLoopConfig) -> 
 ///   [`ConnectionTracker`]; `None` uses the default.
 /// * `tokio_handle` - Runtime handle used for proxy tasks, DNS forwarding, port publishing,
 ///   and ICMP relays.
+/// * `ssh_gateway` - Optional SSH divert/direct/deny enforcement shared across
+///   proxy tasks. `None` preserves the existing data path unchanged.
 #[allow(clippy::too_many_arguments)]
 pub fn smoltcp_poll_loop(
     shared: Arc<SharedState>,
@@ -236,6 +239,7 @@ pub fn smoltcp_poll_loop(
     tokio_handle: tokio::runtime::Handle,
     secrets: SecretsHandle,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
+    ssh_gateway: Option<Arc<SshGatewayConfig>>,
 ) {
     let mut device = SmoltcpDevice::new(shared.clone(), config.mtu);
     let mut iface = create_interface(&mut device, &config);
@@ -616,6 +620,7 @@ pub fn smoltcp_poll_loop(
                 tls_state.clone(),
                 conn.proxy_connect,
                 connection_outbound_proxy,
+                ssh_gateway.clone(),
             );
             tokio_handle.spawn(proxy.run());
         }

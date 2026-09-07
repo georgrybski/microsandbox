@@ -597,6 +597,14 @@ pub struct NetworkSpec {
     ///
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outbound_proxy: Option<OutboundProxy>,
+
+    /// SSH egress policy subdocument.
+    ///
+    /// Guest-visible policy only (strict mode plus grants). The broker
+    /// unix-socket path is host-side and never appears here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[config_patch(nested)]
+    pub ssh: Option<SshConfig>,
 }
 
 /// Proxy configuration for outbound sandbox connections.
@@ -638,6 +646,41 @@ pub struct Socks5Credentials {
 
     /// Host-side source for the SOCKS5 authentication password.
     pub password: SecretSource,
+}
+
+/// SSH egress policy configuration. Carried in [`NetworkSpec::ssh`](NetworkSpec).
+///
+/// Guest-visible policy only: confinement mode plus the allowance set. The
+/// broker unix-socket path is host-side and never appears here; the local
+/// network engine joins this view with its host-side broker endpoint at
+/// runtime.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigPatch)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(default)]
+pub struct SshConfig {
+    /// When true, SSH to non-granted destinations is denied even if generic
+    /// TCP egress allows it.
+    pub strict: bool,
+    /// SSH allowances consulted for divert and strict-deny.
+    pub grants: Vec<SshGrant>,
+    /// Deny strength for SSH violations.
+    pub on_violation: ViolationAction,
+}
+
+/// One SSH allowance: a host pattern plus the ports it covers.
+///
+/// An empty `ports` set matches any port, mirroring [`Rule`] port
+/// semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SshGrant {
+    /// Host pattern this grant covers.
+    pub host: HostPattern,
+    /// Port ranges this grant covers (empty means any port).
+    #[serde(default)]
+    pub ports: Vec<PortRange>,
 }
 
 /// A published port mapping between host and guest.
@@ -1723,6 +1766,7 @@ impl Default for NetworkSpec {
             rate_limiter: None,
             trust_host_cas: false,
             outbound_proxy: None,
+            ssh: None,
         }
     }
 }

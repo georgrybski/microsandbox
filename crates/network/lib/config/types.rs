@@ -13,6 +13,8 @@ use crate::dns::Nameserver;
 use crate::policy::NetworkPolicy;
 use crate::proxy::{OutboundProxy, ResolvedOutboundProxy};
 use crate::secrets::config::SecretsConfig;
+use crate::ssh::SshBrokerBinding;
+use crate::ssh::policy::SshPolicy;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -88,6 +90,11 @@ pub struct NetworkConfig {
     /// relays non-DNS UDP; SOCKS4 blocks it because that protocol has no UDP command.
     #[serde(default)]
     pub outbound_proxy: Option<OutboundProxy>,
+
+    /// SSH egress policy. `None` preserves the existing byte-identical
+    /// behavior; `Some` enables divert/direct/deny gating in the TCP proxy.
+    #[serde(default)]
+    pub ssh: Option<SshPolicy>,
 }
 
 /// Network configuration whose runtime-only values have been resolved.
@@ -101,6 +108,13 @@ pub struct ResolvedNetworkConfig {
     /// Fully resolved outbound proxy, including runtime authentication
     /// material when configured.
     outbound_proxy: Option<ResolvedOutboundProxy>,
+
+    /// Host-side SSH broker binding for divert flows, applied at spawn
+    /// time from builder-only input. `None` keeps divert-intended flows
+    /// denying fail-closed. Missing in payloads from older launchers,
+    /// which therefore keep the fail-closed behavior.
+    #[serde(default)]
+    ssh_broker: Option<SshBrokerBinding>,
 }
 
 /// Optional overrides for the guest interface.
@@ -199,6 +213,7 @@ impl ResolvedNetworkConfig {
         Self {
             config,
             outbound_proxy,
+            ssh_broker: None,
         }
     }
 
@@ -216,6 +231,21 @@ impl ResolvedNetworkConfig {
     /// Returns the fully resolved outbound proxy used by the network runtime.
     pub(crate) fn outbound_proxy(&self) -> Option<&ResolvedOutboundProxy> {
         self.outbound_proxy.as_ref()
+    }
+
+    /// Returns the host-side SSH broker binding for divert flows, if any.
+    #[doc(hidden)]
+    pub fn ssh_broker(&self) -> Option<&SshBrokerBinding> {
+        self.ssh_broker.as_ref()
+    }
+
+    /// Sets the host-side SSH broker binding for divert flows.
+    ///
+    /// Called at spawn time from the SDK's host-side-only builder input;
+    /// never deserialized from guest-visible configuration.
+    #[doc(hidden)]
+    pub fn set_ssh_broker(&mut self, binding: Option<SshBrokerBinding>) {
+        self.ssh_broker = binding;
     }
 
     /// Clears both the declarative and resolved outbound proxy state.
@@ -243,6 +273,7 @@ impl Default for NetworkConfig {
             rate_limiter: None,
             trust_host_cas: false,
             outbound_proxy: None,
+            ssh: None,
         }
     }
 }
@@ -279,7 +310,7 @@ fn default_query_timeout_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{InterfaceOverrides, NetworkConfig, PortProtocol};
+    use super::{InterfaceOverrides, NetworkConfig, PortProtocol, ResolvedNetworkConfig};
     use crate::dns::Nameserver;
     use crate::policy::{Destination, NetworkPolicy, Rule};
     use crate::proxy::OutboundProxy;
@@ -504,5 +535,141 @@ mod tests {
             serde_json::from_str::<PortProtocol>("\"Udp\"").unwrap(),
             PortProtocol::Udp
         );
+    }
+
+    /// SSH policy absent preserves existing behavior: the default config
+    /// carries no SSH gating, old JSON without the field still
+    /// deserializes, and the wire round-trip preserves the absence.
+    #[test]
+    fn ssh_absent_by_default_and_round_trips_through_wire_spec() {
+        let config = NetworkConfig::default();
+        assert!(config.ssh.is_none());
+
+        let old: NetworkConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(old.ssh.is_none());
+
+        let spec: microsandbox_types::NetworkSpec =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert!(spec.ssh.is_none());
+        assert!(
+            !serde_json::to_value(&spec)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("ssh"),
+            "skip_serializing_if should omit an unset ssh policy from the wire form"
+        );
+
+        let back: NetworkConfig =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert!(back.ssh.is_none());
+    }
+
+    /// An SSH policy with grants survives the wire round-trip with its
+    /// strict mode, host patterns, and ports intact.
+    #[test]
+    fn ssh_policy_survives_the_wire_spec_round_trip() {
+        use crate::ssh::policy::{SshGrant, SshPolicy};
+        use microsandbox_types::HostPattern;
+
+        let config = NetworkConfig {
+            ssh: Some(SshPolicy::new(
+                true,
+                vec![SshGrant::new(
+                    HostPattern::Exact("example.com".to_string()),
+                    vec![crate::policy::PortRange::single(22)],
+                )],
+            )),
+            ..NetworkConfig::default()
+        };
+
+        let spec: microsandbox_types::NetworkSpec =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        let wire_ssh = spec.ssh.as_ref().expect("wire must carry ssh");
+        assert!(wire_ssh.strict);
+        assert_eq!(wire_ssh.grants.len(), 1);
+
+        let back: NetworkConfig =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(back.ssh, config.ssh);
+    }
+
+    /// The host-side broker binding rides the resolved config (the
+    /// private launch contract) while the guest-visible spec JSON never
+    /// names the broker socket. The joined gateway config then diverts
+    /// instead of denying fail-closed.
+    #[test]
+    fn ssh_broker_binding_stays_off_the_guest_visible_spec() {
+        use crate::config::EnvNetworkSecretResolver;
+        use crate::policy::Action;
+        use crate::ssh::SshBrokerBinding;
+        use crate::ssh::classifier::SshClassification;
+        use crate::ssh::policy::{BrokerEndpoint, SshFlow, SshGrant, SshPolicy, decide_ssh_egress};
+
+        let policy = SshPolicy::new(
+            true,
+            vec![SshGrant::new(
+                microsandbox_types::HostPattern::Exact("example.com".to_string()),
+                vec![crate::policy::PortRange::single(22)],
+            )],
+        );
+        let config = NetworkConfig {
+            ssh: Some(policy.clone()),
+            ..NetworkConfig::default()
+        };
+
+        let mut resolved = config.resolve(&EnvNetworkSecretResolver).unwrap();
+        assert!(resolved.ssh_broker().is_none());
+        resolved.set_ssh_broker(Some(SshBrokerBinding::new(
+            BrokerEndpoint::new("/run/msb/ssh-broker.sock").expect("test broker must validate"),
+            3,
+        )));
+
+        // Runtime side carries the binding with its transport identity.
+        let binding = resolved.ssh_broker().expect("binding must be set");
+        assert_eq!(binding.transport_cid, 3);
+        assert_eq!(
+            binding.endpoint.path().as_os_str(),
+            std::ffi::OsStr::new("/run/msb/ssh-broker.sock")
+        );
+
+        // Guest-visible sides never name the host socket.
+        let config_json = serde_json::to_value(resolved.config()).unwrap().to_string();
+        assert!(!config_json.contains("ssh-broker.sock"));
+        let spec: microsandbox_types::NetworkSpec =
+            serde_json::from_value(serde_json::to_value(resolved.config()).unwrap()).unwrap();
+        assert!(
+            !serde_json::to_value(&spec)
+                .unwrap()
+                .to_string()
+                .contains("ssh-broker.sock"),
+            "guest-visible NetworkSpec must not name the broker socket"
+        );
+
+        // The joined gateway config diverts a granted flow.
+        let gateway = binding.gateway_config(policy.clone());
+        let decision = decide_ssh_egress(
+            &SshFlow::new("example.com", 22),
+            SshClassification::Ssh,
+            Action::Allow,
+            &policy,
+            gateway.broker.as_ref(),
+        );
+        assert!(
+            decision.is_divert(),
+            "bound gateway must divert granted flows, got {decision:?}"
+        );
+    }
+
+    /// Payloads from older launchers carry no broker field and keep the
+    /// fail-closed behavior (absent binding denies divert-intended flows).
+    #[test]
+    fn resolved_config_without_broker_field_deserializes_to_none() {
+        let resolved: ResolvedNetworkConfig = serde_json::from_value(serde_json::json!({
+            "config": serde_json::to_value(NetworkConfig::default()).unwrap(),
+            "outbound_proxy": null,
+        }))
+        .unwrap();
+        assert!(resolved.ssh_broker().is_none());
     }
 }
