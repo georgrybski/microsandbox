@@ -305,6 +305,10 @@ impl BootParams {
             default_env,
             security_profile,
             handoff_init,
+            // Broker VM fields: only brokerd consumes these; agentd ignores
+            // them so a shared bootstrap frame stays decodable here.
+            broker_key: _,
+            broker_upstream: _,
         } = bootstrap;
 
         let security_profile = match security_profile {
