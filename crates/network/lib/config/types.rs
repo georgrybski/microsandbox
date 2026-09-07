@@ -13,6 +13,7 @@ use crate::dns::Nameserver;
 use crate::policy::NetworkPolicy;
 use crate::proxy::{OutboundProxy, ResolvedOutboundProxy};
 use crate::secrets::config::SecretsConfig;
+use crate::ssh::policy::SshPolicy;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -88,6 +89,11 @@ pub struct NetworkConfig {
     /// relays non-DNS UDP; SOCKS4 blocks it because that protocol has no UDP command.
     #[serde(default)]
     pub outbound_proxy: Option<OutboundProxy>,
+
+    /// SSH egress policy. `None` preserves the existing byte-identical
+    /// behavior; `Some` enables divert/direct/deny gating in the TCP proxy.
+    #[serde(default)]
+    pub ssh: Option<SshPolicy>,
 }
 
 /// Network configuration whose runtime-only values have been resolved.
@@ -243,6 +249,7 @@ impl Default for NetworkConfig {
             rate_limiter: None,
             trust_host_cas: false,
             outbound_proxy: None,
+            ssh: None,
         }
     }
 }
@@ -504,5 +511,62 @@ mod tests {
             serde_json::from_str::<PortProtocol>("\"Udp\"").unwrap(),
             PortProtocol::Udp
         );
+    }
+
+    /// SSH policy absent preserves existing behavior: the default config
+    /// carries no SSH gating, old JSON without the field still
+    /// deserializes, and the wire round-trip preserves the absence.
+    #[test]
+    fn ssh_absent_by_default_and_round_trips_through_wire_spec() {
+        let config = NetworkConfig::default();
+        assert!(config.ssh.is_none());
+
+        let old: NetworkConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(old.ssh.is_none());
+
+        let spec: microsandbox_types::NetworkSpec =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert!(spec.ssh.is_none());
+        assert!(
+            !serde_json::to_value(&spec)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("ssh"),
+            "skip_serializing_if should omit an unset ssh policy from the wire form"
+        );
+
+        let back: NetworkConfig =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert!(back.ssh.is_none());
+    }
+
+    /// An SSH policy with grants survives the wire round-trip with its
+    /// strict mode, host patterns, and ports intact.
+    #[test]
+    fn ssh_policy_survives_the_wire_spec_round_trip() {
+        use crate::ssh::policy::{SshGrant, SshPolicy};
+        use microsandbox_types::HostPattern;
+
+        let config = NetworkConfig {
+            ssh: Some(SshPolicy::new(
+                true,
+                vec![SshGrant::new(
+                    HostPattern::Exact("example.com".to_string()),
+                    vec![crate::policy::PortRange::single(22)],
+                )],
+            )),
+            ..NetworkConfig::default()
+        };
+
+        let spec: microsandbox_types::NetworkSpec =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        let wire_ssh = spec.ssh.as_ref().expect("wire must carry ssh");
+        assert!(wire_ssh.strict);
+        assert_eq!(wire_ssh.grants.len(), 1);
+
+        let back: NetworkConfig =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(back.ssh, config.ssh);
     }
 }

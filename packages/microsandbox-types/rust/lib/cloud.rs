@@ -1011,6 +1011,9 @@ impl TryFrom<CloudSandboxSpec> for SandboxSpec {
             rate_limiter: None,
             trust_host_cas: false,
             outbound_proxy: None,
+            // Cloud tenants cannot configure SSH divert policy; managed
+            // control planes apply their own host-side SSH handling.
+            ssh: None,
         };
         let runtime = SandboxRuntimeOptions {
             workdir: spec.runtime.workdir,

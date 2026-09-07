@@ -68,11 +68,12 @@ pub struct SshFlow {
 /// An empty `ports` set matches any port, mirroring [`crate::policy::Rule`]
 /// port semantics. Ports are otherwise matched with
 /// [`PortRange::contains`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SshGrant {
     /// Host pattern this grant covers.
     pub host: HostPattern,
     /// Port ranges this grant covers (empty means any port).
+    #[serde(default)]
     pub ports: Vec<PortRange>,
 }
 
@@ -83,16 +84,24 @@ pub struct SshGrant {
 /// non-granted destination is denied even if generic TCP egress would
 /// allow it. When `false`, non-granted SSH flows follow the generic
 /// egress verdict.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Carried as `NetworkConfig.ssh`; the wire twin
+/// (`microsandbox_types::SshConfig`) shares this JSON shape so
+/// `NetworkSpec` round-trips through the generic serde conversion.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SshPolicy {
     /// When `true`, SSH to non-granted destinations is denied even if
     /// generic TCP egress allows it.
+    #[serde(default)]
     pub strict: bool,
     /// SSH allowances consulted for divert and strict-deny.
+    #[serde(default)]
     pub grants: Vec<SshGrant>,
     /// Deny strength for SSH violations. `Passthrough` is coerced to
     /// `Block` (fail closed) since placeholder forwarding is meaningless
     /// for SSH routing.
+    #[serde(default)]
     pub on_violation: ViolationAction,
 }
 
@@ -214,6 +223,11 @@ impl SshPolicy {
             action => action.clone(),
         }
     }
+
+    /// Returns `true` when the policy carries no grants and non-strict mode.
+    pub fn is_empty(&self) -> bool {
+        !self.strict && self.grants.is_empty()
+    }
 }
 
 impl BrokerEndpoint {
@@ -275,6 +289,22 @@ impl SshDecision {
     /// Returns `true` for [`SshDecision::Deny`].
     pub fn is_deny(&self) -> bool {
         matches!(self, SshDecision::Deny { .. })
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl Default for SshPolicy {
+    /// Default policy: non-strict with no grants, denying with
+    /// [`ViolationAction::default`].
+    fn default() -> Self {
+        Self {
+            strict: false,
+            grants: Vec::new(),
+            on_violation: ViolationAction::default(),
+        }
     }
 }
 
