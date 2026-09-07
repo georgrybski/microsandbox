@@ -74,6 +74,33 @@ pub struct GuestBootstrap {
     /// Optional PID 1 handoff after agentd finishes guest initialization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_init: Option<BootstrapHandoffInit>,
+
+    /// Sealed SSH key material for the broker VM.
+    ///
+    /// Only the broker VM consumes this field; agentd ignores it.
+    /// Additive and optional: a host that predates this field omits it and
+    /// the guest decodes the absence as `None`, which brokerd refuses with
+    /// a typed custody error instead of starting unauthenticated.
+    ///
+    /// Key material travels in this typed frame rather than the process
+    /// environment because environment entries stay readable through
+    /// `/proc/<pid>/environ`. The bootstrap console channel itself is
+    /// host-asserted and unmeasured: it carries no attestation that the
+    /// bytes came from the intended launcher, so a compromised host could
+    /// substitute material. brokerd's custody boundary therefore starts at
+    /// receipt — it authenticates upstream with whatever arrived here and
+    /// never treats arrival as proof of provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker_key: Option<BrokerSshKey>,
+
+    /// Pinned upstream SSH servers projected from the grant host list.
+    ///
+    /// Only the broker VM consumes this field; agentd ignores it.
+    /// Additive and optional with the same version-skew behavior as
+    /// `broker_key`: absence fails diverted sessions closed, with no
+    /// fallback to unverified upstream connections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker_upstream: Option<BrokerUpstream>,
 }
 
 /// Block-backed root filesystem configuration.
@@ -305,6 +332,59 @@ pub struct BootstrapHandoffInit {
     pub env: Vec<BootstrapEnvVar>,
 }
 
+/// Expected key-type tag for broker SSH key material.
+pub const BROKER_KEY_TYPE_ED25519: &str = "ed25519";
+
+/// Sealed SSH key material delivered to the broker VM inside the typed bootstrap.
+///
+/// Carries decrypted private key bytes (resolved host-side; brokerd receives
+/// material, never resolution configuration). brokerd moves these bytes into
+/// zeroized in-memory key state exactly once and never re-serializes them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrokerSshKey {
+    /// Key-type tag. brokerd accepts exactly [`BROKER_KEY_TYPE_ED25519`]
+    /// and fails closed with a wrong-type custody error for anything else.
+    pub key_type: String,
+
+    /// Decrypted private key bytes. For `"ed25519"` this is the 32-byte
+    /// private seed, which brokerd expands into a keypair in zeroized
+    /// memory.
+    #[serde(with = "serde_bytes")]
+    pub key_bytes: Vec<u8>,
+}
+
+/// Upstream SSH servers the broker VM may reoriginate toward.
+///
+/// Projected host-side from the grant host list: each entry pins one
+/// server the broker is allowed to dial, the login user to present, and
+/// the server public key to require. brokerd authenticates upstream with
+/// the [`BrokerSshKey`] and requires an exact pin match; there is no
+/// fallback to unverified connections.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrokerUpstream {
+    /// Pinned upstream servers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<BrokerUpstreamHost>,
+}
+
+/// One pinned upstream SSH server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrokerUpstreamHost {
+    /// Hostname as the guest addressed it (matched against the divert
+    /// prelude destination).
+    pub host: String,
+
+    /// Upstream SSH port.
+    pub port: u16,
+
+    /// Login user for upstream public-key authentication.
+    pub user: String,
+
+    /// Expected server public key as an `authorized_keys` line
+    /// (`"<algorithm> <base64> [comment]"`).
+    pub public_key: String,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
@@ -405,6 +485,18 @@ mod tests {
                     value: "{\"enabled\":true}".to_string(),
                 }],
             }),
+            broker_key: Some(BrokerSshKey {
+                key_type: BROKER_KEY_TYPE_ED25519.to_string(),
+                key_bytes: vec![0x42; 32],
+            }),
+            broker_upstream: Some(BrokerUpstream {
+                hosts: vec![BrokerUpstreamHost {
+                    host: "example.com".to_string(),
+                    port: 22,
+                    user: "deploy".to_string(),
+                    public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBrokerTestPin".to_string(),
+                }],
+            }),
         };
 
         let message = Message::with_payload(MessageType::Bootstrap, 0, &bootstrap).unwrap();
@@ -413,5 +505,41 @@ mod tests {
         codec::encode_to_buf(&message, &mut frame).unwrap();
         let decoded = codec::decode_message_frame(&frame).unwrap();
         assert_eq!(decoded.payload::<GuestBootstrap>().unwrap(), bootstrap);
+    }
+
+    #[test]
+    fn guest_bootstrap_without_broker_fields_decodes_to_none() {
+        // A host that predates the broker fields omits them; the new guest
+        // must decode the absence as `None` so brokerd can refuse custody
+        // cleanly instead of misreading the frame.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct OldBootstrap {
+            #[serde(default)]
+            hostname: Option<String>,
+        }
+
+        let old = OldBootstrap {
+            hostname: Some("legacy-host".to_string()),
+        };
+        let mut payload = Vec::new();
+        ciborium::into_writer(&old, &mut payload).unwrap();
+        let bootstrap: GuestBootstrap = ciborium::from_reader(&payload[..]).unwrap();
+        assert_eq!(bootstrap.hostname.as_deref(), Some("legacy-host"));
+        assert_eq!(bootstrap.broker_key, None);
+        assert_eq!(bootstrap.broker_upstream, None);
+
+        // The reverse direction holds too: unknown trailing fields from a
+        // newer sender are ignored by an older shape.
+        let full = GuestBootstrap {
+            broker_key: Some(BrokerSshKey {
+                key_type: BROKER_KEY_TYPE_ED25519.to_string(),
+                key_bytes: vec![0x42; 32],
+            }),
+            ..GuestBootstrap::default()
+        };
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&full, &mut encoded).unwrap();
+        let as_old: OldBootstrap = ciborium::from_reader(&encoded[..]).unwrap();
+        assert_eq!(as_old.hostname, None);
     }
 }

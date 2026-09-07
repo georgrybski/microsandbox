@@ -3916,6 +3916,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "microsandbox-brokerd"
+version = "0.6.16"
+dependencies = [
+ "ciborium",
+ "libc",
+ "microsandbox-protocol",
+ "nix 0.31.3",
+ "russh",
+ "serde",
+ "serde_bytes",
+ "thiserror 2.0.20",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "microsandbox-cli"
 version = "0.6.16"
 dependencies = [

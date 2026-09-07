@@ -134,6 +134,25 @@ pub struct SandboxConfig {
     #[serde(skip)]
     pub(crate) ssh_broker_endpoint: Option<microsandbox_network::ssh::BrokerEndpoint>,
 
+    /// Sealed SSH key material for the broker VM.
+    ///
+    /// Set via the sandbox builder. Host-side only: never serialized
+    /// into the spec or the database; applied to the typed bootstrap at
+    /// spawn time. Carries decrypted private key bytes for the broker to
+    /// move into sealed custody, never resolution configuration.
+    /// Follows the `insecure`/`ca_certs` local-state pattern.
+    #[serde(skip)]
+    pub(crate) broker_key: Option<microsandbox_protocol::bootstrap::BrokerSshKey>,
+
+    /// Pinned upstream SSH servers for the broker VM.
+    ///
+    /// Set via the sandbox builder. Host-side only: never serialized
+    /// into the spec or the database; applied to the typed bootstrap at
+    /// spawn time. Each entry pins one server the broker may dial, the
+    /// login user, and the expected server public key.
+    #[serde(skip)]
+    pub(crate) broker_upstream: Option<microsandbox_protocol::bootstrap::BrokerUpstream>,
+
     /// Replace an existing sandbox with the same name during create.
     ///
     /// If the existing sandbox is still active, microsandbox stops it and
@@ -653,6 +672,8 @@ impl Default for SandboxConfig {
             ca_certs: Vec::new(),
             #[cfg(feature = "net")]
             ssh_broker_endpoint: None,
+            broker_key: None,
+            broker_upstream: None,
             replace_existing: false,
             replace_with_timeout: DEFAULT_REPLACE_TIMEOUT,
             slug: None,
