@@ -2523,6 +2523,8 @@ fn sandbox_cli_args(
                     })
                     .collect(),
             }),
+            broker_key: config.broker_key.clone(),
+            broker_upstream: config.broker_upstream.clone(),
             ..GuestBootstrap::default()
         },
         ..Default::default()
@@ -3371,6 +3373,60 @@ mod tests {
                 .ssh_broker()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn sandbox_cli_args_threads_broker_bootstrap_fields() {
+        use microsandbox_protocol::bootstrap::{
+            BROKER_KEY_TYPE_ED25519, BrokerSshKey, BrokerUpstream, BrokerUpstreamHost,
+        };
+
+        let config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .broker_key(BrokerSshKey {
+                key_type: BROKER_KEY_TYPE_ED25519.to_string(),
+                key_bytes: vec![0x42; 32],
+            })
+            .broker_upstream(BrokerUpstream {
+                hosts: vec![BrokerUpstreamHost {
+                    host: "example.com".to_string(),
+                    port: 22,
+                    user: "deploy".to_string(),
+                    public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBrokerTestPin".to_string(),
+                }],
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let launch = render_launch(&config);
+        let key = launch
+            .bootstrap
+            .broker_key
+            .as_ref()
+            .expect("broker key threaded");
+        assert_eq!(key.key_type, BROKER_KEY_TYPE_ED25519);
+        assert_eq!(key.key_bytes, vec![0x42; 32]);
+        let upstream = launch
+            .bootstrap
+            .broker_upstream
+            .as_ref()
+            .expect("broker upstream threaded");
+        assert_eq!(upstream.hosts.len(), 1);
+        assert_eq!(upstream.hosts[0].host, "example.com");
+    }
+
+    #[tokio::test]
+    async fn sandbox_cli_args_omits_broker_bootstrap_fields_by_default() {
+        let config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .build()
+            .await
+            .unwrap();
+
+        let launch = render_launch(&config);
+        assert!(launch.bootstrap.broker_key.is_none());
+        assert!(launch.bootstrap.broker_upstream.is_none());
     }
 
     #[tokio::test]

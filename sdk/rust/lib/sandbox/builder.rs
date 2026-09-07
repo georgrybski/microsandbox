@@ -772,6 +772,29 @@ impl SandboxBuilder {
         self
     }
 
+    /// Set sealed SSH key material for the broker VM.
+    ///
+    /// Host-side only: the key never enters the guest-visible spec.
+    /// Spawn threads it into the typed bootstrap, where the broker moves
+    /// it into sealed custody. Absence fails broker custody closed.
+    pub fn broker_key(mut self, key: microsandbox_protocol::bootstrap::BrokerSshKey) -> Self {
+        self.config.broker_key = Some(key);
+        self
+    }
+
+    /// Set pinned upstream SSH servers for the broker VM.
+    ///
+    /// Host-side only: the pins never enter the guest-visible spec.
+    /// Spawn threads them into the typed bootstrap, where the broker
+    /// requires an exact pin match before reoriginating upstream.
+    pub fn broker_upstream(
+        mut self,
+        upstream: microsandbox_protocol::bootstrap::BrokerUpstream,
+    ) -> Self {
+        self.config.broker_upstream = Some(upstream);
+        self
+    }
+
     /// Prepend explicit rules while preserving a configured policy's defaults and existing rules.
     #[cfg(feature = "net")]
     #[doc(hidden)]
@@ -2701,6 +2724,58 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("must be absolute"));
+    }
+
+    #[tokio::test]
+    async fn test_builder_broker_fields_default_to_none() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .build()
+            .await
+            .unwrap();
+
+        assert!(config.broker_key.is_none());
+        assert!(config.broker_upstream.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_builder_sets_broker_fields_off_spec() {
+        use microsandbox_protocol::bootstrap::{
+            BROKER_KEY_TYPE_ED25519, BrokerSshKey, BrokerUpstream, BrokerUpstreamHost,
+        };
+
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .broker_key(BrokerSshKey {
+                key_type: BROKER_KEY_TYPE_ED25519.to_string(),
+                key_bytes: vec![0x42; 32],
+            })
+            .broker_upstream(BrokerUpstream {
+                hosts: vec![BrokerUpstreamHost {
+                    host: "example.com".to_string(),
+                    port: 22,
+                    user: "deploy".to_string(),
+                    public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBrokerTestPin".to_string(),
+                }],
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let key = config.broker_key.as_ref().expect("broker key retained");
+        assert_eq!(key.key_type, BROKER_KEY_TYPE_ED25519);
+        assert_eq!(key.key_bytes, vec![0x42; 32]);
+        let upstream = config
+            .broker_upstream
+            .as_ref()
+            .expect("broker upstream retained");
+        assert_eq!(upstream.hosts.len(), 1);
+        assert_eq!(upstream.hosts[0].host, "example.com");
+        let spec_json = serde_json::to_value(&config.spec).unwrap().to_string();
+        assert!(
+            !spec_json.contains("example.com"),
+            "guest-visible spec must not carry broker pins"
+        );
     }
 
     #[cfg(feature = "net")]
