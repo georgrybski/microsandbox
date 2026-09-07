@@ -309,6 +309,7 @@ impl BootParams {
             // them so a shared bootstrap frame stays decodable here.
             broker_key: _,
             broker_upstream: _,
+            broker_patterns: _,
         } = bootstrap;
 
         let security_profile = match security_profile {
