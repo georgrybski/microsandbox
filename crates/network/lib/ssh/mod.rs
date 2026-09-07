@@ -13,4 +13,7 @@ pub mod policy;
 //--------------------------------------------------------------------------------------------------
 
 pub use classifier::{SshClassification, SshClassifier, classify_ssh_bytes};
-pub use policy::{BrokerEndpoint, SshDecision, SshFlow, SshGrant, SshPolicy, decide_ssh_egress};
+pub use policy::{
+    BrokerEndpoint, BrokerEndpointError, SshDecision, SshFlow, SshGrant, SshPolicy,
+    decide_ssh_egress,
+};

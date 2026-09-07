@@ -19,8 +19,8 @@
 //! 1. `NetworkPolicy::evaluate_egress` (or `evaluate_egress_with_source`)
 //!    for the generic TCP `Allow`/`Deny`.
 //! 2. The streaming [`SshClassifier`](super::classifier::SshClassifier)
-//!    over the plaintext pre-key-exchange bytes (guest first flight or
-//!    server banner).
+//!    over the plaintext pre-key-exchange bytes (guest first flight and
+//!    server banner, each fed to its own classifier in arrival order).
 //! 3. [`decide_ssh_egress`] with the flow host/port, the classification,
 //!    the egress [`Action`], the [`SshPolicy`], and the optional
 //!    [`BrokerEndpoint`].
@@ -30,13 +30,14 @@
 //!
 //! ## Wiring point
 //!
-//! No `CredentialsPlan` or broker handoff exists in this tree (no
-//! workestrate crate). The workestrate control plane is expected to
-//! compile `[policy.ssh]` plus grants into the runtime [`SshPolicy`]
-//! view defined here, and to supply the [`BrokerEndpoint`] for the
-//! unix-socket shim when divert is configured. Until that wiring lands,
-//! callers construct [`SshPolicy`] directly and pass `None` for the
-//! broker to get direct-or-deny behavior.
+//! The control plane compiles SSH grants into the runtime [`SshPolicy`]
+//! view defined here and supplies the [`BrokerEndpoint`] for the
+//! unix-socket shim when divert is configured. Callers construct
+//! [`SshPolicy`] directly and pass `None` for the broker when no divert
+//! path exists; granted SSH then denies fail-closed rather than falling
+//! back to direct.
+
+use std::path::{Path, PathBuf};
 
 use crate::policy::{Action, PortRange};
 use crate::secrets::config::{HostPattern, ViolationAction};
@@ -95,17 +96,32 @@ pub struct SshPolicy {
     pub on_violation: ViolationAction,
 }
 
-/// Abstract divert target for the credentials broker.
+/// Divert target for the credentials broker: a validated host-side unix-socket path.
 ///
-/// Opaque for this task: the later shim integration (unix-socket dial,
-/// transport CID stamping, epoch prelude) interprets `address`. The
-/// decision function only needs to know whether a broker path is
-/// configured (`Some`) or not (`None`).
+/// Host-side only: the socket path names a host IPC endpoint and must never
+/// appear in guest-visible configuration. Validation accepts
+/// `unix:///absolute/path` or a bare absolute path (`/absolute/path`) and
+/// rejects empty, relative, and non-`unix` schemes fail-closed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrokerEndpoint {
-    /// Broker address in a future-shim-defined form (for example a
-    /// unix-socket path). Treated opaquely here.
-    pub address: String,
+    /// Validated absolute unix-socket path.
+    path: PathBuf,
+}
+
+/// Reason a broker address failed validation.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BrokerEndpointError {
+    /// The address is empty or carries no path.
+    #[error("broker endpoint must not be empty")]
+    Empty,
+    /// The path is not absolute; the broker socket must live at an absolute
+    /// host path so a guest-relative value cannot redirect the dial.
+    #[error("broker endpoint path must be absolute: `{0}`")]
+    NotAbsolute(String),
+    /// The scheme is not `unix`; only host unix sockets are valid divert
+    /// targets.
+    #[error("broker endpoint scheme must be unix: `{0}`")]
+    NonUnixScheme(String),
 }
 
 /// Final routing verdict for an egress flow.
@@ -201,11 +217,47 @@ impl SshPolicy {
 }
 
 impl BrokerEndpoint {
-    /// Create an opaque broker endpoint.
-    pub fn new(address: impl Into<String>) -> Self {
-        Self {
-            address: address.into(),
+    /// Validate a broker address into a host-side unix-socket path.
+    ///
+    /// Accepts `unix:///absolute/path` or a bare absolute path such as
+    /// `/run/msb/ssh-broker.sock`. Rejects empty values, relative paths,
+    /// and non-`unix` schemes fail-closed: callers must treat `Err` as
+    /// divert-unavailable and deny divert-intended flows rather than
+    /// falling back to direct.
+    pub fn new(address: impl AsRef<str>) -> Result<Self, BrokerEndpointError> {
+        let raw = address.as_ref();
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(BrokerEndpointError::Empty);
         }
+        if let Some(rest) = trimmed.strip_prefix("unix://") {
+            if rest.is_empty() {
+                return Err(BrokerEndpointError::Empty);
+            }
+            if !rest.starts_with('/') {
+                return Err(BrokerEndpointError::NotAbsolute(trimmed.to_string()));
+            }
+            return Ok(Self {
+                path: PathBuf::from(rest),
+            });
+        }
+        if trimmed.contains("://") {
+            return Err(BrokerEndpointError::NonUnixScheme(trimmed.to_string()));
+        }
+        if trimmed.starts_with("unix:") {
+            return Err(BrokerEndpointError::NonUnixScheme(trimmed.to_string()));
+        }
+        if !trimmed.starts_with('/') {
+            return Err(BrokerEndpointError::NotAbsolute(trimmed.to_string()));
+        }
+        Ok(Self {
+            path: PathBuf::from(trimmed),
+        })
+    }
+
+    /// Validated absolute unix-socket path for dialing the broker.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -236,7 +288,8 @@ impl SshDecision {
 /// with `NetworkPolicy::evaluate_egress` (default-deny included), so
 /// unclassified flows and non-strict SSH flows fall through to it
 /// unchanged. `broker` is `Some` when the divert path is configured and
-/// `None` otherwise.
+/// `None` otherwise; a broker dial failure is enforced as `Deny` by the
+/// proxy path, never by silently falling back to `Direct`.
 ///
 /// Precedence:
 ///
@@ -244,9 +297,10 @@ impl SshDecision {
 ///   banner at timeout): follow `egress` (`Allow` becomes `Direct`,
 ///   `Deny` becomes `Deny`).
 /// - Classified SSH to a granted destination: `Divert` when the broker
-///   is configured and `egress` allows; `Direct` when granted but no
-///   broker is configured (documented sensible default, still gated on
-///   `egress`); `Deny` when `egress` denies (fail closed).
+///   is configured and `egress` allows; `Deny` when `egress` denies or
+///   when no broker is configured (fail closed: a granted flow without a
+///   divert path never falls back to direct, since that would bypass
+///   broker authentication silently).
 /// - Classified SSH to a non-granted destination with `strict`: `Deny`
 ///   even if `egress` allows (protocol-specific restriction overrides
 ///   the generic transport allowance, including nonstandard ports whose
@@ -275,11 +329,16 @@ pub fn decide_ssh_egress(
             Action::Deny => SshDecision::Deny {
                 action: ssh_policy.deny_action(),
             },
+            // Divert-intended without a broker path denies fail-closed;
+            // falling back to direct would silently bypass broker
+            // authentication, so it is never allowed.
             Action::Allow => match broker {
                 Some(endpoint) => SshDecision::Divert {
                     endpoint: endpoint.clone(),
                 },
-                None => SshDecision::Direct,
+                None => SshDecision::Deny {
+                    action: ssh_policy.deny_action(),
+                },
             },
         }
     } else if ssh_policy.strict {
@@ -313,7 +372,7 @@ mod tests {
     }
 
     fn broker() -> BrokerEndpoint {
-        BrokerEndpoint::new("unix:///run/msb/ssh-broker.sock")
+        BrokerEndpoint::new("unix:///run/msb/ssh-broker.sock").expect("test broker must validate")
     }
 
     #[test]
@@ -330,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn granted_host_without_broker_goes_direct() {
+    fn granted_host_without_broker_denies_fail_closed() {
         let policy = strict_grant("example.com", 22);
         let decision = decide_ssh_egress(
             &flow("example.com", 22),
@@ -339,7 +398,10 @@ mod tests {
             &policy,
             None,
         );
-        assert_eq!(decision, SshDecision::Direct);
+        assert!(
+            decision.is_deny(),
+            "divert-intended without a broker path must deny, never fall back to direct: got {decision:?}"
+        );
     }
 
     #[test]
@@ -486,5 +548,290 @@ mod tests {
         let grant = SshGrant::new(HostPattern::Exact("example.com".to_string()), vec![]);
         assert!(grant.matches(&flow("example.com", 22)));
         assert!(grant.matches(&flow("example.com", 2222)));
+    }
+
+    #[test]
+    fn broker_endpoint_accepts_unix_and_bare_absolute_paths() {
+        let unix = BrokerEndpoint::new("unix:///run/msb/ssh-broker.sock").expect("unix scheme");
+        assert_eq!(
+            unix.path().as_os_str(),
+            std::ffi::OsStr::new("/run/msb/ssh-broker.sock")
+        );
+        let bare = BrokerEndpoint::new("/run/msb/ssh-broker.sock").expect("bare absolute path");
+        assert_eq!(
+            bare.path().as_os_str(),
+            std::ffi::OsStr::new("/run/msb/ssh-broker.sock")
+        );
+        assert_eq!(unix, bare);
+    }
+
+    #[test]
+    fn broker_endpoint_rejects_relative_empty_and_non_unix() {
+        assert_eq!(BrokerEndpoint::new(""), Err(BrokerEndpointError::Empty));
+        assert_eq!(BrokerEndpoint::new("   "), Err(BrokerEndpointError::Empty));
+        assert_eq!(
+            BrokerEndpoint::new("unix://"),
+            Err(BrokerEndpointError::Empty)
+        );
+        assert!(matches!(
+            BrokerEndpoint::new("run/msb/broker.sock"),
+            Err(BrokerEndpointError::NotAbsolute(_))
+        ));
+        assert!(matches!(
+            BrokerEndpoint::new("unix://run/msb/broker.sock"),
+            Err(BrokerEndpointError::NotAbsolute(_))
+        ));
+        assert!(matches!(
+            BrokerEndpoint::new("tcp://127.0.0.1:22"),
+            Err(BrokerEndpointError::NonUnixScheme(_))
+        ));
+        assert!(matches!(
+            BrokerEndpoint::new("http://example.com/broker"),
+            Err(BrokerEndpointError::NonUnixScheme(_))
+        ));
+        assert!(matches!(
+            BrokerEndpoint::new("unix:/run/msb/broker.sock"),
+            Err(BrokerEndpointError::NonUnixScheme(_))
+        ));
+    }
+
+    /// Fail-closed matrix over classification × strict × grants × egress ×
+    /// broker presence. Divert-intended without a broker path denies
+    /// (never direct); unclassified flows follow the generic egress
+    /// verdict unchanged.
+    #[test]
+    fn fail_closed_matrix_covers_classification_strict_grants_egress_broker() {
+        struct Case {
+            name: &'static str,
+            classification: SshClassification,
+            strict: bool,
+            grants: bool,
+            egress: Action,
+            broker: bool,
+            expect_divert: bool,
+            expect_direct: bool,
+        }
+
+        let granted = vec![SshGrant::exact("example.com", 22)];
+        let cases = [
+            // Divert-intended: granted SSH with egress allow diverts only
+            // when the broker path is present; absent denies fail-closed.
+            Case {
+                name: "ssh granted strict allow broker diverts",
+                classification: SshClassification::Ssh,
+                strict: true,
+                grants: true,
+                egress: Action::Allow,
+                broker: true,
+                expect_divert: true,
+                expect_direct: false,
+            },
+            Case {
+                name: "ssh granted strict allow absent denies",
+                classification: SshClassification::Ssh,
+                strict: true,
+                grants: true,
+                egress: Action::Allow,
+                broker: false,
+                expect_divert: false,
+                expect_direct: false,
+            },
+            Case {
+                name: "ssh granted non-strict allow broker diverts",
+                classification: SshClassification::Ssh,
+                strict: false,
+                grants: true,
+                egress: Action::Allow,
+                broker: true,
+                expect_divert: true,
+                expect_direct: false,
+            },
+            Case {
+                name: "ssh granted non-strict allow absent denies",
+                classification: SshClassification::Ssh,
+                strict: false,
+                grants: true,
+                egress: Action::Allow,
+                broker: false,
+                expect_divert: false,
+                expect_direct: false,
+            },
+            // Granted SSH with egress deny always denies.
+            Case {
+                name: "ssh granted strict deny broker denies",
+                classification: SshClassification::Ssh,
+                strict: true,
+                grants: true,
+                egress: Action::Deny,
+                broker: true,
+                expect_divert: false,
+                expect_direct: false,
+            },
+            Case {
+                name: "ssh granted strict deny absent denies",
+                classification: SshClassification::Ssh,
+                strict: true,
+                grants: true,
+                egress: Action::Deny,
+                broker: false,
+                expect_divert: false,
+                expect_direct: false,
+            },
+            // Non-granted SSH with strict denies even when egress allows.
+            Case {
+                name: "ssh non-granted strict allow broker denies",
+                classification: SshClassification::Ssh,
+                strict: true,
+                grants: false,
+                egress: Action::Allow,
+                broker: true,
+                expect_divert: false,
+                expect_direct: false,
+            },
+            Case {
+                name: "ssh non-granted strict allow absent denies",
+                classification: SshClassification::Ssh,
+                strict: true,
+                grants: false,
+                egress: Action::Allow,
+                broker: false,
+                expect_divert: false,
+                expect_direct: false,
+            },
+            // Non-granted SSH without strict follows egress.
+            Case {
+                name: "ssh non-granted non-strict allow follows direct",
+                classification: SshClassification::Ssh,
+                strict: false,
+                grants: false,
+                egress: Action::Allow,
+                broker: true,
+                expect_divert: false,
+                expect_direct: true,
+            },
+            Case {
+                name: "ssh non-granted non-strict deny denies",
+                classification: SshClassification::Ssh,
+                strict: false,
+                grants: false,
+                egress: Action::Deny,
+                broker: true,
+                expect_divert: false,
+                expect_direct: false,
+            },
+            // Empty grants with strict behave as non-granted strict.
+            Case {
+                name: "ssh empty strict allow denies",
+                classification: SshClassification::Ssh,
+                strict: true,
+                grants: false,
+                egress: Action::Allow,
+                broker: true,
+                expect_divert: false,
+                expect_direct: false,
+            },
+            // Unclassified flows follow egress unchanged regardless of
+            // strict, grants, or broker presence.
+            Case {
+                name: "not-ssh strict allow follows direct",
+                classification: SshClassification::NotSsh,
+                strict: true,
+                grants: true,
+                egress: Action::Allow,
+                broker: true,
+                expect_divert: false,
+                expect_direct: true,
+            },
+            Case {
+                name: "not-ssh strict deny denies",
+                classification: SshClassification::NotSsh,
+                strict: true,
+                grants: true,
+                egress: Action::Deny,
+                broker: true,
+                expect_divert: false,
+                expect_direct: false,
+            },
+            Case {
+                name: "need-more-data strict allow follows direct",
+                classification: SshClassification::NeedMoreData,
+                strict: true,
+                grants: true,
+                egress: Action::Allow,
+                broker: false,
+                expect_divert: false,
+                expect_direct: true,
+            },
+            Case {
+                name: "need-more-data strict deny denies",
+                classification: SshClassification::NeedMoreData,
+                strict: true,
+                grants: true,
+                egress: Action::Deny,
+                broker: false,
+                expect_divert: false,
+                expect_direct: false,
+            },
+            Case {
+                name: "need-more-data non-strict empty allow follows direct",
+                classification: SshClassification::NeedMoreData,
+                strict: false,
+                grants: false,
+                egress: Action::Allow,
+                broker: false,
+                expect_divert: false,
+                expect_direct: true,
+            },
+        ];
+
+        for case in cases {
+            let policy = SshPolicy::new(
+                case.strict,
+                if case.grants {
+                    granted.clone()
+                } else {
+                    Vec::new()
+                },
+            );
+            let broker_endpoint = broker();
+            let decision = decide_ssh_egress(
+                &flow("example.com", 22),
+                case.classification,
+                case.egress,
+                &policy,
+                case.broker.then_some(&broker_endpoint),
+            );
+            match (case.expect_divert, case.expect_direct) {
+                (true, _) => assert!(
+                    decision.is_divert(),
+                    "{}: expected divert, got {decision:?}",
+                    case.name
+                ),
+                (_, true) => assert_eq!(
+                    decision,
+                    SshDecision::Direct,
+                    "{}: expected direct (egress fallthrough)",
+                    case.name
+                ),
+                _ => assert!(
+                    decision.is_deny(),
+                    "{}: expected deny, got {decision:?}",
+                    case.name
+                ),
+            }
+            // Divert-intended without a broker must never silently fall
+            // back to direct.
+            if case.classification.is_ssh()
+                && case.grants
+                && case.egress == Action::Allow
+                && !case.broker
+            {
+                assert!(
+                    !decision.is_direct(),
+                    "{}: absent broker must not fall back to direct",
+                    case.name
+                );
+            }
+        }
     }
 }

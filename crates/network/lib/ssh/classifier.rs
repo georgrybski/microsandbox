@@ -36,8 +36,10 @@ pub const MAX_SSH_CLASSIFIER_BYTES: usize = 1024;
 /// Maximum complete non-banner lines tolerated before deciding
 /// [`SshClassification::NotSsh`].
 ///
-/// Allows servers that emit comment lines before the banner while still
-/// bounding how long plain HTTP and other text protocols stay in
+/// Counts only lines that are not accepted banners: up to eight comment
+/// lines may precede the banner, so a banner on the ninth line still
+/// classifies as SSH. The ninth non-banner line decides `NotSsh`.
+/// This bounds how long plain HTTP and other text protocols stay in
 /// [`SshClassification::NeedMoreData`].
 pub const MAX_SSH_PRELUDE_LINES: usize = 8;
 
@@ -79,6 +81,14 @@ pub enum SshClassification {
 /// [`SshClassification::Ssh`] or [`SshClassification::NotSsh`] is
 /// reached, later feeds return the same value so a mid-stream
 /// `SSH-2.0-` substring cannot flip the verdict.
+///
+/// One instance classifies one direction of one connection: create a fresh
+/// [`SshClassifier`] per direction (guest flight and server banner get
+/// separate instances fed in arrival order) and do not reuse an instance
+/// across connections. [`SshClassifier::reset`] exists only for tests that
+/// recycle an instance; production code constructs a new classifier per
+/// direction per connection so buffered bytes and sticky verdicts never
+/// leak across flows.
 #[derive(Debug, Clone, Default)]
 pub struct SshClassifier {
     buf: Vec<u8>,
@@ -147,6 +157,12 @@ impl SshClassifier {
     }
 
     /// Clear buffered bytes and any sticky verdict for reuse.
+    ///
+    /// Production code prefers a fresh [`SshClassifier`] per direction per
+    /// connection; reuse via `reset` is a test convenience. A reset
+    /// instance must still serve only one direction of one connection at
+    /// a time, since buffered bytes and the sticky verdict are
+    /// direction-specific.
     pub fn reset(&mut self) {
         self.buf.clear();
         self.decided = None;
@@ -181,20 +197,23 @@ fn evaluate_buffer(buf: &[u8]) -> SshClassification {
         return SshClassification::NotSsh;
     }
 
-    let mut complete_lines = 0usize;
+    // Count only non-banner complete lines: the banner itself never counts
+    // toward the prelude budget, so eight comment lines plus a banner on
+    // the ninth line still classifies as SSH.
+    let mut non_banner_lines = 0usize;
     let mut start = 0usize;
     while let Some(rel) = buf[start..].iter().position(|b| *b == b'\n') {
         let line = &buf[start..start + rel];
-        complete_lines += 1;
-        if complete_lines > MAX_SSH_PRELUDE_LINES {
-            return SshClassification::NotSsh;
-        }
         let line = strip_cr(line);
         if line.len() > MAX_SSH_LINE_BYTES {
             return SshClassification::NotSsh;
         }
         if line_is_ssh_banner(line) {
             return SshClassification::Ssh;
+        }
+        non_banner_lines += 1;
+        if non_banner_lines > MAX_SSH_PRELUDE_LINES {
+            return SshClassification::NotSsh;
         }
         if line_starts_with(line, SSH_PREFIX) {
             return SshClassification::NotSsh;
@@ -434,5 +453,48 @@ mod tests {
     fn oversized_buffer_is_not_ssh() {
         let big = vec![b'A'; MAX_SSH_CLASSIFIER_BYTES + 1];
         assert_eq!(classify_ssh_bytes(&big), SshClassification::NotSsh);
+    }
+
+    #[test]
+    fn eight_comment_lines_then_banner_still_classifies_as_ssh() {
+        let mut buf = Vec::new();
+        for i in 0..MAX_SSH_PRELUDE_LINES {
+            buf.extend_from_slice(format!("comment-{i}\r\n").as_bytes());
+        }
+        buf.extend_from_slice(b"SSH-2.0-OpenSSH_9.6\r\n");
+        assert_eq!(
+            classify_ssh_bytes(&buf),
+            SshClassification::Ssh,
+            "eight non-banner lines plus a banner must still classify as SSH"
+        );
+    }
+
+    #[test]
+    fn ninth_non_banner_line_decides_not_ssh() {
+        let mut buf = Vec::new();
+        for i in 0..=MAX_SSH_PRELUDE_LINES {
+            buf.extend_from_slice(format!("comment-{i}\r\n").as_bytes());
+        }
+        buf.extend_from_slice(b"SSH-2.0-OpenSSH_9.6\r\n");
+        assert_eq!(
+            classify_ssh_bytes(&buf),
+            SshClassification::NotSsh,
+            "nine non-banner lines exhaust the prelude budget before the banner"
+        );
+    }
+
+    #[test]
+    fn reset_clears_sticky_verdict_for_test_reuse() {
+        let mut classifier = SshClassifier::new();
+        assert_eq!(
+            classifier.feed(b"GET / HTTP/1.1\r\n"),
+            SshClassification::NotSsh
+        );
+        classifier.reset();
+        assert_eq!(
+            classifier.feed(b"SSH-2.0-OpenSSH_9.6\r\n"),
+            SshClassification::Ssh,
+            "reset must clear the sticky verdict so a recycled test instance behaves fresh"
+        );
     }
 }
