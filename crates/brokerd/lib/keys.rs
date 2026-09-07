@@ -177,6 +177,11 @@ impl BrokerKey {
         &self.provenance
     }
 
+    /// Borrow the parsed keypair for handoff-only use by the upstream SSH client.
+    pub(crate) fn private_key(&self) -> &PrivateKey {
+        &self.key
+    }
+
     /// Public key as an `authorized_keys` line (log-safe diagnostics).
     pub fn public_key_openssh(&self) -> String {
         self.key.public_key().to_openssh().unwrap_or_default()

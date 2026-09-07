@@ -28,6 +28,7 @@ use crate::epoch::{EpochState, apply_provision};
 use crate::error::{BrokerError, BrokerResult};
 use crate::keys::BrokerKey;
 use crate::prelude::read_ssh_divert_prelude;
+use crate::ssh::{build_server_config, parse_upstream_pin, reoriginate};
 use crate::vsock::{VsockListener, VsockStream};
 
 //--------------------------------------------------------------------------------------------------
@@ -51,6 +52,9 @@ pub struct Broker {
 
     /// Console-bound epoch state.
     epoch: Mutex<Option<EpochState>>,
+
+    /// Guest-facing SSH server configuration (ephemeral host key).
+    server_config: Arc<russh::server::Config>,
 }
 
 /// Outcome of handling one console frame.
@@ -69,11 +73,15 @@ enum ConsoleOutcome {
 
 impl Broker {
     /// Build the broker runtime from its configuration and sealed key.
+    ///
+    /// Mints the ephemeral guest-facing SSH host key.
     pub fn new(config: BrokerConfig, key: BrokerKey) -> BrokerResult<Arc<Self>> {
+        let server_config = build_server_config()?;
         Ok(Arc::new(Self {
             config,
             custody: Arc::new(key),
             epoch: Mutex::new(None),
+            server_config,
         }))
     }
 
@@ -158,11 +166,10 @@ impl Broker {
         }
     }
 
-    /// Serve one accepted divert stream through validation to egress.
+    /// Serve one accepted divert stream through validation to reorigination.
     ///
     /// Every refusal is fail-closed with a log line: the stream is dropped
-    /// without relaying a byte. A validated session opens its egress tunnel
-    /// and then closes: SSH termination and reorigination attach here.
+    /// without relaying a byte.
     async fn serve_connection(&self, mut stream: VsockStream) {
         let prelude = match timeout(
             Duration::from_secs(PRELUDE_READ_TIMEOUT_SECS),
@@ -196,24 +203,49 @@ impl Broker {
             );
             return;
         };
-        let (host, port) = (entry.host.clone(), entry.port);
-        let mut egress = match VsockStream::connect(self.config.egress_port).await {
-            Ok(egress) => egress,
+        let pin = match parse_upstream_pin(entry) {
+            Ok(pin) => pin,
             Err(e) => {
-                eprintln!("brokerd: egress dial for {host}:{port} failed: {e}");
+                eprintln!("brokerd: divert to {} refused: {e}", prelude.dest_host);
                 return;
             }
         };
-        if let Err(e) = open_egress_tunnel(&mut egress, &host, port).await {
-            eprintln!("brokerd: egress tunnel for {host}:{port} failed: {e}");
+        let mut egress = match VsockStream::connect(self.config.egress_port).await {
+            Ok(egress) => egress,
+            Err(e) => {
+                eprintln!(
+                    "brokerd: egress dial for {}:{} failed: {e}",
+                    prelude.dest_host, prelude.dest_port
+                );
+                return;
+            }
+        };
+        if let Err(e) = open_egress_tunnel(&mut egress, &prelude.dest_host, prelude.dest_port).await
+        {
+            eprintln!(
+                "brokerd: egress tunnel for {}:{} failed: {e}",
+                prelude.dest_host, prelude.dest_port
+            );
             return;
         }
         eprintln!(
-            "brokerd: validated divert to {host}:{port} (cid {}, custody {}); \
-             egress tunnel open, closing without relay",
-            prelude.transport_cid,
-            self.custody.provenance()
+            "brokerd: reoriginating divert to {}:{} (cid {})",
+            prelude.dest_host, prelude.dest_port, prelude.transport_cid
         );
+        if let Err(e) = reoriginate(
+            stream,
+            egress,
+            &self.custody,
+            &pin,
+            Arc::clone(&self.server_config),
+        )
+        .await
+        {
+            eprintln!(
+                "brokerd: reorigination for {}:{} ended: {e}",
+                prelude.dest_host, prelude.dest_port
+            );
+        }
     }
 }
 

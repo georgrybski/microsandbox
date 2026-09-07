@@ -28,6 +28,7 @@ pub mod error;
 pub mod init;
 pub mod keys;
 pub mod prelude;
+pub mod ssh;
 pub mod vsock;
 
 pub use broker::Broker;
