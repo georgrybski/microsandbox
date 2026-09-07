@@ -232,12 +232,15 @@ impl Broker {
             "brokerd: reoriginating divert to {}:{} (cid {})",
             prelude.dest_host, prelude.dest_port, prelude.transport_cid
         );
+        let identity = prelude.session_identity();
         if let Err(e) = reoriginate(
             stream,
             egress,
             &self.custody,
             &pin,
             Arc::clone(&self.server_config),
+            identity,
+            Arc::clone(&self.config.patterns),
         )
         .await
         {

@@ -3012,6 +3012,7 @@ fn parse_chunk_size(line: &[u8]) -> Result<usize, ViolationAction> {
 
 /// Returns the stricter of two blocking actions, where
 /// `BlockAndTerminate` > `BlockAndLog` > `Block`.
+// Parity seam: the SSH broker mirrors this reduction with an audit/count-only response leg, while HTTP substitution keeps its framing rewrites in P0.
 fn strictest_violation_report(
     current: Option<SecretViolationReport>,
     candidate: SecretViolationReport,

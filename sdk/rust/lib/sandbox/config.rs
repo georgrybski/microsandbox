@@ -153,6 +153,15 @@ pub struct SandboxConfig {
     #[serde(skip)]
     pub(crate) broker_upstream: Option<microsandbox_protocol::bootstrap::BrokerUpstream>,
 
+    /// DLP patterns enforced on the broker VM's relayed SSH sessions.
+    ///
+    /// Set via the sandbox builder. Host-side only: never serialized
+    /// into the spec or the database; applied to the typed bootstrap at
+    /// spawn time. Each entry names one credential, carries its match
+    /// bytes, and states the coalesced action contributed on a hit.
+    #[serde(skip)]
+    pub(crate) broker_patterns: Option<microsandbox_protocol::bootstrap::BrokerPatterns>,
+
     /// Replace an existing sandbox with the same name during create.
     ///
     /// If the existing sandbox is still active, microsandbox stops it and
@@ -674,6 +683,7 @@ impl Default for SandboxConfig {
             ssh_broker_endpoint: None,
             broker_key: None,
             broker_upstream: None,
+            broker_patterns: None,
             replace_existing: false,
             replace_with_timeout: DEFAULT_REPLACE_TIMEOUT,
             slug: None,

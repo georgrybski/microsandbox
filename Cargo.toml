@@ -17,6 +17,7 @@ members = [
     "crates/migration",
     "crates/protocol",
     "crates/runtime",
+    "crates/scan",
     "crates/testing/init",
     "crates/testing/macros",
     "crates/testing/utils",
@@ -90,6 +91,7 @@ microsandbox-migration = { version = "=0.6.16", path = "crates/migration" }
 microsandbox-network = { version = "=0.6.16", path = "crates/network" }
 microsandbox-protocol = { version = "=0.6.16", path = "crates/protocol" }
 microsandbox-runtime = { version = "=0.6.16", path = "crates/runtime", default-features = false }
+microsandbox-scan = { version = "=0.6.16", path = "crates/scan" }
 microsandbox-utils = { version = "=0.6.16", path = "crates/utils" }
 microsandbox-vsock = { version = "=0.6.16", path = "crates/vsock" }
 msb_krun = { git = "https://github.com/rybskiworks/libkrun", rev = "dc9f5f16a2384ab4c84d50c01f9613f9e1879705" }

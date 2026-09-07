@@ -326,6 +326,7 @@ impl TcpProxy {
                 // after the 5 s peek budget falls through to the generic
                 // egress verdict rather than stalling the connection. This
                 // is the one deliberate fail-open hole.
+                shared.record_evasion_audit();
                 tracing::info!(
                     dst = %guest_dst,
                     guest_bytes = initial_buf.len(),

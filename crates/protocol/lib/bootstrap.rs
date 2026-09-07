@@ -4,6 +4,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use serde::{Deserialize, Serialize};
 
+use microsandbox_scan::{ActionSet, Decoder};
+
 use crate::exec::ExecRlimit;
 
 //--------------------------------------------------------------------------------------------------
@@ -101,6 +103,17 @@ pub struct GuestBootstrap {
     /// fallback to unverified upstream connections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub broker_upstream: Option<BrokerUpstream>,
+
+    /// DLP patterns enforced on relayed SSH sessions.
+    ///
+    /// Only the broker VM consumes this field; agentd ignores it.
+    /// Additive and optional with the same version-skew behavior as
+    /// `broker_key`: absence means no DLP scanning and relayed sessions
+    /// pass through unchanged. brokerd moves the pattern bytes into
+    /// sealed custody at ingest and emits only pattern ids and digests
+    /// in audit records — pattern content is never persisted or logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker_patterns: Option<BrokerPatterns>,
 }
 
 /// Block-backed root filesystem configuration.
@@ -385,6 +398,42 @@ pub struct BrokerUpstreamHost {
     pub public_key: String,
 }
 
+/// DLP patterns for the broker VM's SSH relay scanner.
+///
+/// Projected host-side from the credential policy: each entry names one
+/// credential, carries its match bytes, and states the coalesced action
+/// contributed when it hits. brokerd compiles these into a sealed match
+/// library at ingest; the bytes never leave that custody.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrokerPatterns {
+    /// Patterns to compile into the relay scanner.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patterns: Vec<BrokerPattern>,
+}
+
+/// One DLP pattern delivered to the broker VM inside the typed bootstrap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrokerPattern {
+    /// Credential name for audit attribution (never secret content).
+    pub credential_id: String,
+
+    /// Authored encoding of [`BrokerPattern::bytes`].
+    pub decoder: Decoder,
+
+    /// Authored pattern bytes: the literal credential bytes for
+    /// [`Decoder::Raw`](microsandbox_scan::Decoder::Raw), standard-base64
+    /// text decoding to them for
+    /// [`Decoder::Base64`](microsandbox_scan::Decoder::Base64). brokerd
+    /// moves these bytes into sealed custody exactly once and never
+    /// re-serializes them.
+    #[serde(with = "serde_bytes")]
+    pub bytes: Vec<u8>,
+
+    /// Coalesced action contributed when this pattern hits.
+    #[serde(default)]
+    pub action: ActionSet,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
@@ -497,6 +546,18 @@ mod tests {
                     public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBrokerTestPin".to_string(),
                 }],
             }),
+            broker_patterns: Some(BrokerPatterns {
+                patterns: vec![BrokerPattern {
+                    credential_id: "api-key".to_string(),
+                    decoder: Decoder::Raw,
+                    bytes: b"test-only-pattern-bytes".to_vec(),
+                    action: ActionSet {
+                        enforce: None,
+                        audit: true,
+                        count: true,
+                    },
+                }],
+            }),
         };
 
         let message = Message::with_payload(MessageType::Bootstrap, 0, &bootstrap).unwrap();
@@ -527,6 +588,7 @@ mod tests {
         assert_eq!(bootstrap.hostname.as_deref(), Some("legacy-host"));
         assert_eq!(bootstrap.broker_key, None);
         assert_eq!(bootstrap.broker_upstream, None);
+        assert_eq!(bootstrap.broker_patterns, None);
 
         // The reverse direction holds too: unknown trailing fields from a
         // newer sender are ignored by an older shape.

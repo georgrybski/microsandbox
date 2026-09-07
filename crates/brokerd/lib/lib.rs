@@ -19,6 +19,7 @@
 // Exports
 //--------------------------------------------------------------------------------------------------
 
+pub mod audit;
 pub mod broker;
 pub mod config;
 pub mod console;
@@ -27,6 +28,7 @@ pub mod epoch;
 pub mod error;
 pub mod init;
 pub mod keys;
+pub mod patterns;
 pub mod prelude;
 pub mod ssh;
 pub mod vsock;

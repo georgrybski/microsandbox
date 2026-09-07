@@ -5,7 +5,10 @@
 //! guest port, and these constants must match that projection. A mismatch
 //! fails loud at bind or dial time rather than misrouting traffic.
 
+use std::sync::Arc;
+
 use microsandbox_protocol::bootstrap::BrokerUpstream;
+use microsandbox_scan::PatternLibrary;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -50,6 +53,9 @@ pub struct BrokerConfig {
 
     /// Pinned upstream servers projected from the grant host list.
     pub upstream: Option<BrokerUpstream>,
+
+    /// Compiled DLP match library shared across relay sessions.
+    pub patterns: Arc<PatternLibrary>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -58,12 +64,22 @@ pub struct BrokerConfig {
 
 impl BrokerConfig {
     /// Create a configuration with explicit ports and upstream pins.
+    ///
+    /// The DLP match library starts empty (sessions relay unchanged);
+    /// attach an ingested library with [`BrokerConfig::with_patterns`].
     pub fn new(divert_port: u32, egress_port: u32, upstream: Option<BrokerUpstream>) -> Self {
         Self {
             divert_port,
             egress_port,
             upstream,
+            patterns: PatternLibrary::empty(),
         }
+    }
+
+    /// Attach the ingested DLP match library shared across relay sessions.
+    pub fn with_patterns(mut self, patterns: Arc<PatternLibrary>) -> Self {
+        self.patterns = patterns;
+        self
     }
 
     /// Look up the pin for a divert destination.
@@ -93,6 +109,7 @@ impl Default for BrokerConfig {
             divert_port: SSH_DIVERT_LISTEN_PORT,
             egress_port: EGRESS_CONNECT_PORT,
             upstream: None,
+            patterns: PatternLibrary::empty(),
         }
     }
 }

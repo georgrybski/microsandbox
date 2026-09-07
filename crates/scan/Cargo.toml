@@ -1,0 +1,22 @@
+[package]
+name = "microsandbox-scan"
+description = "Transport-agnostic streaming secret matcher for the microsandbox project."
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[lib]
+path = "lib/lib.rs"
+
+[dependencies]
+base64.workspace = true
+hex.workspace = true
+percent-encoding = "2"
+serde.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

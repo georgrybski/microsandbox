@@ -79,6 +79,11 @@ pub struct SharedState {
 
     /// Aggregate network byte counters at the guest/runtime boundary.
     metrics: NetworkMetrics,
+
+    /// Evasion-signal audits: SSH first flights still undecided when the
+    /// peek budget expires and falling through to the generic egress
+    /// verdict instead of stalling the connection.
+    evasion_audits: AtomicU64,
 }
 
 /// Aggregate network byte counters shared with the runtime metrics sampler.
@@ -122,6 +127,7 @@ impl SharedState {
             gateway_ipv4: OnceLock::new(),
             gateway_ipv6: OnceLock::new(),
             metrics: NetworkMetrics::default(),
+            evasion_audits: AtomicU64::new(0),
         }
     }
 
@@ -267,6 +273,16 @@ impl SharedState {
     /// Total bytes delivered by the runtime to the guest.
     pub fn rx_bytes(&self) -> u64 {
         self.metrics.rx_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Record one evasion-signal audit (SSH banner undecided after budget).
+    pub fn record_evasion_audit(&self) {
+        self.evasion_audits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Total evasion-signal audits recorded.
+    pub fn evasion_audits(&self) -> u64 {
+        self.evasion_audits.load(Ordering::Relaxed)
     }
 }
 

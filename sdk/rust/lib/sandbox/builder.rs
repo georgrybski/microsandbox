@@ -795,6 +795,20 @@ impl SandboxBuilder {
         self
     }
 
+    /// Set DLP patterns enforced on the broker VM's relayed SSH sessions.
+    ///
+    /// Host-side only: the patterns never enter the guest-visible spec.
+    /// Spawn threads them into the typed bootstrap, where the broker
+    /// compiles them into a sealed match library. Absence means no DLP
+    /// scanning and relayed sessions pass through unchanged.
+    pub fn broker_patterns(
+        mut self,
+        patterns: microsandbox_protocol::bootstrap::BrokerPatterns,
+    ) -> Self {
+        self.config.broker_patterns = Some(patterns);
+        self
+    }
+
     /// Prepend explicit rules while preserving a configured policy's defaults and existing rules.
     #[cfg(feature = "net")]
     #[doc(hidden)]
@@ -2736,12 +2750,14 @@ mod tests {
 
         assert!(config.broker_key.is_none());
         assert!(config.broker_upstream.is_none());
+        assert!(config.broker_patterns.is_none());
     }
 
     #[tokio::test]
     async fn test_builder_sets_broker_fields_off_spec() {
         use microsandbox_protocol::bootstrap::{
-            BROKER_KEY_TYPE_ED25519, BrokerSshKey, BrokerUpstream, BrokerUpstreamHost,
+            BROKER_KEY_TYPE_ED25519, BrokerPatterns, BrokerSshKey, BrokerUpstream,
+            BrokerUpstreamHost,
         };
 
         let config = SandboxBuilder::new("test")
@@ -2758,6 +2774,9 @@ mod tests {
                     public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBrokerTestPin".to_string(),
                 }],
             })
+            .broker_patterns(BrokerPatterns {
+                patterns: Vec::new(),
+            })
             .build()
             .await
             .unwrap();
@@ -2771,6 +2790,7 @@ mod tests {
             .expect("broker upstream retained");
         assert_eq!(upstream.hosts.len(), 1);
         assert_eq!(upstream.hosts[0].host, "example.com");
+        assert!(config.broker_patterns.is_some(), "broker patterns retained");
         let spec_json = serde_json::to_value(&config.spec).unwrap().to_string();
         assert!(
             !spec_json.contains("example.com"),

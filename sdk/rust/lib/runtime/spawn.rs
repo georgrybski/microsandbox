@@ -2525,6 +2525,7 @@ fn sandbox_cli_args(
             }),
             broker_key: config.broker_key.clone(),
             broker_upstream: config.broker_upstream.clone(),
+            broker_patterns: config.broker_patterns.clone(),
             ..GuestBootstrap::default()
         },
         ..Default::default()
@@ -3378,8 +3379,10 @@ mod tests {
     #[tokio::test]
     async fn sandbox_cli_args_threads_broker_bootstrap_fields() {
         use microsandbox_protocol::bootstrap::{
-            BROKER_KEY_TYPE_ED25519, BrokerSshKey, BrokerUpstream, BrokerUpstreamHost,
+            BROKER_KEY_TYPE_ED25519, BrokerPattern, BrokerPatterns, BrokerSshKey, BrokerUpstream,
+            BrokerUpstreamHost,
         };
+        use microsandbox_scan::{ActionSet, Decoder};
 
         let config = SandboxBuilder::new("test")
             .image("/tmp/rootfs")
@@ -3393,6 +3396,14 @@ mod tests {
                     port: 22,
                     user: "deploy".to_string(),
                     public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBrokerTestPin".to_string(),
+                }],
+            })
+            .broker_patterns(BrokerPatterns {
+                patterns: vec![BrokerPattern {
+                    credential_id: "api-key".to_string(),
+                    decoder: Decoder::Raw,
+                    bytes: b"test-only-pattern-bytes".to_vec(),
+                    action: ActionSet::passthrough(),
                 }],
             })
             .build()
@@ -3414,6 +3425,13 @@ mod tests {
             .expect("broker upstream threaded");
         assert_eq!(upstream.hosts.len(), 1);
         assert_eq!(upstream.hosts[0].host, "example.com");
+        let patterns = launch
+            .bootstrap
+            .broker_patterns
+            .as_ref()
+            .expect("broker patterns threaded");
+        assert_eq!(patterns.patterns.len(), 1);
+        assert_eq!(patterns.patterns[0].credential_id, "api-key");
     }
 
     #[tokio::test]
@@ -3427,6 +3445,7 @@ mod tests {
         let launch = render_launch(&config);
         assert!(launch.bootstrap.broker_key.is_none());
         assert!(launch.bootstrap.broker_upstream.is_none());
+        assert!(launch.bootstrap.broker_patterns.is_none());
     }
 
     #[tokio::test]

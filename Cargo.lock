@@ -3853,6 +3853,7 @@ dependencies = [
  "microsandbox-network",
  "microsandbox-protocol",
  "microsandbox-runtime",
+ "microsandbox-scan",
  "microsandbox-types",
  "microsandbox-utils",
  "nix 0.31.3",
@@ -3922,6 +3923,7 @@ dependencies = [
  "ciborium",
  "libc",
  "microsandbox-protocol",
+ "microsandbox-scan",
  "nix 0.31.3",
  "russh",
  "serde",
@@ -4169,6 +4171,7 @@ version = "0.6.16"
 dependencies = [
  "chrono",
  "ciborium",
+ "microsandbox-scan",
  "microsandbox-types",
  "serde",
  "serde_bytes",
@@ -4227,6 +4230,19 @@ dependencies = [
  "tokio",
  "tracing",
  "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
+name = "microsandbox-scan"
+version = "0.6.16"
+dependencies = [
+ "base64 0.23.1",
+ "hex",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
  "zeroize",
 ]
 
