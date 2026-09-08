@@ -20,8 +20,8 @@
 //! Relayed bytes pass through the DLP scanner: guest-to-upstream channel
 //! data, extended data, and exec commands enforce the session's match
 //! library (block closes the channel, block-and-terminate tears down the
-//! session), while upstream-to-guest relayed data is audit/count-only in
-//! P0 and always forwards.
+//! session), while upstream-to-guest relayed data is audit/count-only by
+//! default and always forwards (see [`UPSTREAM_RESPONSE_ENFORCEMENT`]).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -47,6 +47,18 @@ use crate::prelude::SessionIdentity;
 
 /// Time allowed for one upstream channel-request reply.
 const REPLY_TIMEOUT_SECS: u64 = 30;
+
+/// Upstream-to-guest relay enforcement switch (audit-only by default).
+///
+/// `false` keeps the response leg audit/count-only: reports still feed the
+/// response counters and audit records, but every chunk forwards. A
+/// 25-fixture realistic-corpus battery (150 chunks across both legs, whole
+/// and midpoint-split) reports no hits for 32-byte credentials, yet the
+/// response leg stays non-enforcing until response-side enforcement is
+/// explicitly adopted: flipping to `true` routes the pump through
+/// [`enforcement_for`], so a block closes the channel and a terminate
+/// tears down the session.
+pub const UPSTREAM_RESPONSE_ENFORCEMENT: bool = false;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -695,6 +707,21 @@ pub fn enforcement_for(report: &ScanReport) -> ScanEnforcement {
     }
 }
 
+/// Map an upstream-to-guest scan report to a relay decision under the
+/// response-enforcement switch.
+///
+/// Audit-only (the default) always forwards; enabled routes through
+/// [`enforcement_for`]. Pure over the report and the switch, so both the
+/// current audit-only behavior and the future enforcing behavior are
+/// unit-testable without SSH.
+pub fn response_enforcement_for(report: &ScanReport) -> ScanEnforcement {
+    if UPSTREAM_RESPONSE_ENFORCEMENT {
+        enforcement_for(report)
+    } else {
+        ScanEnforcement::Forward
+    }
+}
+
 /// Reoriginate one diverted guest session toward its pinned upstream.
 ///
 /// `guest` is the accepted divert stream (starting with the guest's first
@@ -865,6 +892,24 @@ pub fn parse_upstream_pin(entry: &BrokerUpstreamHost) -> BrokerResult<UpstreamPi
 // Functions: Helpers
 //--------------------------------------------------------------------------------------------------
 
+/// Close a response-enforced channel on the guest leg.
+///
+/// Best-effort like the request-leg close: either leg may already be
+/// closing when enforcement fires. A terminate decision tears down the
+/// whole session first; a block only closes the offending channel.
+async fn close_response_channel(
+    guest: &russh::server::Handle,
+    shared: &RelayShared,
+    channel: ChannelId,
+    decision: ScanEnforcement,
+) {
+    if decision == ScanEnforcement::TerminateSession {
+        shared.termination.terminate();
+    }
+    let _ = guest.close(channel).await;
+    shared.channels.lock().await.remove(&channel);
+}
+
 /// Answer a guest channel request from an upstream reply.
 fn answer(session: &mut Session, channel: ChannelId, ok: bool) -> Result<(), BrokerError> {
     if ok {
@@ -881,8 +926,10 @@ fn answer(session: &mut Session, channel: ChannelId, ok: bool) -> Result<(), Bro
 
 /// Pump one upstream channel into its guest channel until either side ends.
 ///
-/// Upstream-to-guest bytes are audit/count-only in P0: hits are observed
-/// for attribution and the bytes always forward, with no enforcement.
+/// Upstream-to-guest bytes are audit/count-only by default: hits are
+/// observed for attribution and the bytes forward unless
+/// [`UPSTREAM_RESPONSE_ENFORCEMENT`] routes the report's decision into
+/// enforcement.
 async fn pump_upstream_to_guest(
     guest: russh::server::Handle,
     guest_channel: ChannelId,
@@ -894,7 +941,10 @@ async fn pump_upstream_to_guest(
         match rx.wait().await {
             Some(ChannelMsg::Data { data }) => {
                 let report = shared.scan_response.lock().await.scan_chunk(&data);
-                shared
+                // Count and audit every response report; the relay decision
+                // stays behind the response-enforcement switch, so the
+                // observed decision is dropped and resolved below.
+                let _ = shared
                     .observe(
                         guest_channel,
                         ChannelDirection::UpstreamToGuest,
@@ -902,13 +952,24 @@ async fn pump_upstream_to_guest(
                         &shared.response_hits,
                     )
                     .await;
-                if guest.data(guest_channel, data).await.is_err() {
-                    break;
+                match response_enforcement_for(&report) {
+                    ScanEnforcement::Forward => {
+                        if guest.data(guest_channel, data).await.is_err() {
+                            break;
+                        }
+                    }
+                    decision => {
+                        close_response_channel(&guest, &shared, guest_channel, decision).await;
+                        break;
+                    }
                 }
             }
             Some(ChannelMsg::ExtendedData { data, ext }) => {
                 let report = shared.scan_response.lock().await.scan_chunk(&data);
-                shared
+                // Count and audit every response report; the relay decision
+                // stays behind the response-enforcement switch, so the
+                // observed decision is dropped and resolved below.
+                let _ = shared
                     .observe(
                         guest_channel,
                         ChannelDirection::UpstreamToGuest,
@@ -916,8 +977,16 @@ async fn pump_upstream_to_guest(
                         &shared.response_hits,
                     )
                     .await;
-                if guest.extended_data(guest_channel, ext, data).await.is_err() {
-                    break;
+                match response_enforcement_for(&report) {
+                    ScanEnforcement::Forward => {
+                        if guest.extended_data(guest_channel, ext, data).await.is_err() {
+                            break;
+                        }
+                    }
+                    decision => {
+                        close_response_channel(&guest, &shared, guest_channel, decision).await;
+                        break;
+                    }
                 }
             }
             Some(ChannelMsg::Eof) => {
@@ -1095,6 +1164,29 @@ mod tests {
         assert_eq!(
             enforcement_for(&report_with(Some(Severity::BlockAndTerminate))),
             ScanEnforcement::TerminateSession
+        );
+    }
+
+    #[test]
+    fn response_leg_stays_audit_only_by_default() {
+        // Compile-time pin: the response leg stays audit-only until
+        // response-side enforcement is explicitly adopted.
+        const { assert!(!UPSTREAM_RESPONSE_ENFORCEMENT) };
+        // Under the default switch a block report still forwards on the
+        // response leg, while the shared mapping shows what enabling the
+        // switch would enforce — no SSH needed either way.
+        for severity in [
+            Severity::BlockAndLog,
+            Severity::Block,
+            Severity::BlockAndTerminate,
+        ] {
+            let report = report_with(Some(severity));
+            assert_eq!(response_enforcement_for(&report), ScanEnforcement::Forward);
+            assert_ne!(enforcement_for(&report), ScanEnforcement::Forward);
+        }
+        assert_eq!(
+            response_enforcement_for(&report_with(None)),
+            ScanEnforcement::Forward
         );
     }
 

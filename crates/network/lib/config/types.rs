@@ -672,4 +672,43 @@ mod tests {
         .unwrap();
         assert!(resolved.ssh_broker().is_none());
     }
+
+    /// A `Passthrough` deny strength survives the wire round-trip intact:
+    /// the only coercion is the routing layer's `deny_action` at decision
+    /// time, never the serialization path.
+    #[test]
+    fn ssh_passthrough_violation_survives_the_wire_spec_round_trip() {
+        use crate::ssh::policy::{SshGrant, SshPolicy};
+
+        let stored = microsandbox_types::ViolationAction::Passthrough(vec![
+            microsandbox_types::HostPattern::Exact("example.com".to_string()),
+        ]);
+        let config = NetworkConfig {
+            ssh: Some(
+                SshPolicy::new(true, vec![SshGrant::exact("example.com", 22)])
+                    .with_violation(stored.clone()),
+            ),
+            ..NetworkConfig::default()
+        };
+
+        let spec: microsandbox_types::NetworkSpec =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(
+            spec.ssh.as_ref().expect("wire must carry ssh").on_violation,
+            stored,
+            "the wire twin must carry Passthrough faithfully"
+        );
+
+        let back: NetworkConfig =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(back.ssh, config.ssh);
+        assert_eq!(
+            back.ssh
+                .as_ref()
+                .expect("round trip keeps ssh")
+                .deny_action(),
+            microsandbox_types::ViolationAction::Block,
+            "the decision layer still coerces fail-closed"
+        );
+    }
 }

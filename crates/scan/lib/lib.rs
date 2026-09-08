@@ -24,6 +24,8 @@
 
 pub mod action;
 pub mod decode;
+#[cfg(test)]
+mod false_positives;
 pub mod library;
 pub mod pattern;
 pub mod scan;

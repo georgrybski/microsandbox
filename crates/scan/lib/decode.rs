@@ -98,13 +98,13 @@ impl Base64StreamDecoder {
                 if let (Some(a), Some(b)) = (decode_char(a), decode_char(b)) {
                     out.push((a << 2) | (b >> 4));
                 }
-            } else if d == b'=' && c != b'=' {
-                if let (Some(a), Some(b), Some(c)) =
+            } else if d == b'='
+                && c != b'='
+                && let (Some(a), Some(b), Some(c)) =
                     (decode_char(a), decode_char(b), decode_char(c))
-                {
-                    out.push((a << 2) | (b >> 4));
-                    out.push((b << 4) | (c >> 2));
-                }
+            {
+                out.push((a << 2) | (b >> 4));
+                out.push((b << 4) | (c >> 2));
             }
             // Whether or not the pad closed a valid quantum, the run ends
             // here: fresh alphabet characters start a new run.
