@@ -325,14 +325,18 @@ impl TcpProxy {
                 // lines), so 512 bytes is generous; an incomplete banner
                 // after the 5 s peek budget falls through to the generic
                 // egress verdict rather than stalling the connection. This
-                // is the one deliberate fail-open hole.
-                shared.record_evasion_audit();
-                tracing::info!(
-                    dst = %guest_dst,
-                    guest_bytes = initial_buf.len(),
-                    server_bytes = server_sample.len(),
-                    "ssh classification incomplete after budget; falling through to egress",
-                );
+                // is the one deliberate fail-open hole. The audit counter
+                // stays exact; the log line is sampled (first few, then
+                // every Nth) so a banner-less scanner cannot flood logs.
+                let previous = shared.record_evasion_audit();
+                if crate::netstack::shared::should_log_evasion_audit(previous) {
+                    tracing::info!(
+                        dst = %guest_dst,
+                        guest_bytes = initial_buf.len(),
+                        server_bytes = server_sample.len(),
+                        "ssh classification incomplete after budget; falling through to egress",
+                    );
+                }
             }
             match decide_ssh_egress(
                 &flow,

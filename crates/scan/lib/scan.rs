@@ -517,7 +517,7 @@ mod tests {
             vec![0u8; 256],
             (0..=255u8).cycle().take(512).collect(),
             b"\xff\xfe\x00\x01 binary \x00\x01\x02 noise".to_vec(),
-            format!("test-credential-9999-value").into_bytes(),
+            b"test-credential-9999-value".to_vec(),
             // Truncated credential prefix: below-length fragments must not hit.
             credential(0)[..8].to_vec(),
         ];
