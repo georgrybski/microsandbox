@@ -19,18 +19,18 @@ const NORMAL_SHUTDOWN_FLUSH_TIMEOUT_SECS: u64 = 2;
 
 /// Maximum time agentd spends in its handoff-mode poweroff sequence.
 ///
-/// In init-handoff sandboxes (systemd, openrc, …) agentd's shutdown
-/// handler signals the new PID 1 with `SIGRTMIN+4`, sleeps for this
-/// duration to give the init a chance to act, then falls back to
-/// `SIGTERM`. The host's handoff shutdown fallback must exceed this
-/// so it doesn't cut the sequence short.
+/// For systemd, agentd submits `poweroff.target` using the running receiver's
+/// control helper and waits within this total grace. Submission is not proof
+/// of poweroff. Other init systems retain the legacy sender-relative RT signal
+/// and SIGTERM fallback, whose semantics are receiver-specific. The host's
+/// handoff shutdown fallback must exceed this grace.
 pub const HANDOFF_POWEROFF_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(HANDOFF_POWEROFF_TIMEOUT_SECS);
 
 /// Additional host-side margin after agentd's handoff poweroff grace.
 ///
-/// This gives the guest init time to react to agentd's fallback signal before
-/// the host gives up and tears down the VMM process.
+/// This gives the guest init additional time before the host gives up and tears
+/// down the VMM process. Host fallback is not evidence of graceful guest exit.
 pub const SHUTDOWN_FLUSH_MARGIN: std::time::Duration =
     std::time::Duration::from_secs(SHUTDOWN_FLUSH_MARGIN_SECS);
 
@@ -44,14 +44,12 @@ pub const NORMAL_SHUTDOWN_FLUSH_TIMEOUT: std::time::Duration =
 
 /// Host fallback window for sandboxes that hand PID 1 to another init.
 ///
-/// agentd uses this window to `sync()` block-backed root filesystems
-/// and power off the kernel cleanly (or run its handoff sequence —
-/// see [`HANDOFF_POWEROFF_TIMEOUT`]). On a healthy guest the VMM
-/// exits well inside the window and the host fallback is a no-op;
-/// the fallback only fires when the guest is wedged.
+/// The guest runs its handoff sequence (see [`HANDOFF_POWEROFF_TIMEOUT`])
+/// within this window. Init and its services remain responsible for graceful
+/// shutdown; a slow or failed shutdown can reach the host's forced fallback.
 ///
 /// Equals [`HANDOFF_POWEROFF_TIMEOUT`] plus [`SHUTDOWN_FLUSH_MARGIN`] for the
-/// init's own signal handling — enforced at compile time below.
+/// init's own shutdown handling — enforced at compile time below.
 pub const HANDOFF_SHUTDOWN_FLUSH_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(HANDOFF_POWEROFF_TIMEOUT_SECS + SHUTDOWN_FLUSH_MARGIN_SECS);
 
