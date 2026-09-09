@@ -16,22 +16,24 @@ Rule: state flows down (1 → 2 → 3) only. Build/check state must NEVER touch
 
 ### Layer 1 — build inputs (pure)
 
-Everything byte-pinned via `flake.lock`:
+Flake inputs are pinned via `flake.lock`; Cargo Git sources and release
+archives also have fixed-output hashes in the package definitions:
 
 | Input | Derivation | Pin |
 |-------|------------|-----|
-| `agentd` | `nix/packages/agentd.nix` — musl static via `pkgsStatic`, built from this flake's locked fork source (`src = self`) | flake rev |
-| `libkrunfw` (Branch A, current) | `nix/packages/microsandbox.nix:57-60` — `fetchurl` + `sha256` of the upstream v0.6.8 release tarball, `libkrunfw.so*` only | SRI hash in-tree |
-| `libkrunfw` (Branch B, future) | `nix/packages/microsandbox.nix:45-52` — `fetchGit` derivation built from `vendor/libkrunfw`; NOT implemented | submodule gitlink |
+| `agentd` | `nix/packages/agentd.nix` — musl static via `pkgsStatic`, built from the filtered Rust workspace source | flake rev |
+| Cargo dependencies | `nix/cargo-lock.nix` — shared by both packages and Cargo checks; one Git hash covers every crate in the locked libkrun checkout | `Cargo.lock` and `outputHashes` |
+| `libkrunfw` (current interim input) | `nix/packages/microsandbox.nix` — `fetchurl` + `sha256` of the upstream v0.6.8 release tarball, `libkrunfw.so*` only | SRI hash in-tree |
+| `libkrunfw` (source-built follow-up) | A fork-owned package, validated against the locked Rust runtime and firmware ABI before adoption | compatible immutable source revision |
 | toolchain | fenix `stable` via the shared nix-tooling pin (`flake.nix:9-18,75`) | `flake.lock` |
 
 ### Layer 2 — build/check state (ephemeral)
 
 `MSB_HOME="$TMPDIR/.microsandbox"`, set in the shared `stageAgentd` snippet
-(`flake.nix:105-116`) used as `preBuild` by `checks.clippy` and `checks.unit`
-only. `$TMPDIR` is the nix sandbox's per-derivation scratch — writable during
-the build, deleted after. The snippet also stages `build/agentd` and exports
-`MSB_AGENTD_PATH` (commit `a34153a`).
+used as `preBuild` by `checks.clippy` and `checks.unit` only. `$TMPDIR` is the
+nix sandbox's per-derivation scratch — writable during the build, deleted
+after. The snippet stages `build/agentd`, exports `MSB_AGENTD_PATH`, and copies
+the matching built CLI and firmware into the scratch home's `bin/` and `lib/`.
 
 ### Layer 3 — runtime state (consumer-owned)
 
@@ -60,19 +62,50 @@ directory or overriding `HOME` globally — redirect the app's state dir instead
 (`create_dir_all` on `{bin,lib}/` under `resolve_home()` from
 `crates/utils/lib/lib.rs:178`).
 
-## Fail-closed contract for nix builds (contract; implementation queued)
+## Offline builds and checks
 
 `crates/filesystem/build.rs` (`build_agentd`, `prebuilt` feature) resolves the
 guest agentd in this order: `build/agentd` → `MSB_AGENTD_PATH` → cached
 `OUT_DIR` copy → GitHub release download (`agentd_download_url(PREBUILT_VERSION)`,
 `PREBUILT_VERSION = CARGO_PKG_VERSION`, i.e. the v0.6.16 asset). The download
-leg is a build-time network fetch — forbidden under the nix contract. Rule:
-nix check `preBuild` must assert `MSB_AGENTD_PATH` is set (fail-closed) so the
-fallback can never silently fire; upstream keeps the fallback for its no-nix
-`cargo build` contract (Contract A) — the fork's nix contract (Contract B)
-refuses it. Same pattern as the workestrate `ci.yml` e2e-nix fail-closed env
-asserts. This section documents the CONTRACT ONLY — implementation is a queued
-follow-up, deliberately NOT implemented here.
+leg is a build-time network fetch, which Nix sandboxed builds cannot use.
+The host package stages the separately built guest daemon and disables the
+`prebuilt` feature. Workspace checks stage both the daemon and the matching
+host runtime before compiling default features. Their SDK build script finds
+the expected runtime version locally, so it does not download a release.
+Cargo build, lint, dependency-policy and unit checks use vendored sources;
+the custom checks pass `--locked --offline` explicitly.
+The unit check also supplies the Nix CA bundle explicitly so TLS client
+construction does not depend on host trust-store discovery.
+
+Build the public outputs without entering the development shell:
+
+```sh
+nix build .#microsandbox .#agentd --no-link --no-write-lock-file
+nix build .#checks.x86_64-linux.package --no-link --no-write-lock-file
+nix build .#checks.x86_64-linux.fmt .#checks.x86_64-linux.deny --no-link --no-write-lock-file
+```
+
+The guest package verifies that its installed ELF has neither an interpreter
+nor shared-library dependencies. The package check verifies the CLI version,
+the shipped guest daemon, and dynamic loading of the firmware's required kernel
+export. The public package names remain `agentd`,
+`microsandbox`, `msb`, and `default` (`msb` and `default` alias `microsandbox`).
+Consumers should obtain SDK paths from the same flake input that supplies
+these packages.
+
+### Workspace test requirements
+
+`checks.unit` runs the full workspace with the existing upstream KVM ignore
+markers; it does not exclude filesystem tests. Those tests exercise strict
+stat virtualization using the `user.msb._probe` and `user.msb.override_stat`
+extended attributes. [Nix's default Linux syscall filter](https://github.com/NixOS/nix/blob/2.34.7/src/libstore/unix/build/linux-derivation-builder.cc#L104)
+returns `ENOTSUP` for
+extended-attribute reads and writes, including on writable scratch files.
+On such builders this gate fails at the filesystem capability probe and the
+complete suite needs a separately isolated host test environment. Changing
+the runtime's strict behavior or automatically disabling the syscall filter
+is not part of the package build.
 
 ## Devshell state isolation (proposal; queued)
 

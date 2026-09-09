@@ -2,11 +2,11 @@
   description = "microsandbox (rybskiworks fork) — self-contained nix packaging on shared nix-tooling pins";
 
   inputs = {
-    # Shared tooling pin — mirrors workestrate/flake.nix exactly.
-    # For local iteration: `--override-input tooling path:../nix-tooling` (or
-    # the absolute path). Do NOT follow-override tooling's owned pins
-    # (fenix rev / tombi); only nixpkgs-class inputs are shared via follows.
-    tooling.url = "github:rybskiworks/nix-tooling/18f8b85f6777240a0ecef4e93ebee69313802aed";
+    # Shared tooling owns the toolchain and dependency versions.
+    # For local iteration, override tooling with a Git-filtered checkout:
+    # `--override-input tooling git+file:///absolute/path/to/nix-tooling`.
+    # Keep its owned pins intact; consumers follow the shared input graph.
+    tooling.url = "github:rybskiworks/nix-tooling/eae927a0da5fd04d2dfd2e7876042c6243adba65";
 
     # ONE pin universe: every shared input follows tooling. Do NOT declare
     # own revs for any of these — bumps happen in nix-tooling only.
@@ -17,9 +17,8 @@
     treefmt-nix.follows = "tooling/treefmt-nix";
     git-hooks.follows = "tooling/git-hooks";
 
-    # Required by devenv's flakeModule (containers/mk-shell-bin support is
-    # wired unconditionally there; nix-tooling pruned these, so they are
-    # declared here with the same revs workestrate uses). Not used directly.
+    # Inputs for devenv's default container outputs. Not used directly by the
+    # packages; these can be removed if the unused container outputs are disabled.
     nix2container = {
       url = "github:nlewo/nix2container/76be9608a7f4d6c985d28b0e7be903ae2547df3e";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -33,7 +32,7 @@
     # shell via
     #   nix develop --override-input devenv-root "file+file://<rootfile>"
     # where <rootfile> is a FILE containing the worktree abs path (NOT the
-    # directory), or via `nix develop --impure` (falls back to PWD).
+    # directory).
     devenv-root = {
       url = "file+file:///dev/null";
       flake = false;
@@ -45,17 +44,15 @@
     flake-parts.lib.mkFlake { inherit inputs; } {
       # NOTE: tooling's treefmt-nix / git-hooks flakeModules are deliberately
       # NOT imported here. The fork already has .pre-commit-config.yaml and
-      # .taplo.toml, and the pinned tooling's treefmt rustfmt predates the
-      # edition-2024 default fix (nix-tooling@a9bd083). The Rust fmt gate is
-      # covered by checks.fmt (cargo fmt, which honors .rustfmt.toml).
-      # Deferred: revisit after the tooling pin is bumped past a9bd083.
+      # .taplo.toml. The Rust fmt gate is covered by checks.fmt (cargo fmt,
+      # which honors .rustfmt.toml).
       imports = [
         # NOTE(pure-eval): devenv.root defaults to $PWD, which is blank under
         # pure evaluation, so plain `nix flake show/check` fails by design with
         # "devenv was not able to determine the current directory" (upstream
         # devenv behavior, see devenv.sh "using with flakes" guide). Use
-        # `nix flake show/check --impure` (or --override-input devenv-root
-        # with a file containing $PWD, as direnv does). Do NOT hard-code
+        # --override-input devenv-root with a file containing the worktree
+        # path, as direnv does. Do NOT hard-code
         # devenv.root to a fixed path — non-portable between machines.
         inputs.devenv.flakeModule
       ];
@@ -74,20 +71,56 @@
           # Pinned Rust toolchain via fenix (owned pin — see inputs above).
           rustToolchain = inputs.fenix.packages.${system}.stable;
 
-          # The flake root IS the workspace root. Flake git semantics already
-          # exclude untracked/ignored files (target/, .devenv/, the
-          # unpopulated vendor/libkrunfw submodule contents), so a plain
-          # `src = self` is acceptable — no cleanSourceWith filter needed.
-          src = inputs.self;
+          # Only Rust workspace inputs affect package sources. Exclude local
+          # build caches even when the flake is supplied as a path override.
+          src = pkgs.lib.cleanSourceWith {
+            src = inputs.self;
+            filter =
+              path: type:
+              let
+                relative = pkgs.lib.removePrefix "${inputs.self}/" path;
+                root = builtins.head (pkgs.lib.splitString "/" relative);
+              in
+              builtins.elem root [
+                "Cargo.toml"
+                "Cargo.lock"
+                ".cargo"
+                ".rustfmt.toml"
+                "crates"
+                "sdk"
+                "packages"
+                "examples"
+                "assets"
+                "README.md"
+                "LICENSE"
+                "deny.toml"
+              ]
+              && pkgs.lib.cleanSourceFilter path type
+              && !(builtins.elem (builtins.baseNameOf path) [
+                "target"
+                "build"
+                ".devenv"
+                ".direnv"
+                ".venv"
+                "node_modules"
+              ]);
+          };
 
           rustPlatform = pkgs.makeRustPlatform {
             inherit (rustToolchain) cargo;
             inherit (rustToolchain) rustc;
           };
 
-          agentd = pkgs.callPackage ./nix/packages/agentd.nix { inherit src; };
+          cargoLock = import ./nix/cargo-lock.nix { inherit src; };
+
+          agentd = pkgs.callPackage ./nix/packages/agentd.nix { inherit src cargoLock; };
           msb = pkgs.callPackage ./nix/packages/microsandbox.nix {
-            inherit src rustToolchain agentd;
+            inherit
+              src
+              rustToolchain
+              agentd
+              cargoLock
+              ;
           };
 
           # Toolchain with the musl std for the agentd musl clippy gate
@@ -113,6 +146,11 @@
             # Point at writable TMPDIR instead. Scoped here — do NOT copy to
             # devenv enterShell ergonomics.
             export MSB_HOME="$TMPDIR/.microsandbox"
+            # The SDK's default `prebuilt` feature verifies the runtime here.
+            # Supply the matching package so checks never download a release.
+            mkdir -p "$MSB_HOME/bin" "$MSB_HOME/lib"
+            cp ${msb}/bin/msb "$MSB_HOME/bin/"
+            cp -P ${msb}/lib/libkrunfw.so* "$MSB_HOME/lib/"
           '';
         in
         {
@@ -131,6 +169,25 @@
           # with workestrate's scripts/kvm-tests.sh as the reference.
 
           checks = {
+            package =
+              pkgs.runCommand "microsandbox-package-check"
+                {
+                  nativeBuildInputs = [ pkgs.python3 ];
+                }
+                ''
+                  export MSB_HOME="$TMPDIR/.microsandbox"
+                  ${msb}/bin/msb --version | grep -Fx 'msb ${msb.version}'
+                  cmp ${msb}/libexec/agentd ${agentd}/libexec/agentd
+                  test -e ${msb}/lib/libkrunfw.so
+                  python - <<'PY'
+                  import ctypes
+
+                  firmware = ctypes.CDLL("${msb}/lib/libkrunfw.so.5.6.1")
+                  getattr(firmware, "krunfw_get_kernel")
+                  PY
+                  mkdir -p $out
+                '';
+
             # Rust formatting gate — fenix toolchain; cargo fmt honors the
             # fork's .rustfmt.toml (edition = "2024").
             fmt =
@@ -154,21 +211,21 @@
             # (h2, pyo3, rsa, proc-macro-error2). Widen to `licenses` and
             # `advisories` once the upstream baseline is fixed; see the TODO
             # at bans.wildcards in deny.toml.
-            deny =
-              pkgs.runCommand "cargo-deny-check"
-                {
-                  nativeBuildInputs = [
-                    pkgs.cargo-deny
-                    rustToolchain.cargo
-                    rustToolchain.rustc
-                  ];
-                }
-                ''
-                  export CARGO_HOME=$TMPDIR/cargo-home
-                  cd ${src}
-                  cargo deny --locked check bans sources
-                  mkdir -p $out
-                '';
+            deny = rustPlatform.buildRustPackage {
+              pname = "microsandbox-deny";
+              version = "0.6.16";
+              inherit src cargoLock;
+              nativeBuildInputs = [ pkgs.cargo-deny ];
+              buildPhase = ''
+                runHook preBuild
+                cargo deny --locked --offline check bans sources
+                runHook postBuild
+              '';
+              installPhase = ''
+                mkdir -p $out
+              '';
+              doCheck = false;
+            };
 
             # Heavy check (allowed to be expensive): upstream's clippy gates
             # from .github/workflows/check.yml —
@@ -179,7 +236,7 @@
               pname = "microsandbox-clippy";
               version = "0.6.16";
               inherit src;
-              cargoLock.lockFile = src + "/Cargo.lock";
+              inherit cargoLock;
               cargo = clippyToolchain;
               rustc = clippyToolchain;
               nativeBuildInputs = [
@@ -193,9 +250,9 @@
               preBuild = stageAgentd;
               buildPhase = ''
                 runHook preBuild
-                cargo clippy --workspace --exclude microsandbox-agentd -- -D warnings
+                cargo clippy --jobs "$NIX_BUILD_CORES" --locked --offline --workspace --exclude microsandbox-agentd -- -D warnings
                 cargo clippy --manifest-path crates/agentd/Cargo.toml \
-                  --target x86_64-unknown-linux-musl -- -D warnings
+                  --jobs "$NIX_BUILD_CORES" --locked --offline --target x86_64-unknown-linux-musl -- -D warnings
                 runHook postBuild
               '';
               installPhase = ''
@@ -204,17 +261,17 @@
               doCheck = false;
             };
 
-            # Heavy check (allowed to be expensive): unit tests. Empirical
-            # baseline (2026-09-06, devshell, no /dev/kvm): full
-            # `cargo test --workspace` is green WITHOUT scoping — 3049
-            # passed, 0 failed, 138 ignored across 108 test binaries; the
-            # KVM-dependent tests are already #[ignore]d upstream, so no
-            # exclusion list is needed. libcap-ng comes from buildInputs.
+            # Full workspace tests retain upstream's existing KVM ignores.
+            # Strict filesystem tests also require xattrs; the default Linux
+            # Nix syscall filter rejects them. Keep these tests intact and use
+            # an isolated host test environment when that builder policy applies.
             unit = rustPlatform.buildRustPackage {
               pname = "microsandbox-unit-tests";
               version = "0.6.16";
               inherit src;
-              cargoLock.lockFile = src + "/Cargo.lock";
+              inherit cargoLock;
+              # TLS client construction needs explicit trust roots in the sandbox.
+              SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
               nativeBuildInputs = [ pkgs.pkg-config ];
               buildInputs = with pkgs; [
                 libcap_ng
@@ -223,7 +280,7 @@
               preBuild = stageAgentd;
               buildPhase = ''
                 runHook preBuild
-                cargo test --workspace
+                cargo test --jobs "$NIX_BUILD_CORES" --locked --offline --workspace -- --test-threads "$NIX_BUILD_CORES"
                 runHook postBuild
               '';
               installPhase = ''

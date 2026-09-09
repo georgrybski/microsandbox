@@ -440,17 +440,17 @@
         "treefmt-nix": "treefmt-nix_2"
       },
       "locked": {
-        "lastModified": 1788554028,
-        "narHash": "sha256-U2ZXEsLl29j0aIaunEIwLAAOy/sQkWv2a6TOYwOT6Jo=",
+        "lastModified": 1788911152,
+        "narHash": "sha256-yum3Wf8l9SZlJCKz8HTDhpCPVVcS2+c2SXhESh7dh8M=",
         "owner": "rybskiworks",
         "repo": "nix-tooling",
-        "rev": "18f8b85f6777240a0ecef4e93ebee69313802aed",
+        "rev": "eae927a0da5fd04d2dfd2e7876042c6243adba65",
         "type": "github"
       },
       "original": {
         "owner": "rybskiworks",
         "repo": "nix-tooling",
-        "rev": "18f8b85f6777240a0ecef4e93ebee69313802aed",
+        "rev": "eae927a0da5fd04d2dfd2e7876042c6243adba65",
         "type": "github"
       }
     },

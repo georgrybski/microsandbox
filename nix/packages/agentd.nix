@@ -1,8 +1,7 @@
 # agentd — guest init/agent daemon for microsandbox microVMs.
 #
-# Built as a static musl binary from THIS flake's own source (`src = self`
-# passed in from the fork flake — the flake root IS the workspace root, so no
-# sourceRoot). agentd runs INSIDE the guest microVM, not on the host — a static
+# Built as a static musl binary from this flake's filtered workspace source.
+# agentd runs INSIDE the guest microVM, not on the host — a static
 # musl binary has no library deps and works with any guest rootfs (alpine/musl
 # or glibc).
 #
@@ -13,7 +12,11 @@
 # rustc >= 1.85), the host build will fail and we must inject the fenix
 # toolchain via fenix.combine with the musl target.
 
-{ pkgs, src }:
+{
+  pkgs,
+  src,
+  cargoLock,
+}:
 
 pkgs.pkgsStatic.rustPlatform.buildRustPackage rec {
   pname = "microsandbox-agentd";
@@ -21,9 +24,7 @@ pkgs.pkgsStatic.rustPlatform.buildRustPackage rec {
 
   inherit src;
 
-  cargoLock = {
-    lockFile = src + "/Cargo.lock";
-  };
+  inherit cargoLock;
 
   # Only build the agentd crate, not the whole workspace.
   cargoBuildFlags = [
@@ -35,17 +36,20 @@ pkgs.pkgsStatic.rustPlatform.buildRustPackage rec {
 
   installPhase = ''
     runHook preInstall
-    # pkgsStatic sets a musl hostPlatform, so cargo may place the binary at
-    # target/x86_64-unknown-linux-musl/release/agentd OR target/release/agentd
-    # depending on how pkgsStatic wires the target. Find it robustly and fail
-    # loudly if missing or ambiguous.
-    agentd_bin=$(find target -type f -name agentd -path '*/release/*' | head -n1)
-    if [ -z "$agentd_bin" ]; then
-      echo "error: agentd binary not found under target/*/release/" >&2
-      find target -type f -name agentd >&2 || true
+    install -Dm755 target/${pkgs.pkgsStatic.stdenv.hostPlatform.rust.rustcTarget}/release/agentd \
+      $out/libexec/agentd
+    runHook postInstall
+  '';
+
+  doInstallCheck = true;
+  installCheckPhase = ''
+    runHook preInstallCheck
+    ${pkgs.buildPackages.binutils}/bin/readelf --program-headers $out/libexec/agentd > headers
+    ${pkgs.buildPackages.binutils}/bin/readelf --dynamic $out/libexec/agentd > dynamic
+    if grep -q INTERP headers || grep -q NEEDED dynamic; then
+      echo "error: guest agentd must be statically linked" >&2
       exit 1
     fi
-    install -Dm755 "$agentd_bin" $out/libexec/agentd
-    runHook postInstall
+    runHook postInstallCheck
   '';
 }
