@@ -3,7 +3,7 @@
 //! This module composes with the existing egress machinery without changing
 //! its semantics: the caller first evaluates the generic transport policy
 //! ([`Action`] via `NetworkPolicy::evaluate_egress`), classifies the flow
-//! with [`SshClassification`](super::classifier::SshClassification), then
+//! with [`SshClassification`], then
 //! calls [`decide_ssh_egress`] for the final routing verdict.
 //!
 //! Deny strength reuses the secrets [`ViolationAction`] vocabulary

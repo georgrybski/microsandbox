@@ -12,6 +12,8 @@ mod host_mode;
 pub(crate) mod inode;
 mod metadata;
 pub mod mount_policy;
+#[cfg(target_os = "linux")]
+mod read_policy;
 mod remove_ops;
 mod special;
 #[cfg(target_os = "linux")]

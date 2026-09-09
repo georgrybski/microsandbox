@@ -560,6 +560,7 @@ pub(crate) fn do_readlink(fs: &PassthroughFs, _ctx: Context, ino: u64) -> io::Re
     #[cfg(target_os = "linux")]
     {
         let inode_fd = inode::get_inode_fd(fs, ino)?;
+        super::read_policy::check_inode_fd(fs, ino, inode_fd.raw())?;
         let st = platform::fstat(inode_fd.raw())?;
 
         // Real symlink on host — use readlinkat.

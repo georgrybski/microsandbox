@@ -2,7 +2,7 @@
 //!
 //! Custody chain: the launcher resolves credential material host-side and
 //! projects the decrypted Ed25519 seed into the typed bootstrap frame
-//! ([`BrokerSshKey`](microsandbox_protocol::bootstrap::BrokerSshKey)).
+//! ([`BrokerSshKey`]).
 //! [`BrokerKey::from_bootstrap`] moves those bytes into a parsed Ed25519
 //! keypair exactly once. The seed copy is zeroized after expansion, the
 //! parsed scalar lives in `ssh-key`'s own zeroizing buffers, and custody

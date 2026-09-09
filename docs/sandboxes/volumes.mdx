@@ -480,17 +480,25 @@ let sb = Sandbox::builder("dev")
 
 ### Masking semantics
 
-For each guest-visible path the policy returns one of:
+For each guest-visible path the policy returns one of these decisions. On Linux, the backend refines traversal candidates using the actual host object's type without following symlinks:
 
 - **Visible** — the path is exposed normally.
-- **Masked** — the host entry is sealed: `lookup`, read-opens, `stat`, `unlink`, and renaming it out fail with `ENOENT`, the name is omitted from `readdir`, and no host mutation is possible through the masked alias. Creating over a masked *name* is allowed and tags the guest-created alias (union semantics); write-opening (`O_WRONLY`/`O_RDWR`/`O_CREAT`) a masked host file adopts and tags that host file, making the alias guest-owned. A masked directory that a later rule unmasks a descendant of becomes **traversal-only**: the directory itself is hidden but can still be traversed so the descendant can be reached.
-- **TraversalOnly** — hidden itself but traversable for unmasked descendants.
+- **Masked** — an untagged host entry is hidden: `lookup`, new read-opens, inode-only `stat`, `unlink`, and renaming it out fail with `ENOENT`, and its name is omitted from new directory listings. Authorized creation over a masked *name* tags the guest-created alias (union semantics); an authorized write-open of a masked host file adopts and tags that host file, making the alias guest-owned. Read visibility through that alias requires the tag to match the opened object's identity. A read-only mount cannot adopt a file this way.
+- **TraversalOnly** — a possible ancestor of an unmasked descendant. An actual directory remains discoverable and traversable, with its children filtered independently. A regular file, real symlink (including one pointing to a directory), or file-backed symlink is not a traversal directory: it receives the same read-admission and identity-bound tag checks as **Masked**. The path decision alone never grants a non-directory read access.
+
+For example, masking `**` and then unmasking `**/public` permits traversal through real directories to a file named `public`; it does not expose sibling files merely because the path evaluator conservatively classifies them as possible ancestors.
 
 Write admission is enforced separately from visibility: the evaluator takes the union of `writes.allow` and `writes.deny` rules ordered by scope authority (home → config → workload → mount); the last non-frozen match wins, so a later, lower-authority scope relaxes an earlier scope's rule unless that rule is terminal (`"overridable": false`), and deny rules apply before allow rules within the same scope. The default is allow. A terminal rule freezes the decision against all later matches. A matching write deny blocks creates, write-opens, attribute changes, and removals with `EACCES` even when the path is otherwise visible; on remove-class operations an untagged masked path still fails with `ENOENT`, since invisibility takes precedence there.
 
 `protect` rules are terminal masks that can never be overridden or tagged: create/open/setattr-class operations fail with `EACCES`, remove-class operations fail with `ENOENT`, and a protected entry blocks cascade removal of a masked ancestor.
 
 To preserve correctness across rename and forget races, the backend keeps a small **tag store** of pinned `O_PATH` descriptors for masked aliases. When a masked directory is removed, the backend performs a bounded **cascade removal** of masked descendants (depth-limited, fail-closed) so stale tags are evicted.
+
+### Admission and runtime upgrades
+
+Read admission is checked before exposing a child name or inode and before issuing a new read handle, inode-only metadata or existence/read/traverse access result, or symlink target. Already-issued file handles retain access to their opened object, including after unlink or replacement; handle-based reads and metadata are not live-revoked. Directory handles retain their point-in-time listing snapshots. Fresh admission still checks the current object, so an old listing cannot authorize reading a denied replacement.
+
+Policies are immutable for a mount's lifetime. Installing a new CLI does not update the filesystem backend inside an already-running runtime. Restart or recreate affected sandboxes with the updated runtime to apply enforcement fixes; this does not require a policy JSON or image-format migration. Rolling back to an older runtime also rolls back its enforcement behavior.
 
 ### Fail-closed loader
 

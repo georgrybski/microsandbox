@@ -59,6 +59,83 @@ mod snapshot_tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn floating_allow_sandbox() -> TestSandbox {
+        TestSandbox::with_config(|mut cfg| {
+            cfg.mask_policy = Some(Arc::new(program(&["**"], &["**/public"])));
+            cfg.stat_virtualization = StatVirtualization::Off;
+            cfg.readonly = true;
+            cfg.inject_init = false;
+            cfg
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn floating_allow_hides_host_regular_file() {
+        let sb = floating_allow_sandbox();
+        sb.host_create_file("public", b"public control");
+        sb.host_create_file("secret.txt", b"synthetic private bytes");
+
+        // The path-only evaluator cannot establish that this candidate is not a directory.
+        assert_eq!(
+            decide(sb.fs.mask_policy().unwrap(), "secret.txt"),
+            Decision::TraversalOnly
+        );
+        assert!(!sb.fs.tagged_visible(ROOT_INODE, b"secret.txt"));
+
+        let public = sb.lookup_root("public").unwrap();
+        let handle = sb.fuse_open(public.inode, libc::O_RDONLY as u32).unwrap();
+        assert_eq!(
+            sb.fuse_read(public.inode, handle, 4096, 0).unwrap(),
+            b"public control"
+        );
+
+        let (names, _) = names_and_offsets(&sb, ROOT_INODE);
+        assert!(names.iter().any(|name| name == b"public"));
+        let secret_listed = names.iter().any(|name| name == b"secret.txt");
+        let secret_lookup_errno = sb
+            .lookup_root("secret.txt")
+            .err()
+            .and_then(|error| error.raw_os_error());
+        assert_eq!(
+            (secret_listed, secret_lookup_errno),
+            (false, Some(LINUX_ENOENT)),
+            "a traversal candidate that is an untagged host file must be hidden from listing and lookup"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn floating_allow_preserves_directory_traversal_to_public_file() {
+        let sb = floating_allow_sandbox();
+        sb.host_create_dir("branch/deeper");
+        sb.host_create_file("branch/deeper/public", b"nested public control");
+
+        assert_eq!(
+            decide(sb.fs.mask_policy().unwrap(), "branch"),
+            Decision::TraversalOnly
+        );
+        let branch = sb.lookup_root("branch").unwrap();
+        assert_eq!(branch.attr.st_mode & libc::S_IFMT, libc::S_IFDIR);
+        let (root_names, _) = names_and_offsets(&sb, ROOT_INODE);
+        assert!(root_names.iter().any(|name| name == b"branch"));
+
+        let deeper = sb.lookup(branch.inode, "deeper").unwrap();
+        assert_eq!(deeper.attr.st_mode & libc::S_IFMT, libc::S_IFDIR);
+        let (branch_names, _) = names_and_offsets(&sb, branch.inode);
+        assert!(branch_names.iter().any(|name| name == b"deeper"));
+
+        let public = sb.lookup(deeper.inode, "public").unwrap();
+        let (deeper_names, _) = names_and_offsets(&sb, deeper.inode);
+        assert!(deeper_names.iter().any(|name| name == b"public"));
+        let handle = sb.fuse_open(public.inode, libc::O_RDONLY as u32).unwrap();
+        assert_eq!(
+            sb.fuse_read(public.inode, handle, 4096, 0).unwrap(),
+            b"nested public control"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn host_created_entries_are_filtered_at_snapshot_time() {
         let policy = Arc::new(program(&[".env"], &[]));

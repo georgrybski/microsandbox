@@ -2,7 +2,7 @@
 //!
 //! The TCP proxy dials upstream as today and relays the server banner to
 //! the guest immediately while it buffers the guest first flight. Two
-//! [`SshClassifier`](super::classifier::SshClassifier) instances (one per
+//! [`SshClassifier`] instances (one per
 //! direction, fed in arrival order) decide whether the flow is SSH; the
 //! policy decision in [`super::policy`] then routes direct, deny, or
 //! divert. Divert closes the direct upstream socket, dials the broker

@@ -43,7 +43,11 @@ pub(crate) fn do_getattr(
 
     let st = match handle {
         Some(handle) => stat_handle(fs, handle)?,
-        None => inode::stat_inode(fs, ino)?,
+        None => {
+            #[cfg(target_os = "linux")]
+            super::read_policy::check_inode(fs, ino)?;
+            inode::stat_inode(fs, ino)?
+        }
     };
     Ok((st, fs.cfg.attr_timeout))
 }
@@ -297,6 +301,12 @@ pub(crate) fn do_access(fs: &PassthroughFs, ctx: Context, ino: u64, mask: u32) -
     if fs.is_virtual_init_inode(ino) {
         // init.krun is always readable and executable.
         return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    if mask == platform::ACCESS_F_OK || mask & (platform::ACCESS_R_OK | platform::ACCESS_X_OK) != 0
+    {
+        super::read_policy::check_inode(fs, ino)?;
     }
 
     let st = inode::stat_inode(fs, ino)?;

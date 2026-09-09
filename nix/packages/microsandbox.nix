@@ -1,20 +1,19 @@
 # microsandbox — msb CLI + runtime libraries, built from THIS flake's source.
 #
-# Source provenance: `src = self` passed in from the fork flake (the flake
-# root IS the workspace root, so no sourceRoot; flake git semantics already
-# exclude untracked/ignored files such as target/ and the unpopulated
-# vendor/libkrunfw submodule contents). The fork is a 0.6.16 workspace
+# Source provenance: the fork flake supplies its filtered Rust workspace,
+# excluding local build caches and unrelated files. The fork is a 0.6.16 workspace
 # (edition 2024, resolver 3). msb is built from source via buildRustPackage
 # with the fenix-pinned toolchain for host-toolchain consistency. agentd is
 # built separately (nix/packages/agentd.nix, musl static) and assembled here.
-# libkrunfw comes from the upstream release tarball (Branch A, interim) — see
-# CONTINGENCY below.
+# libkrunfw currently comes from a fixed-hash upstream release tarball;
+# replacing it with a compatible source-built fork package is a follow-up.
 
 {
   pkgs,
   rustToolchain,
   agentd,
   src,
+  cargoLock,
 }:
 
 let
@@ -25,38 +24,18 @@ let
     inherit (rustToolchain) cargo;
   };
 
-  # -----------------------------------------------------------------------
-  # libkrunfw — CONTINGENCY
-  # -----------------------------------------------------------------------
-  # Provenance / license: the tarball fetched below is a prebuilt binary of
-  # libkrunfw, which embeds a GPL-2.0-licensed Linux kernel image plus
-  # patches. Redistributing the built package therefore carries the GPL-2.0
-  # §3 corresponding-source offer obligation. The exact corresponding source
-  # is the upstream fork repo https://github.com/superradcompany/libkrunfw
-  # (branch krunfw; at the time of writing resolving to 21cb6dce), pinned as
-  # the fork's vendor/libkrunfw submodule (recorded gitlink 21cb6dce19a615f63e41ecb913334d18560c1364).
+  # Interim firmware input: retain the v0.6.8 release's fixed-hash firmware
+  # until the fork exposes a compatible source-built package. It embeds a
+  # GPL-2.0 Linux kernel, so corresponding-source provenance must be checked
+  # before redistributing this assembled runtime.
   #
-  # Branch A (default): fetch the upstream v0.6.8 release tarball and extract
-  # ONLY libkrunfw.so* from it. Verified 2026-09-06: curl -fSL the URL below
-  # → HTTP 200 (22035553 bytes); `tar tzf` lists flat layout `msb` +
-  # `libkrunfw.so.5.6.1` (no lib/ dir — installPhase handles both); sha256 hex
-  # 992be66ce8a61965b3ac7733bce58d6a98a8292a172e85c8751074a2ad16f69d matches
-  # the SRI below; embedded kernel is Linux 6.12.98 (Fri Jul 24 13:01:52 WAT
-  # 2026). Source tag v0.6.8 (bf6e619f). If the tar 404s, Branch B becomes
-  # mandatory.
-  #
-  # Branch B (spike, NOT implemented): build libkrunfw from the fork's
-  # vendor/libkrunfw submodule (gitlink commit 21cb6dce19a615f63e41ecb913334d18560c1364, repo
-  # https://github.com/superradcompany/libkrunfw.git branch krunfw). The
-  # submodule is NOT populated locally. Building it requires kernel build
-  # deps (gcc, make, flex, bison, libelf) and produces libkrunfw.so.5.6.1.
-  # TODO: if Branch A fails, implement a libkrunfw.nix that fetchGit's the
-  # submodule repo at 21cb6dce19a615f63e41ecb913334d18560c1364 and builds via `make` (see fork justfile
-  # build-libkrunfw recipe).
+  # A source-built replacement must preserve the SDK's expected firmware ABI
+  # and be validated together with the locked msb_krun revision. This is a
+  # packaging follow-up, not merely a fallback if the release disappears.
   #
   # The fork's LIBKRUNFW_VERSION is "5.6.1" (ABI "5") — NOT 5.2.1 as in the
   # old 0.5.6 release tarball. The symlink layout must match: libkrunfw.so.5.6.1
-  # -> libkrunfw.so.5 -> libkrunfw.so.
+  # <- libkrunfw.so.5 <- libkrunfw.so.
   libkrunfwTar = pkgs.fetchurl {
     url = "https://github.com/superradcompany/microsandbox/releases/download/v0.6.8/microsandbox-linux-x86_64.tar.gz";
     sha256 = "sha256-mSvmbOimGWWzrHczvOWNapioKSoXLoXIdRB0oq0W9p0=";
@@ -68,9 +47,7 @@ rustPlatform.buildRustPackage rec {
 
   inherit src;
 
-  cargoLock = {
-    lockFile = src + "/Cargo.lock";
-  };
+  inherit cargoLock;
 
   # Build only the cli crate. Features: net + ssh (matching the fork justfile's
   # build-msb recipe exactly) via --no-default-features, which deliberately
@@ -122,28 +99,18 @@ rustPlatform.buildRustPackage rec {
   # Assemble the runtime layout the tool expects:
   #   $out/bin/msb           — from cargo target/release/msb
   #   $out/libexec/agentd    — from the agentd derivation (musl static)
-  #   $out/lib/libkrunfw.so* — from the upstream release tarball (Branch A)
+  #   $out/lib/libkrunfw.so* — from the fixed-hash upstream release tarball
   installPhase = ''
     runHook preInstall
 
     mkdir -p $out/bin $out/lib $out/libexec
 
-    # msb CLI binary. buildRustPackage may place it at target/release/msb
-    # OR target/<host-triple>/release/msb depending on whether --target is set.
-    # Find it robustly and fail loudly if missing (same pattern as agentd.nix).
-    msb_bin=$(find target -type f -name msb -path '*/release/*' ! -name '*.d' | head -n1)
-    if [ -z "$msb_bin" ]; then
-      echo "error: msb binary not found under target/*/release/" >&2
-      find target -type f -name msb >&2 || true
-      exit 1
-    fi
-    install -Dm755 "$msb_bin" $out/bin/msb
+    install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/msb $out/bin/msb
 
     # agentd (static musl — runs in the guest microVM).
     install -Dm755 ${agentd}/libexec/agentd $out/libexec/agentd
 
-    # libkrunfw: extract from the upstream release tarball (Branch A).
-    # The tar contains lib/libkrunfw.so.5.6.1 (+ possibly other libs).
+    # libkrunfw: extract only firmware from the upstream release tarball.
     tar xzf ${libkrunfwTar} -C $TMPDIR
     if [ -d "$TMPDIR/lib" ]; then
       for f in "$TMPDIR"/lib/libkrunfw.so*; do
@@ -165,10 +132,10 @@ rustPlatform.buildRustPackage rec {
 
     # Fail-closed: libkrunfw is mandatory for the microVM runtime. If the
     # release tarball didn't contain it (wrong version, missing lib/, or the
-    # tar 404'd and Branch B is needed), abort loudly rather than shipping a
+    # archive layout changed), abort loudly rather than shipping a
     # broken msb with no KVM firmware.
     if ! ls $out/lib/libkrunfw.so* >/dev/null 2>&1; then
-      echo "error: libkrunfw.so* not found in release tar — fill the hash or implement Branch B (submodule build)" >&2
+      echo "error: libkrunfw.so* not found in the pinned release archive" >&2
       exit 1
     fi
 

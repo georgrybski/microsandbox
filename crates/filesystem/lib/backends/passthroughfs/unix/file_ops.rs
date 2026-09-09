@@ -46,13 +46,18 @@ pub(crate) fn do_open(
     }
 
     #[cfg(target_os = "linux")]
-    let (masked_policy_path, write_intent) = {
+    let (masked_policy_path, write_intent, policy_inode_fd) = {
         let write_intent = open_flags_mutate(flags as i32);
         let mut masked = false;
-        if let Some(policy) = fs.mask_policy()
-            && let Some(path) = inode::lexical_inode_path(fs, inode)
-            && let Ok(path) = super::mount_policy::LexicalPath::new(&path)
-        {
+        let mut policy_inode_fd = None;
+        if let Some(policy) = fs.mask_policy() {
+            // Pin the exact object before type/tag admission. The same fd is
+            // reopened below, so a replacement cannot be truncated first and
+            // rejected only afterward.
+            let fd = inode::get_inode_fd(fs, inode)?;
+            let path = inode::lexical_inode_path(fs, inode).ok_or_else(platform::enoent)?;
+            let path =
+                super::mount_policy::LexicalPath::new(&path).map_err(|_| platform::enoent())?;
             if policy.is_protected(&path) {
                 return Err(platform::eacces());
             }
@@ -65,17 +70,24 @@ pub(crate) fn do_open(
             {
                 return Err(platform::eacces());
             }
-            if matches!(
-                policy.decide(&path).decision,
-                super::mount_policy::Decision::Masked
-            ) {
-                masked = true;
-                if !write_intent && !fs.tagged_visible_for_inode(inode) {
+            let st = platform::fstat(fd.raw())?;
+            masked = super::read_policy::is_masked(policy.decide(&path).decision, st.st_mode);
+            if masked {
+                let alias = inode::current_anchor_alias_for_policy(fs, inode)
+                    .ok_or_else(platform::enoent)?;
+                let tagged = super::read_policy::tag_matches(
+                    fs,
+                    alias.parent,
+                    &alias.name,
+                    inode::linux_alt_key_from_fd(fd.raw())?,
+                )?;
+                if !write_intent && !tagged {
                     return Err(platform::enoent());
                 }
             }
+            policy_inode_fd = Some(fd);
         }
-        (masked, write_intent)
+        (masked, write_intent, policy_inode_fd)
     };
 
     #[cfg(target_os = "macos")]
@@ -103,50 +115,18 @@ pub(crate) fn do_open(
         open_flags &= !libc::O_APPEND;
     }
 
-    // open_inode_fd adds O_CLOEXEC itself and rejects real host symlinks.
+    #[cfg(target_os = "linux")]
+    let fd = match policy_inode_fd {
+        Some(ref pinned) => inode::reopen_inode_fd(fs, pinned.raw(), open_flags)?,
+        None => inode::open_inode_fd(fs, inode, open_flags)?,
+    };
+
+    #[cfg(target_os = "macos")]
     let fd = inode::open_inode_fd(fs, inode, open_flags)?;
 
-    #[cfg(target_os = "linux")]
-    if masked_policy_path {
-        if inode::lexical_inode_path(fs, inode).is_none() {
-            // SAFETY: `fd` is a valid fd returned by `open_inode_fd`; the lexical path
-            // disappeared, so it is closed here and not referenced again.
-            unsafe { libc::close(fd) };
-            return Err(platform::enoent());
-        }
-        let stored = fs.tags().and_then(|tags| {
-            inode::current_anchor_alias_for_policy(fs, inode)
-                .and_then(|alias| tags.get_identity(alias.parent, &alias.name))
-        });
-        if stored.is_none() && !write_intent {
-            // SAFETY: `fd` is a valid fd returned by `open_inode_fd`; no stored identity
-            // exists for this read-only alias, so it is closed and not used again.
-            unsafe { libc::close(fd) };
-            return Err(platform::enoent());
-        }
-        if let Some(stored) = stored {
-            let actual = match inode::linux_alt_key_from_fd(fd) {
-                Ok(actual) => actual,
-                Err(err) => {
-                    // SAFETY: `fd` is a valid fd returned by `open_inode_fd`; identity lookup
-                    // failed, so it is closed here and not referenced again.
-                    unsafe { libc::close(fd) };
-                    return Err(err);
-                }
-            };
-            if actual != stored {
-                if let Some(alias) = inode::current_anchor_alias_for_policy(fs, inode)
-                    && let Some(tags) = fs.tags()
-                {
-                    tags.evict(alias.parent, &alias.name);
-                }
-                // SAFETY: `fd` is a valid fd returned by `open_inode_fd`; the identity
-                // mismatch evicted the alias, so it is closed and not used again.
-                unsafe { libc::close(fd) };
-                return Err(platform::enoent());
-            }
-        }
-    }
+    // SAFETY: the reopen returned a new fd. Own it before fallible metadata
+    // handling so every failure closes it without publishing a handle.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
 
     #[cfg(target_os = "linux")]
     if masked_policy_path && write_intent {
@@ -169,10 +149,6 @@ pub(crate) fn do_open(
             let _ = host_strip_priv_bits(fd);
         }
     }
-
-    // SAFETY: `fd` is a valid fd from `open_inode_fd`; `from_raw_fd` takes ownership so
-    // `File` closes it on drop, and `fd` is not referenced again.
-    let file = unsafe { std::fs::File::from_raw_fd(fd) };
 
     let handle = fs.next_handle.fetch_add(1, Ordering::Relaxed);
     let data = Arc::new(HandleData {
