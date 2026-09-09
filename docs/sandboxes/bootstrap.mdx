@@ -405,6 +405,29 @@ msb run ghcr.io/superradcompany/debian-systemd:12 \
 ```
 </CodeGroup>
 
+### Volatile runtime directories
+
+Before user mounts or runtime files are written, agentd prepares `/run` in
+the final guest root, after any block-root pivot. If no mount exists at or
+below `/run`, it mounts a new tmpfs with mode0755, `nodev` and `nosuid`.
+It does not add `noexec`. Image or overlay contents previously under that
+unmounted directory are hidden, not deleted: `/run` is runtime state, not
+persistent application storage.
+
+Existing mounts at `/run` or beneath it are preserved without changing their
+filesystem, flags or permissions. Explicit user mounts are then applied in
+their existing parent-before-child order, so an explicit `/run` mount and
+its children retain their requested settings. A profile requiring tmpfs
+must independently reject any preserved or explicit non-tmpfs `/run`.
+Agentd creates `/run/microsandbox` after these user mounts for its runtime files.
+
+A symlink or non-directory `/run`, unreadable or malformed mount metadata,
+or a failed default mount causes a clear bootstrap error; agentd does not
+guess a replacement or follow an image symlink. This can refuse older images
+that used a symlink at `/run`. The new behavior applies when booting the new
+agentd, not retroactively to already-running guests. No image format or
+persisted configuration migration is performed.
+
 ### Shutdown after handoff
 
 When PID 1 is systemd, agentd resolves `/proc/1/exe` and uses `bin/systemctl`
