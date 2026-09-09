@@ -111,7 +111,9 @@
             inherit (rustToolchain) rustc;
           };
 
-          cargoLock = import ./nix/cargo-lock.nix { inherit src; };
+          # Evaluation reads metadata from the already-fetched flake input;
+          # the filtered compilation source need not exist in the store yet.
+          cargoLock = import ./nix/cargo-lock.nix { lockFile = ./Cargo.lock; };
 
           agentd = pkgs.callPackage ./nix/packages/agentd.nix { inherit src cargoLock; };
           msb = pkgs.callPackage ./nix/packages/microsandbox.nix {

@@ -108,6 +108,11 @@ export. The public package names remain `agentd`,
 Consumers should obtain SDK paths from the same flake input that supplies
 these packages.
 
+Evaluation reads `Cargo.lock` directly from the immutable flake input, separately
+from the filtered Rust compilation source. This lets read-only derivation
+queries work before the filtered source has been copied into the store; the
+dependency versions and fixed-output hashes are unchanged.
+
 ### Workspace test requirements
 
 `checks.unit` runs the full workspace with the existing upstream KVM ignore
