@@ -187,8 +187,8 @@ pub fn classify_ssh_bytes(data: &[u8]) -> SshClassification {
 ///
 /// Holds the peek only while the whole buffer is still
 /// [`SshClassification::NeedMoreData`] and the bytes after the last `\n`
-/// stay banner-compatible: either a strict prefix of [`SSH_20_PREFIX`] or
-/// [`SSH_199_PREFIX`] (for example `SSH-2.0-O` split across TCP segments)
+/// stay banner-compatible: either a strict prefix of `SSH_20_PREFIX` or
+/// `SSH_199_PREFIX` (for example `SSH-2.0-O` split across TCP segments)
 /// or one of those prefixes followed by printable banner bytes (a banner
 /// split past the prefix). A completed first line, binary bytes, or a
 /// diverged prefix (`SSH-foo`) fall through immediately. The proxy uses

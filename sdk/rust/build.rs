@@ -1,5 +1,9 @@
-//! Build script — downloads prebuilt msb + libkrunfw to `$MSB_HOME` (or
-//! `~/.microsandbox/`) under `{bin,lib}/`.
+//! Build script — validates an explicit read-only `MSB_BUILD_RUNTIME`, or
+//! installs prebuilt msb + libkrunfw under `$MSB_HOME` (or `~/.microsandbox/`).
+
+#[cfg(feature = "prebuilt")]
+#[path = "build_support/runtime.rs"]
+mod build_runtime;
 
 #[cfg(all(feature = "prebuilt", not(windows)))]
 use std::fs;
@@ -27,6 +31,20 @@ use microsandbox_utils::{
 fn main() {
     #[cfg(feature = "prebuilt")]
     {
+        println!("cargo:rerun-if-env-changed=MSB_BUILD_RUNTIME");
+        if let Some(runtime) = build_runtime::from_override(
+            std::env::var_os("MSB_BUILD_RUNTIME"),
+            &msb_binary_filename(),
+            &libkrunfw_filename(),
+            microsandbox_utils::PREBUILT_VERSION,
+        )
+        .unwrap_or_else(|error| panic!("invalid MSB_BUILD_RUNTIME: {error}"))
+        {
+            println!("cargo:rerun-if-changed={}", runtime.msb.display());
+            println!("cargo:rerun-if-changed={}", runtime.firmware.display());
+            return;
+        }
+
         // Re-run if MSB_HOME changes - it determines where binaries are placed.
         println!("cargo:rerun-if-env-changed=MSB_HOME");
         println!("cargo:rerun-if-env-changed=HOME");

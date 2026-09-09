@@ -64,6 +64,20 @@ directory or overriding `HOME` globally — redirect the app's state dir instead
 
 ## Offline builds and checks
 
+The SDK's default `prebuilt` build script accepts `MSB_BUILD_RUNTIME` as a
+build-time-only, read-only runtime prefix. Set it to the fork's `microsandbox`
+package output, containing `bin/msb` and `lib/<platform firmware filename>`.
+The build validates both files and requires `msb --version` to match the SDK's
+prebuilt version. An explicit empty, relative, missing, or incompatible prefix
+is an error: it never falls back to downloading or installing under `MSB_HOME`.
+It does not select runtime state or change the runtime binary-resolution API.
+When unset, the existing prebuilt installation behavior remains unchanged.
+
+This separates immutable compiler inputs from an application's mutable
+`MSB_HOME`. The guest agent still uses the independent `MSB_AGENTD_PATH`
+contract. `checks.build-runtime` exercises the read-only validation with
+matching, missing, non-executable, and incompatible fixtures.
+
 `crates/filesystem/build.rs` (`build_agentd`, `prebuilt` feature) resolves the
 guest agentd in this order: `build/agentd` → `MSB_AGENTD_PATH` → cached
 `OUT_DIR` copy → GitHub release download (`agentd_download_url(PREBUILT_VERSION)`,

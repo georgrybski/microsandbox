@@ -6,13 +6,13 @@
 //! base64-decoded views and reports [`ScanReport`]s carrying pattern ids
 //! and digests — never secret content.
 //!
-//! Detection primitives ([`decode`](crate::decode) internals) are faithful
+//! Detection primitives ([`decode`] internals) are faithful
 //! ports of the HTTP secret-substitution detector's kernel
 //! (`crates/network/lib/secrets/handler.rs`: `contains_bytes`,
 //! `update_tail_buffer`, the 6x encoded-expansion bound, percent decoding,
 //! `json_unescape`, and the strictest-action reduction). The HTTP proxies
 //! keep their own framing in P0 and are not rewired onto this crate; the
-//! parity tests in [`scan`](crate::scan) pin the shared kernel so a future
+//! parity tests in [`scan`] pin the shared kernel so a future
 //! rewiring stays consistent with the detector.
 //!
 //! Custody: pattern bytes live in [`SealedBytes`] (no `Clone`, no

@@ -421,9 +421,9 @@ pub struct BrokerPattern {
     pub decoder: Decoder,
 
     /// Authored pattern bytes: the literal credential bytes for
-    /// [`Decoder::Raw`](microsandbox_scan::Decoder::Raw), standard-base64
+    /// [`Decoder::Raw`], standard-base64
     /// text decoding to them for
-    /// [`Decoder::Base64`](microsandbox_scan::Decoder::Base64). brokerd
+    /// [`Decoder::Base64`]. brokerd
     /// moves these bytes into sealed custody exactly once and never
     /// re-serializes them.
     #[serde(with = "serde_bytes")]

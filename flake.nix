@@ -140,6 +140,7 @@
             cp ${agentd}/libexec/agentd build/agentd
             touch build/agentd
             export MSB_AGENTD_PATH="${agentd}/libexec/agentd"
+            export MSB_BUILD_RUNTIME="${msb}"
             # Sandbox-safe MSB_HOME for check gates only: nix sandbox sets
             # HOME=/homeless-shelter, so resolve_home() (sdk/rust/build.rs via
             # crates/utils resolve_home()) would fail creating bin/ and lib/ dirs.
@@ -169,6 +170,20 @@
           # with workestrate's scripts/kvm-tests.sh as the reference.
 
           checks = {
+            build-runtime =
+              pkgs.runCommand "microsandbox-build-runtime-check"
+                {
+                  nativeBuildInputs = [
+                    rustToolchain.rustc
+                    pkgs.stdenv.cc
+                  ];
+                }
+                ''
+                  rustc --edition=2024 --test ${src}/sdk/rust/build_support/runtime.rs -o build-runtime-tests
+                  ./build-runtime-tests
+                  mkdir -p $out
+                '';
+
             package =
               pkgs.runCommand "microsandbox-package-check"
                 {
