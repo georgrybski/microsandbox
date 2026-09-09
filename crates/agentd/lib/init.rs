@@ -1,6 +1,6 @@
 //! PID 1 init: mount filesystems, apply tmpfs mounts, prepare runtime directories.
 
-use crate::config::{BootParams, SecurityProfile};
+use crate::config::{BlockRootSpec, BootParams, SecurityProfile};
 use crate::error::AgentdResult;
 use crate::{network, rlimit, tls};
 
@@ -32,9 +32,11 @@ pub fn init(
     rlimit::apply_baseline(&params.rlimits)?;
     linux::mount_filesystems()?;
     linux::mount_runtime()?;
-    if let Some(spec) = &params.block_root {
-        linux::mount_block_root(spec)?;
-    }
+    prepare_final_root(
+        params.block_root.as_ref(),
+        linux::mount_block_root,
+        crate::runtime_dir::prepare_run,
+    )?;
     before_user_mounts()?;
     if params.security_profile == SecurityProfile::Restricted {
         force_restricted_mount_flags(&mut params);
@@ -77,6 +79,19 @@ fn force_restricted_mount_flags(params: &mut BootParams) {
         spec.nosuid = true;
         spec.nodev = true;
     }
+}
+
+fn prepare_final_root(
+    block_root: Option<&BlockRootSpec>,
+    mount_root: impl FnOnce(&BlockRootSpec) -> AgentdResult<()>,
+    prepare_run: impl FnOnce() -> AgentdResult<()>,
+) -> AgentdResult<()> {
+    if let Some(spec) = block_root {
+        mount_root(spec)?;
+    }
+    // The block-root operation includes the pivot and remounts /proc. Do not
+    // prepare /run in the discarded bootstrap root or after user child mounts.
+    prepare_run()
 }
 
 fn ensure_scripts_profile_block(profile: &str) -> String {
@@ -985,7 +1000,7 @@ mod linux {
         Ok(())
     }
 
-    /// Creates `/run` and `/run/microsandbox` directories.
+    /// Creates `/run/microsandbox` after explicit user mounts are applied.
     ///
     /// `/run/microsandbox` is the canonical directory for agentd-owned
     /// runtime files (e.g. the post-handoff stderr log). Creating it
@@ -1079,8 +1094,92 @@ mod linux {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
     use crate::config::{DirMountSpec, DiskMountSpec, FileMountSpec, TmpfsSpec};
+
+    #[test]
+    fn test_run_preparation_follows_successful_final_root_pivot() {
+        let operations = RefCell::new(Vec::new());
+        let root = BlockRootSpec::DiskImage {
+            device: "/dev/synthetic-root".into(),
+            fstype: Some("ext4".into()),
+        };
+        prepare_final_root(
+            Some(&root),
+            |_| {
+                operations.borrow_mut().push("mount-and-pivot");
+                Ok(())
+            },
+            || {
+                operations.borrow_mut().push("prepare-run");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*operations.borrow(), ["mount-and-pivot", "prepare-run"]);
+        operations.borrow_mut().clear();
+        prepare_final_root(
+            None,
+            |_| panic!("no root pivot requested"),
+            || {
+                operations.borrow_mut().push("prepare-run");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*operations.borrow(), ["prepare-run"]);
+    }
+
+    #[test]
+    fn test_failed_root_setup_cannot_prepare_run_in_the_old_root() {
+        let root = BlockRootSpec::DiskImage {
+            device: "/dev/synthetic-root".into(),
+            fstype: None,
+        };
+        let error = prepare_final_root(
+            Some(&root),
+            |_| {
+                Err(crate::error::AgentdError::Init(
+                    "synthetic pivot failure".into(),
+                ))
+            },
+            || panic!("must not modify the bootstrap root after failure"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("synthetic pivot failure"));
+    }
+
+    #[test]
+    fn test_explicit_run_mount_settings_and_child_order_remain_authoritative() {
+        let dirs = [DirMountSpec {
+            tag: "client".into(),
+            guest_path: "/run/client".into(),
+            readonly: false,
+            noexec: false,
+            nosuid: false,
+            nodev: false,
+        }];
+        let tmpfs = [TmpfsSpec {
+            path: "/run".into(),
+            size_mib: Some(12),
+            mode: Some(0o700),
+            noexec: true,
+            nosuid: false,
+            nodev: false,
+            readonly: false,
+        }];
+        let plan = linux::planned_user_mounts_for_test(&dirs, &[], &[], &tmpfs).unwrap();
+        assert_eq!(
+            plan,
+            [("tmpfs", "/run".into()), ("dir", "/run/client".into())]
+        );
+        assert_eq!(tmpfs[0].size_mib, Some(12));
+        assert_eq!(tmpfs[0].mode, Some(0o700));
+        assert!(tmpfs[0].noexec);
+        assert!(!tmpfs[0].nosuid && !tmpfs[0].nodev);
+    }
 
     #[test]
     fn test_ensure_scripts_profile_block_appends_block() {
