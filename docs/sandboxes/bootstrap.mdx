@@ -405,6 +405,30 @@ msb run ghcr.io/superradcompany/debian-systemd:12 \
 ```
 </CodeGroup>
 
+### Shutdown after handoff
+
+When PID 1 is systemd, agentd resolves `/proc/1/exe` and uses `bin/systemctl`
+from that same installation to submit `poweroff.target` with
+`--job-mode=replace-irreversibly --no-block --no-ask-password --system`.
+Supported layouts include `/lib/systemd/systemd`, `/usr/lib/systemd/systemd`,
+and a Nix store package's `lib/systemd/systemd`. The corresponding helper must
+be an executable regular file at its canonical path. Unexpected systemd
+layouts, missing helpers, command failures, and timeouts are reported as
+errors, without falling back to signals or tearing down systemd's filesystems.
+
+This named request avoids depending on the agent's libc real-time signal
+offset: a musl sender's `SIGRTMIN+4` is not a glibc receiver's poweroff signal.
+The helper gets at most two seconds within the existing five-second handoff
+grace. Successful submission only means systemd accepted the job; it does not
+prove completed poweroff or database flush. The host retains its separate
+eight-second default handoff fallback, which may force the VM to exit.
+Shutdown validation must distinguish guest completion from that host fallback.
+
+Agentd-as-PID-1 shutdown is unchanged. Non-systemd handoffs retain their legacy
+RT-signal/SIGTERM sequence; its effect is receiver-specific and is not a
+verified graceful-shutdown contract. Already-running guests keep the agentd
+binary they booted with; upgrading the host alone does not repair them.
+
 ### Picking an image
 
 Most slim Docker base images do not include systemd or another full init. Use an image that ships the init you want, or build a small custom image that installs it.

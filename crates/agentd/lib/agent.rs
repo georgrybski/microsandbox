@@ -736,7 +736,7 @@ async fn handle_message(
             }
             state.fs.clear();
 
-            request_guest_poweroff()?;
+            request_guest_poweroff().await?;
             return Err(AgentdError::Shutdown);
         }
 
@@ -1256,7 +1256,7 @@ fn write_to_fd(fd: i32, buf: &[u8]) -> std::io::Result<usize> {
     }
 }
 
-fn request_guest_poweroff() -> AgentdResult<()> {
+async fn request_guest_poweroff() -> AgentdResult<()> {
     if crate::handoff::is_pid_1() {
         // PID 1 mode (no handoff): tear down filesystems so block-backed
         // mounts reach a clean terminal state, then power the kernel off.
@@ -1268,15 +1268,21 @@ fn request_guest_poweroff() -> AgentdResult<()> {
         return Ok(());
     }
 
+    let deadline = tokio::time::Instant::now() + HANDOFF_POWEROFF_TIMEOUT;
+    if let Some(helper) = crate::shutdown::systemd_poweroff_helper()? {
+        // The receiver's control protocol is independent of agentd's libc.
+        // Errors must not fall through to signals or filesystem teardown while
+        // systemd may still be flushing services and coordinating its mounts.
+        return crate::shutdown::poweroff_systemd(&helper, deadline).await;
+    }
+
     unsafe {
         libc::sync();
     }
 
-    // Handoff mode: ask the new init (PID 1) to shut down.
-    // SIGRTMIN+4 is systemd's poweroff signal; sysvinit-derived inits
-    // typically default-handle it as a clean exit. Either way, PID 1
-    // exiting causes the kernel to panic the guest, which the VMM
-    // observes as a clean shutdown.
+    // Preserve the legacy non-systemd handoff behavior. Its RT signal and
+    // SIGTERM semantics are receiver-specific and do not establish graceful
+    // shutdown. Systemd receivers never take this path.
     if crate::handoff::signal_init_shutdown().is_ok() {
         std::thread::sleep(HANDOFF_POWEROFF_TIMEOUT);
     }

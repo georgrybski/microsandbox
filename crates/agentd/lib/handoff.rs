@@ -310,11 +310,11 @@ pub fn is_pid_1() -> bool {
     nix::unistd::getpid().as_raw() == 1
 }
 
-/// Sends `SIGRTMIN+4` to PID 1 to request shutdown.
+/// Sends the legacy sender-relative `SIGRTMIN+4` to a non-systemd PID 1.
 ///
-/// systemd interprets this as "start poweroff.target". Other inits
-/// typically default-handle it as "exit cleanly," which causes the
-/// kernel to panic on PID 1 exit and triggers VMM shutdown.
+/// Its meaning is receiver-specific and does not establish graceful shutdown.
+/// Systemd shutdown uses its own installation's control helper instead: sender
+/// and receiver libcs can disagree on the base of the real-time signal range.
 ///
 /// `SIGRTMIN` is a function on Linux (glibc reserves the first few
 /// RT signals for libc internals), so the value is computed at
@@ -329,7 +329,7 @@ pub fn signal_init_shutdown() -> AgentdResult<()> {
     Ok(())
 }
 
-/// Sends `SIGTERM` to PID 1 as a sysvinit-friendly shutdown fallback.
+/// Sends the legacy `SIGTERM` fallback to a non-systemd PID 1.
 pub fn signal_init_term() -> AgentdResult<()> {
     let ret = unsafe { libc::kill(1, libc::SIGTERM) };
     if ret != 0 {
