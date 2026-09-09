@@ -17,6 +17,8 @@ mod test_mutation_policy;
 mod test_name_validation;
 mod test_open_after_unlink;
 mod test_quota;
+#[cfg(target_os = "linux")]
+mod test_read_admission;
 mod test_readonly;
 mod test_remove_ops;
 mod test_root_containment;

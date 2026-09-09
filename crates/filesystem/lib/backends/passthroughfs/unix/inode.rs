@@ -327,40 +327,13 @@ fn do_lookup_linux(
     let st = platform::statx_to_stat64(&stx);
     let mnt_id = stx.stx_mnt_id;
     let alt_key = InodeAltKey::new(st.st_ino, st.st_dev, mnt_id);
-    if let Some(policy) = fs.mask_policy() {
-        let path = lexical_child_path(fs, parent, name.to_bytes());
-        if let Some(path) = path
-            && let Ok(lexical) = super::mount_policy::LexicalPath::new(&path)
-            && !policy.is_protected(&lexical)
-            && matches!(
-                policy.decide(&lexical).decision,
-                super::mount_policy::Decision::Masked
-            )
-        {
-            let Some(stored) = fs
-                .tags()
-                .and_then(|tags| tags.get_identity(parent, name.to_bytes()))
-            else {
-                // SAFETY: `fd` is a valid O_PATH fd for the looked-up entry. No
-                // tag identity is recorded for this masked alias, so the
-                // lookup fails closed (ENOENT). The fd is not owned elsewhere
-                // and is not used again after close (no double-close).
-                unsafe { libc::close(fd) };
-                return Err(platform::enoent());
-            };
-            if stored != alt_key {
-                if let Some(tags) = fs.tags() {
-                    tags.evict(parent, name.to_bytes());
-                }
-                // SAFETY: `fd` is a valid O_PATH fd whose recorded tag identity
-                // no longer matches the entry's current identity (rename race);
-                // the alias is evicted and the lookup fails closed (ENOENT).
-                // The fd is not owned elsewhere and is not used again after
-                // close (no double-close).
-                unsafe { libc::close(fd) };
-                return Err(platform::enoent());
-            }
-        }
+    if let Err(err) =
+        super::read_policy::check_child(fs, parent, name.to_bytes(), st.st_mode, alt_key)
+    {
+        // SAFETY: the O_PATH fd has not been published or transferred to an
+        // owner. Failed read admission closes it before any inode is exposed.
+        unsafe { libc::close(fd) };
+        return Err(err);
     }
     let alias = NamespaceAlias::new(parent, name.to_bytes());
     let patched = crate::backends::shared::stat_override::patched_stat(
@@ -1046,18 +1019,7 @@ pub(crate) fn open_inode_fd(fs: &PassthroughFs, inode: u64, flags: i32) -> io::R
     #[cfg(target_os = "linux")]
     {
         let inode_fd = get_inode_fd(fs, inode)?;
-        let st = platform::fstat(inode_fd.raw())?;
-        if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
-            return Err(platform::eloop());
-        }
-        let mut buf = [0u8; 20];
-        let fd_str = format_fd_cstr(inode_fd.raw(), &mut buf);
-        let reopen_flags = (flags & !libc::O_NOFOLLOW) | libc::O_CLOEXEC;
-        let fd = unsafe { libc::openat(fs.proc_self_fd.as_raw_fd(), fd_str, reopen_flags) };
-        if fd < 0 {
-            return Err(platform::linux_error(io::Error::last_os_error()));
-        }
-        Ok(fd)
+        reopen_inode_fd(fs, inode_fd.raw(), flags)
     }
 
     #[cfg(target_os = "macos")]
@@ -1078,6 +1040,24 @@ pub(crate) fn open_inode_fd(fs: &PassthroughFs, inode: u64, flags: i32) -> io::R
         let path = vol_path(data.dev, data.ino);
         open_macos_inode_reopen(path.as_ptr(), flags)
     }
+}
+
+/// Reopen a pinned Linux inode after admission without resolving its name again.
+#[cfg(target_os = "linux")]
+pub(crate) fn reopen_inode_fd(fs: &PassthroughFs, inode_fd: RawFd, flags: i32) -> io::Result<i32> {
+    let st = platform::fstat(inode_fd)?;
+    if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+        return Err(platform::eloop());
+    }
+    let mut buf = [0u8; 20];
+    let fd_str = format_fd_cstr(inode_fd, &mut buf);
+    // This follows only our pinned procfd, never a real host symlink.
+    let reopen_flags = (flags & !libc::O_NOFOLLOW) | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(fs.proc_self_fd.as_raw_fd(), fd_str, reopen_flags) };
+    if fd < 0 {
+        return Err(platform::linux_error(io::Error::last_os_error()));
+    }
+    Ok(fd)
 }
 
 /// Format a file descriptor number as a null-terminated C string into a stack buffer.
