@@ -85,8 +85,9 @@ pub struct SshGatewayConfig {
     pub broker: Option<BrokerEndpoint>,
     /// Sandbox transport identifier stamped into the divert prelude.
     ///
-    /// Carried by the host-side [`SshBrokerBinding`] (derived at spawn
-    /// from the leased network slot). `0` (unspecified) only when no
+    /// Carried by the host-side [`SshBrokerBinding`] from the supervisor's
+    /// reserved guest CID, checked by the runtime against libkrun.
+    /// `0` (unspecified) only when no
     /// binding exists, in which case no divert can happen.
     pub transport_cid: u64,
 }
@@ -98,9 +99,9 @@ pub struct SshGatewayConfig {
 /// guest-visible `NetworkConfig.ssh` / `NetworkSpec.ssh` serialization.
 /// The endpoint names the broker unix socket diverted flows dial and
 /// `transport_cid` attributes the session to one sandbox transport.
-/// Spawn derives the transport identifier from the leased network slot,
-/// the per-sandbox discriminator available in this tree, and stamps it
-/// into every divert prelude alongside the wall-clock epoch.
+/// Spawn carries the supervisor's reserved CID, which the runtime assigns to
+/// libkrun and verifies before guest execution. A CID is not a launch generation;
+/// the legacy prelude's wall-clock timestamp does not provide that binding.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SshBrokerBinding {
     /// Divert target for broker-mediated SSH sessions.

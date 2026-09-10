@@ -17,11 +17,15 @@ maintained as the microVM substrate for workestrate.
 - agentd offline-build fix (staged-agentd path override for nix builds).
 - Pinned fork runtime and source-built firmware with shared Nix tooling inputs.
 - A credential-free KVM lifecycle smoke app (`nix run .#test-runtime`).
+- Host-reserved guest CIDs projected through the launcher into libkrun, with
+  explicit old-runtime refusal and no network-slot substitution for SSH.
 
-The terminating SSH broker integration is incomplete. In particular, the
-existing TCP forwarding path chooses diversion after exposing upstream bytes;
-passing its current unit tests does not establish working stock-client SSH
-custody. Treat this as an implementation gap, not an operational guarantee.
+The terminating SSH broker integration is incomplete. Configured endpoints now
+select dispatch before upstream connection/bytes; actual OpenSSH tests cover
+two-session termination, exact username matching and independent host-key
+verification. Generation-bound multi-instance authorization, managed host
+certificates and shared broker VM lifecycle still need integration. Native
+protocol tests and guest-CID tests do not establish full SSH custody acceptance.
 
 ## CI model: two contracts
 

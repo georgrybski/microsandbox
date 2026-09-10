@@ -22,6 +22,13 @@ use microsandbox_network::ResolvedNetworkConfig;
 use crate::vm::{MetricsSlotHandoff, StartupCommand};
 
 //--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// Must-understand launcher capability for assigning and checking a guest CID.
+pub const GUEST_CID_CAPABILITY: &str = "guest-cid-v1";
+
+//--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
 
@@ -149,6 +156,13 @@ pub struct LaunchConfig {
     /// Host Unix sockets exposed through virtio-vsock.
     #[serde(default)]
     pub vsock: Vec<VsockRouteSpec>,
+
+    /// CID reserved by the host supervisor for this launch, never a network slot.
+    ///
+    /// The launcher must require [`GUEST_CID_CAPABILITY`] on the runtime argv:
+    /// an older runtime must refuse, not silently discard this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_cid: Option<u32>,
 }
 
 /// Lifetime bounds for the sandbox.
@@ -214,4 +228,106 @@ pub struct FileMountConfig {
 
     /// Filename presented at the root of the synthetic virtio-fs share.
     pub filename: String,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+impl LaunchConfig {
+    /// Validate must-understand requirements before creating runtime artifacts.
+    /// This is a launch compatibility guard, not guest authentication.
+    pub fn validate_capabilities(&self, required: &[String]) -> Result<(), String> {
+        for capability in required {
+            if capability != GUEST_CID_CAPABILITY {
+                return Err(format!("unsupported launch capability: {capability}"));
+            }
+        }
+        let requires_cid = required.iter().any(|c| c == GUEST_CID_CAPABILITY);
+        if requires_cid != self.guest_cid.is_some() {
+            return Err(
+                "guest CID and guest-cid-v1 launch requirement must be supplied together".into(),
+            );
+        }
+        if let Some(cid) = self.guest_cid {
+            validate_guest_cid(cid)?;
+        }
+        #[cfg(feature = "net")]
+        validate_ssh_guest_cid(self.guest_cid, self.network.as_ref())?;
+        Ok(())
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+/// Refuse reserved vsock addresses, including the wildcard address.
+pub fn validate_guest_cid(cid: u32) -> Result<(), String> {
+    if cid < 3 || cid == u32::MAX {
+        return Err(format!("invalid guest CID {cid}: reserved vsock address"));
+    }
+    Ok(())
+}
+
+/// Require the SSH network context to name the exact CID assigned to libkrun.
+#[cfg(feature = "net")]
+pub fn validate_ssh_guest_cid(
+    cid: Option<u32>,
+    network: Option<&ResolvedNetworkConfig>,
+) -> Result<(), String> {
+    if let Some(binding) = network.and_then(ResolvedNetworkConfig::ssh_broker) {
+        let cid = cid.ok_or("SSH custody requires a host-reserved guest CID")?;
+        validate_guest_cid(cid)?;
+        if binding.transport_cid != u64::from(cid) {
+            return Err("SSH broker attribution does not match the assigned guest CID".into());
+        }
+    }
+    Ok(())
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guest_cid_requires_explicit_capability_and_valid_address() {
+        let mut launch = LaunchConfig::default();
+        let required = [GUEST_CID_CAPABILITY.to_string()];
+        assert!(launch.validate_capabilities(&[]).is_ok());
+        assert!(launch.validate_capabilities(&required).is_err());
+        assert!(
+            launch
+                .validate_capabilities(&["unknown-v2".into()])
+                .is_err()
+        );
+        for cid in [0, 1, 2, u32::MAX] {
+            launch.guest_cid = Some(cid);
+            assert!(launch.validate_capabilities(&required).is_err());
+        }
+        for cid in [3, 65_536, u32::MAX - 1] {
+            launch.guest_cid = Some(cid);
+            assert!(launch.validate_capabilities(&required).is_ok());
+            assert!(launch.validate_capabilities(&[]).is_err());
+        }
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn ssh_attribution_must_match_assigned_cid_not_a_network_slot() {
+        use microsandbox_network::ssh::{BrokerEndpoint, SshBrokerBinding};
+
+        let mut network = ResolvedNetworkConfig::default();
+        let endpoint = BrokerEndpoint::new("/run/test-broker.sock").unwrap();
+        network.set_ssh_broker(Some(SshBrokerBinding::new(endpoint, 65_536)));
+        assert!(validate_ssh_guest_cid(Some(65_536), Some(&network)).is_ok());
+        for cid in [None, Some(1), Some(3), Some(65_537), Some(u32::MAX)] {
+            assert!(validate_ssh_guest_cid(cid, Some(&network)).is_err());
+        }
+        assert!(validate_ssh_guest_cid(None, None).is_ok());
+    }
 }

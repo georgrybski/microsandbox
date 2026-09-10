@@ -167,6 +167,27 @@ inside their fresh context and report cleanup failures. The optional
 `/tmp` is intentional. `packages.x86_64-linux.runtime-smoke-image` exposes the
 same uncompressed image archive for other explicitly isolated tests.
 
+The fixture also includes a static `/bin/guest-cid` probe that reads the kernel's
+actual vsock CID. The SDK's `guest_cid` integration target creates a new isolated
+local backend, loads this archive with image pulls disabled, boots two guests,
+replaces one with a fresh reserved CID and checks that the other's CID remains
+unchanged. Networking is disabled; the configured local vsock route only enables
+the device. No SSH custody or generation authorization is inferred from this test.
+
+Run it against the matching built runtime with `MSB_PATH` set to its absolute
+`bin/msb`, `MSB_LIBKRUNFW_PATH` set to that package's `lib/libkrunfw.so`,
+`MSB_TEST_IMAGE_ARCHIVE` set to the built smoke archive, and
+`MSB_CONFIG_PATH` set to an absolute nonexistent test path (the test refuses an
+existing configuration):
+
+```sh
+cargo test --locked --offline -p microsandbox --test guest_cid -- --ignored --nocapture
+```
+
+The test preserves its fresh artifact directory and cleans up only its two
+named guests. A successful guest-CID test does not validate host-global CID
+reservation; that remains the embedding supervisor's responsibility.
+
 ## Devshell state isolation (proposal; queued)
 
 Devshell experimentation should never write the user's real

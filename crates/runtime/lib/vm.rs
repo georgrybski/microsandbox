@@ -372,6 +372,9 @@ pub struct VmConfig {
     /// Host Unix sockets exposed through virtio-vsock.
     pub vsock: Vec<microsandbox_types::VsockRouteSpec>,
 
+    /// Guest CID reserved by the host supervisor, checked against libkrun.
+    pub guest_cid: Option<u32>,
+
     /// Pre-built filesystem backends as `(tag, backend)` pairs.
     #[cfg(unix)]
     pub backends: Vec<(String, Box<dyn DynFileSystem + Send + Sync>)>,
@@ -491,6 +494,7 @@ impl std::fmt::Debug for VmConfig {
             .field("rootfs_disk_readonly", &self.rootfs_disk_readonly)
             .field("mounts", &self.mounts)
             .field("disks", &self.disks);
+        debug.field("guest_cid", &self.guest_cid);
         #[cfg(unix)]
         debug.field("backends", &format!("[{} backend(s)]", self.backends.len()));
         debug
@@ -1785,6 +1789,17 @@ fn build_vm(
     let mut network_metrics_handle = None;
     let mut network_secrets_handle = None;
 
+    // A transport identity is assigned to this VM, not derived from its IP
+    // allocation slot. The supervisor owns cross-process reservation.
+    let expected_guest_cid = vm.guest_cid;
+    if let Some(cid) = expected_guest_cid {
+        crate::launch::validate_guest_cid(cid).map_err(RuntimeError::Custom)?;
+        builder = builder.vsock(|vsock| vsock.guest_cid(cid));
+    }
+    #[cfg(feature = "net")]
+    crate::launch::validate_ssh_guest_cid(expected_guest_cid, Some(&vm.network))
+        .map_err(RuntimeError::Custom)?;
+
     // Vsock routes are independent of virtio-net. Microsandbox owns the host
     // local IPC endpoints while libkrun retains framing, queues and credits.
     #[cfg(unix)]
@@ -1975,6 +1990,15 @@ fn build_vm(
     let vm = builder
         .build()
         .map_err(|e| RuntimeError::Custom(format!("build VM: {e}")))?;
+
+    if let Some(expected) = expected_guest_cid
+        && vm.guest_cid() != expected
+    {
+        return Err(RuntimeError::Custom(format!(
+            "libkrun guest CID mismatch: assigned {expected}, got {}",
+            vm.guest_cid()
+        )));
+    }
 
     let bootstrap_frame = encode_bootstrap_frame(&bootstrap)?;
 
