@@ -139,6 +139,10 @@ pub struct SandboxConfig {
     #[serde(skip)]
     pub(crate) guest_cid: Option<u32>,
 
+    /// Per-launch host-to-guest Unix listeners owned by libkrun, never persisted.
+    #[serde(skip)]
+    pub(crate) host_vsock_listeners: Vec<microsandbox_runtime::launch::HostVsockListener>,
+
     /// Sealed SSH key material for the broker VM.
     ///
     /// Set via the sandbox builder. Host-side only: never serialized
@@ -687,6 +691,7 @@ impl Default for SandboxConfig {
             #[cfg(feature = "net")]
             ssh_broker_endpoint: None,
             guest_cid: None,
+            host_vsock_listeners: Vec::new(),
             broker_key: None,
             broker_upstream: None,
             broker_patterns: None,

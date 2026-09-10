@@ -1,4 +1,4 @@
-{ pkgs }:
+{ pkgs, vsockProbe }:
 let
   guestCid = pkgs.pkgsStatic.stdenv.mkDerivation {
     pname = "microsandbox-guest-cid-probe";
@@ -15,6 +15,7 @@ let
     mkdir -p $out/bin $out/etc $out/tmp $out/root
     cp ${pkgs.pkgsStatic.busybox}/bin/busybox $out/bin/busybox
     cp ${guestCid}/bin/guest-cid $out/bin/guest-cid
+    cp ${vsockProbe}/bin/vsock-guest-probe $out/bin/vsock-guest-probe
     for applet in sh cat uname printf sync mkdir sleep; do
       ln -s busybox $out/bin/$applet
     done

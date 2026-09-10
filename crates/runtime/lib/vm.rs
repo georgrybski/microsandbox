@@ -375,6 +375,9 @@ pub struct VmConfig {
     /// Guest CID reserved by the host supervisor, checked against libkrun.
     pub guest_cid: Option<u32>,
 
+    /// Host-owned listener paths for this launch, never durable route configuration.
+    pub host_vsock_listeners: Vec<crate::launch::HostVsockListener>,
+
     /// Pre-built filesystem backends as `(tag, backend)` pairs.
     #[cfg(unix)]
     pub backends: Vec<(String, Box<dyn DynFileSystem + Send + Sync>)>,
@@ -495,6 +498,7 @@ impl std::fmt::Debug for VmConfig {
             .field("mounts", &self.mounts)
             .field("disks", &self.disks);
         debug.field("guest_cid", &self.guest_cid);
+        debug.field("host_vsock_listeners", &self.host_vsock_listeners);
         #[cfg(unix)]
         debug.field("backends", &format!("[{} backend(s)]", self.backends.len()));
         debug
@@ -1802,6 +1806,21 @@ fn build_vm(
 
     // Vsock routes are independent of virtio-net. Microsandbox owns the host
     // local IPC endpoints while libkrun retains framing, queues and credits.
+    crate::launch::validate_host_vsock_listeners(&vm.host_vsock_listeners, &vm.vsock)
+        .map_err(RuntimeError::Custom)?;
+    #[cfg(feature = "net")]
+    if !vm.host_vsock_listeners.is_empty()
+        && vm.deployment_profile == DeploymentProfile::MultiTenant
+    {
+        return Err(RuntimeError::Custom(
+            "host vsock listeners are disabled for multi-tenant deployments".into(),
+        ));
+    }
+    #[cfg(unix)]
+    for listener in &vm.host_vsock_listeners {
+        builder =
+            builder.vsock(|vsock| vsock.unix_listen(listener.guest_port, &listener.host_socket));
+    }
     #[cfg(unix)]
     if !vm.vsock.is_empty() {
         #[cfg(feature = "net")]

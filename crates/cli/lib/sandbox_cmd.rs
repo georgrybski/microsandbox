@@ -251,6 +251,7 @@ pub fn run(args: SandboxArgs) -> ! {
         disks,
         vsock: launch.vsock,
         guest_cid: launch.guest_cid,
+        host_vsock_listeners: launch.host_vsock_listeners,
         #[cfg(unix)]
         backends: vec![],
         init_path: launch.init_path,
@@ -700,6 +701,34 @@ mod tests {
             load_launch_config(&args)
                 .unwrap_err()
                 .contains("unsupported launch capability")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn host_listener_capability_is_checked_when_loading_launch_config() {
+        use microsandbox_runtime::launch::{HOST_VSOCK_LISTEN_CAPABILITY, HostVsockListener};
+        use std::io::Write;
+        let launch = LaunchConfig {
+            host_vsock_listeners: vec![HostVsockListener {
+                host_socket: "/run/launch/service.sock".into(),
+                guest_port: 5000,
+            }],
+            ..Default::default()
+        };
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&serde_json::to_vec(&launch).unwrap())
+            .unwrap();
+        let mut args = args_with(None, Some(file.path().to_path_buf()));
+        assert!(
+            load_launch_config(&args)
+                .unwrap_err()
+                .contains("must be supplied together")
+        );
+        args.require_launch_capability = vec![HOST_VSOCK_LISTEN_CAPABILITY.into()];
+        assert_eq!(
+            load_launch_config(&args).unwrap().host_vsock_listeners[0].guest_port,
+            5000
         );
     }
 

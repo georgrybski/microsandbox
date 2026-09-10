@@ -155,6 +155,20 @@ refused. Supervisors must reserve and pass a CID before enabling custody; there
 is no compatibility fallback to slot identity. The reservation is transient,
 not serialized into the durable sandbox spec or inherited on restart.
 
+`host-vsock-listen-v1` similarly requires a nonempty transient
+`host_vsock_listeners` payload. It selects libkrun's existing host-listen
+direction; durable `VsockRouteSpec` remains guest-to-host. The SDK must supply
+fresh host-owned paths for each launch/replacement. Old runtimes reject the
+unknown requirement before interpreting the payload. Cloud, Windows and
+multi-tenant deployments refuse this host-only setting. Unix stream ports
+cannot collide across the two directions; datagram ports remain independent.
+
+The pinned libkrun binds listeners synchronously and checks ownership on
+reactivation. Normal exit retires listeners through the existing VMM exit
+observer; forced termination may leave a stale pathname, which is never unlinked
+automatically to permit another launch. Transport binding does not replace the
+guest application readiness handshake or establish original workload identity.
+
 ## 6. Database, Configuration, and Migration History
 
 The SQLite database under `MSB_HOME` is a durable protocol between releases. Host and runtime processes must also agree on WAL, busy timeout, foreign-key, synchronous, and writer settings.

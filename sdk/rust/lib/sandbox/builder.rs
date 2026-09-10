@@ -934,6 +934,27 @@ impl SandboxBuilder {
         self
     }
 
+    /// Bind a fresh host Unix socket and forward accepted streams to a guest port.
+    ///
+    /// This is host-to-guest, unlike [`Self::vsock`]. The guest service accepts
+    /// ordinary vsock streams from host CID 2. Supply an absolute, per-launch
+    /// path in a private supervisor-owned directory. Existing paths cause an
+    /// error; libkrun owns binding and cleanup. A bound transport does not prove
+    /// guest-service readiness.
+    ///
+    /// The setting is local and transient, not persisted in the task spec or
+    /// inherited on restart. Cloud backends and older runtimes refuse it.
+    #[cfg(unix)]
+    pub fn vsock_host_listen(mut self, host_path: impl AsRef<Path>, guest_port: u32) -> Self {
+        self.config
+            .host_vsock_listeners
+            .push(microsandbox_runtime::launch::HostVsockListener {
+                host_socket: host_path.as_ref().to_path_buf(),
+                guest_port,
+            });
+        self
+    }
+
     /// Expose a host Unix datagram socket on a guest-to-host vsock port.
     ///
     /// Datagram boundaries are preserved end to end. Delivery remains
@@ -1665,7 +1686,7 @@ impl SandboxBuilder {
     /// Validate the stable route key and the host resources it references.
     fn validate_vsock_routes(&self) -> MicrosandboxResult<()> {
         if self.config.spec.deployment_profile == DeploymentProfile::MultiTenant
-            && !self.config.spec.vsock.is_empty()
+            && (!self.config.spec.vsock.is_empty() || !self.config.host_vsock_listeners.is_empty())
         {
             return Err(MicrosandboxError::InvalidConfig(
                 "host vsock routes are disabled for multi-tenant deployments".into(),
@@ -1673,6 +1694,11 @@ impl SandboxBuilder {
         }
 
         let mut routes = HashSet::new();
+        microsandbox_runtime::launch::validate_host_vsock_listeners(
+            &self.config.host_vsock_listeners,
+            &self.config.spec.vsock.routes,
+        )
+        .map_err(MicrosandboxError::InvalidConfig)?;
 
         for route in &self.config.spec.vsock.routes {
             #[cfg(unix)]
@@ -2485,6 +2511,40 @@ mod tests {
             config.spec.vsock.routes[1].socket_type,
             VsockSocketType::Dgram
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_vsock_listeners_are_transient_and_validate_with_existing_routes() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .vsock_host_listen("/run/launch/in.sock", 5000)
+            .vsock_dgram("/run/events.sock", 5000)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(config.host_vsock_listeners.len(), 1);
+        let json = serde_json::to_value(&config).unwrap();
+        assert!(json.get("host_vsock_listeners").is_none());
+        assert!(!json.to_string().contains("/run/launch/in.sock"));
+        let restored: super::super::SandboxConfig = serde_json::from_value(json).unwrap();
+        assert!(restored.host_vsock_listeners.is_empty());
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .vsock_host_listen("/run/launch/in.sock", 5000)
+            .vsock("/run/out.sock", 5000)
+            .build()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("duplicate vsock stream port"));
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .deployment_profile(DeploymentProfile::MultiTenant)
+            .vsock_host_listen("/run/launch/in.sock", 5000)
+            .build()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("multi-tenant"));
     }
 
     #[cfg(unix)]

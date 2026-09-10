@@ -125,7 +125,10 @@
 
           agentd = pkgs.callPackage ./nix/packages/agentd.nix { inherit src cargoLock version; };
           libkrunfw = inputs.libkrunfw.packages.${system}.default;
-          runtimeSmokeImage = pkgs.callPackage ./nix/packages/runtime-smoke-image.nix { };
+          vsockProbe = pkgs.callPackage ./nix/packages/guest-vsock-probe.nix {
+            inherit src cargoLock version;
+          };
+          runtimeSmokeImage = pkgs.callPackage ./nix/packages/runtime-smoke-image.nix { inherit vsockProbe; };
           msb = pkgs.callPackage ./nix/packages/microsandbox.nix {
             inherit
               src
