@@ -16,16 +16,29 @@ Rule: state flows down (1 → 2 → 3) only. Build/check state must NEVER touch
 
 ### Layer 1 — build inputs (pure)
 
-Flake inputs are pinned via `flake.lock`; Cargo Git sources and release
-archives also have fixed-output hashes in the package definitions:
+Flake inputs are pinned via `flake.lock`; Cargo Git sources also have
+fixed-output hashes in the package definitions:
 
 | Input | Derivation | Pin |
 |-------|------------|-----|
 | `agentd` | `nix/packages/agentd.nix` — musl static via `pkgsStatic`, built from the filtered Rust workspace source | flake rev |
-| Cargo dependencies | `nix/cargo-lock.nix` — shared by both packages and Cargo checks; one Git hash covers every crate in the locked libkrun checkout | `Cargo.lock` and `outputHashes` |
-| `libkrunfw` (current interim input) | `nix/packages/microsandbox.nix` — `fetchurl` + `sha256` of the upstream v0.6.8 release tarball, `libkrunfw.so*` only | SRI hash in-tree |
-| `libkrunfw` (source-built follow-up) | A fork-owned package, validated against the locked Rust runtime and firmware ABI before adoption | compatible immutable source revision |
+| Cargo dependencies | `nix/cargo-lock.nix` — shared by both packages and Cargo checks; fixed-output hashes cover the locked libkrun and rust-vmm checkouts, including their pinned submodules | `Cargo.lock` and `outputHashes` |
+| `libkrunfw` | The fork's source-built `libkrunfw` flake input; its tooling, nixpkgs and flake-parts follow this flake's shared inputs | immutable revision in `flake.lock` |
 | toolchain | fenix `stable` via the shared nix-tooling pin (`flake.nix:9-18,75`) | `flake.lock` |
+
+The runtime package links its firmware filenames to the source-built output,
+keeping the kernel in one store path. `packages.x86_64-linux.microsandbox.libkrunfw`
+exposes that exact firmware derivation to consumers. There is no release-archive
+fallback. Package checks verify the firmware's exported kernel entry point;
+boot, restart and shutdown require separate runtime tests on a KVM-capable host.
+
+Cargo applies `[patch.crates-io]` only from the consuming workspace root. This
+workspace therefore pins `msb-vm-memory` to the same rust-vmm revision as
+libkrun, so the runtime and image backend use the same memory types. Applications
+consuming this SDK from another workspace must also apply that root patch and
+lock it consistently; the patch is not inherited from this dependency. The
+standalone Ruby extension has its own Cargo workspace and dependency pins and
+is not covered by the Linux runtime package checks.
 
 ### Layer 2 — build/check state (ephemeral)
 
@@ -129,6 +142,30 @@ On such builders this gate fails at the filesystem capability probe and the
 complete suite needs a separately isolated host test environment. Changing
 the runtime's strict behavior or automatically disabling the syscall filter
 is not part of the package build.
+
+### Runtime acceptance on Linux
+
+`nix run .#test-runtime` requires readable/writable `/dev/kvm` and a host
+filesystem supporting the runtime's extended attributes. Unlike pure package
+checks, this explicitly boots a real microVM outside the Nix build sandbox.
+Missing KVM fails the test rather than reporting a skipped pass.
+
+The app builds a small credential-free OCI fixture using the same nixpkgs pin,
+loads it locally, and allocates a new temporary HOME/XDG/MSB context. It neither
+uses existing sandboxes nor inherits registry credentials. Guest networking is
+default-denied. The suite checks the packaged firmware's exact kernel release,
+agent readiness, command output/error/exit status, persistent root-disk data
+across a cold stop/start and guest shutdown before the host-exit fallback. It
+does not establish saved-memory restore, systemd/NixOS support, nested
+virtualization or SSH custody.
+
+Each run prints an artifact directory containing command output, runtime
+shutdown logs and a JSON result. Successful runs remove their disposable
+sandbox; artifacts remain for inspection. Failed runs attempt force-stop only
+inside their fresh context and report cleanup failures. The optional
+`--scratch-parent` must stay short enough for Unix socket paths; the default
+`/tmp` is intentional. `packages.x86_64-linux.runtime-smoke-image` exposes the
+same uncompressed image archive for other explicitly isolated tests.
 
 ## Devshell state isolation (proposal; queued)
 

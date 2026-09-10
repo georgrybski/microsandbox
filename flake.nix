@@ -17,6 +17,13 @@
     treefmt-nix.follows = "tooling/treefmt-nix";
     git-hooks.follows = "tooling/git-hooks";
 
+    libkrunfw = {
+      url = "github:rybskiworks/libkrunfw/3017d504988971bd84dcc5935c96aa4a81227d1e";
+      inputs.tooling.follows = "tooling";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.flake-parts.follows = "flake-parts";
+    };
+
     # Inputs for devenv's default container outputs. Not used directly by the
     # packages; these can be removed if the unused container outputs are disabled.
     nix2container = {
@@ -117,6 +124,8 @@
           version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
           agentd = pkgs.callPackage ./nix/packages/agentd.nix { inherit src cargoLock version; };
+          libkrunfw = inputs.libkrunfw.packages.${system}.default;
+          runtimeSmokeImage = pkgs.callPackage ./nix/packages/runtime-smoke-image.nix { };
           msb = pkgs.callPackage ./nix/packages/microsandbox.nix {
             inherit
               src
@@ -124,6 +133,7 @@
               agentd
               cargoLock
               version
+              libkrunfw
               ;
           };
 
@@ -163,15 +173,28 @@
 
           packages = {
             inherit agentd msb;
+            runtime-smoke-image = runtimeSmokeImage;
             # workestrate consumes `packages.${system}.microsandbox`.
             microsandbox = msb;
             default = msb;
           };
 
-          # TODO(apps): test-kvm / test-nested-virt runner apps are deferred —
-          # they need /dev/kvm and a nested-virt-capable host, so they are not
-          # meaningfully wrappable as flake apps in this container. Revisit
-          # with workestrate's scripts/kvm-tests.sh as the reference.
+          # KVM acceptance runs outside the Nix build sandbox, with its own
+          # disposable state. It never becomes an implicitly skipped check.
+          apps.test-runtime = {
+            type = "app";
+            program = "${
+              pkgs.writeShellApplication {
+                name = "msb-test-runtime";
+                runtimeInputs = [ pkgs.python3 ];
+                text = ''
+                  exec python3 ${./scripts/smoke/cli/runtime-firmware.py} \
+                    --msb ${msb}/bin/msb --image ${runtimeSmokeImage} \
+                    --kernel-release ${libkrunfw}/share/libkrunfw/kernel.release "$@"
+                '';
+              }
+            }/bin/msb-test-runtime";
+          };
 
           checks = {
             build-runtime =
