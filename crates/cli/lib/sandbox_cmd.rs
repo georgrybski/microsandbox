@@ -93,6 +93,10 @@ pub struct SandboxArgs {
     /// Path to a JSON [`LaunchConfig`] file (manual invocation / debugging).
     #[arg(long = "config-file", hide = true)]
     pub config_file: Option<PathBuf>,
+
+    /// Must-understand private launch features; old runtimes reject this flag.
+    #[arg(long, hide = true)]
+    pub require_launch_capability: Vec<String>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -246,6 +250,7 @@ pub fn run(args: SandboxArgs) -> ! {
         file_mounts: launch.file_mounts,
         disks,
         vsock: launch.vsock,
+        guest_cid: launch.guest_cid,
         #[cfg(unix)]
         backends: vec![],
         init_path: launch.init_path,
@@ -346,7 +351,10 @@ fn load_launch_config(args: &SandboxArgs) -> Result<LaunchConfig, String> {
             .map_err(|e| format!("failed to read --config-file {}: {e}", path.display()))?,
         None => return Err("missing --config-file for `msb sandbox`".to_string()),
     };
-    serde_json::from_slice(&bytes).map_err(|e| format!("invalid launch config: {e}"))
+    let launch: LaunchConfig =
+        serde_json::from_slice(&bytes).map_err(|e| format!("invalid launch config: {e}"))?;
+    launch.validate_capabilities(&args.require_launch_capability)?;
+    Ok(launch)
 }
 
 /// Read the full contents of the inherited config fd, taking ownership so it
@@ -663,7 +671,36 @@ mod tests {
             #[cfg(unix)]
             config_fd,
             config_file,
+            require_launch_capability: Vec::new(),
         }
+    }
+
+    #[test]
+    fn test_guest_cid_capability_is_checked_when_loading_launch_config() {
+        use std::io::Write;
+
+        let launch = LaunchConfig {
+            guest_cid: Some(65_536),
+            ..Default::default()
+        };
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&serde_json::to_vec(&launch).unwrap())
+            .unwrap();
+        let mut args = args_with(None, Some(file.path().to_path_buf()));
+        assert!(
+            load_launch_config(&args)
+                .unwrap_err()
+                .contains("must be supplied together")
+        );
+        args.require_launch_capability =
+            vec![microsandbox_runtime::launch::GUEST_CID_CAPABILITY.to_string()];
+        assert_eq!(load_launch_config(&args).unwrap().guest_cid, Some(65_536));
+        args.require_launch_capability.push("unknown-v2".into());
+        assert!(
+            load_launch_config(&args)
+                .unwrap_err()
+                .contains("unsupported launch capability")
+        );
     }
 
     #[test]

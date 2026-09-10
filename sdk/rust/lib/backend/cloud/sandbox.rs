@@ -472,6 +472,10 @@ fn reject_dropped_cloud_create_fields(config: &SandboxConfig) -> MicrosandboxRes
         )
     };
 
+    if config.guest_cid.is_some() {
+        return Err(unsupported("guest_cid"));
+    }
+
     if config.spec.resources.max_cpus != config.spec.resources.cpus {
         return Err(unsupported("max_cpus"));
     }
@@ -992,6 +996,13 @@ mod tests {
             .push(b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----".to_vec());
         let err = CloudCreateBody::try_from(config).unwrap_err();
         assert!(matches!(err, MicrosandboxError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn cloud_create_request_refuses_host_reserved_guest_cid() {
+        let mut config = base_cloud_config();
+        config.guest_cid = Some(65_536);
+        assert_unsupported_config_field(config, "guest_cid");
     }
 
     #[test]

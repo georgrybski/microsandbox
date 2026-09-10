@@ -752,11 +752,12 @@ impl SandboxBuilder {
     /// Set the host-side SSH broker endpoint divert-intended flows dial.
     ///
     /// Host-side only: the endpoint never enters the guest-visible
-    /// network spec. Spawn joins it with the leased-slot transport
-    /// identifier on the resolved config; without it, divert-intended
-    /// flows deny fail-closed.
+    /// network spec. Requires [`Self::guest_cid`] from a host supervisor's
+    /// reservation; missing identity fails launch instead of substituting
+    /// a network slot. Without an endpoint, divert-intended flows deny.
     ///
     /// ```ignore
+    /// .guest_cid(65_536) // Reserve this CID in the host supervisor first.
     /// .ssh_broker_endpoint("/run/msb/ssh-broker.sock")
     /// ```
     #[cfg(feature = "net")]
@@ -766,6 +767,25 @@ impl SandboxBuilder {
             Err(error) => {
                 if self.build_error.is_none() {
                     self.build_error = Some(MicrosandboxError::InvalidConfig(error.to_string()));
+                }
+            }
+        }
+        self
+    }
+
+    /// Assign a host-reserved CID to this VM's existing libkrun vsock device.
+    ///
+    /// This is local, per-launch supervisor input, not a durable workload
+    /// property or an authorization token. The supervisor must prevent reuse
+    /// across processes and bind its own instance/generation before launch.
+    /// Older runtimes refuse the required launch capability. A restored task
+    /// must receive a fresh reservation, never copy a persisted CID.
+    pub fn guest_cid(mut self, cid: u32) -> Self {
+        match microsandbox_runtime::launch::validate_guest_cid(cid) {
+            Ok(()) => self.config.guest_cid = Some(cid),
+            Err(error) => {
+                if self.build_error.is_none() {
+                    self.build_error = Some(MicrosandboxError::InvalidConfig(error));
                 }
             }
         }
@@ -1505,6 +1525,13 @@ impl SandboxBuilder {
     fn validate(&mut self) -> MicrosandboxResult<()> {
         if let Some(err) = self.build_error.take() {
             return Err(err);
+        }
+
+        #[cfg(feature = "net")]
+        if self.config.ssh_broker_endpoint.is_some() && self.config.guest_cid.is_none() {
+            return Err(MicrosandboxError::InvalidConfig(
+                "SSH custody requires a host-reserved guest CID".into(),
+            ));
         }
 
         if self.config.spec.name.is_empty() {
@@ -2706,6 +2733,7 @@ mod tests {
     async fn test_builder_sets_ssh_broker_endpoint_off_spec() {
         let config = SandboxBuilder::new("test")
             .image("alpine")
+            .guest_cid(65_536)
             .ssh_broker_endpoint("/run/msb/ssh-broker.sock")
             .build()
             .await
@@ -2726,6 +2754,42 @@ mod tests {
                 .contains("ssh-broker.sock"),
             "guest-visible spec must not name the host broker socket"
         );
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn test_builder_rejects_broker_endpoint_without_reserved_cid() {
+        let error = SandboxBuilder::new("test")
+            .image("alpine")
+            .ssh_broker_endpoint("/run/msb/ssh-broker.sock")
+            .build()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("host-reserved guest CID"));
+    }
+
+    #[tokio::test]
+    async fn test_guest_cid_is_validated_and_never_persisted() {
+        for cid in [0, 1, 2, u32::MAX] {
+            let error = SandboxBuilder::new("test")
+                .image("alpine")
+                .guest_cid(cid)
+                .build()
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("invalid guest CID"));
+        }
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .guest_cid(65_536)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(config.guest_cid, Some(65_536));
+        let json = serde_json::to_value(&config).unwrap();
+        assert!(json.get("guest_cid").is_none());
+        let restored: crate::SandboxConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.guest_cid, None);
     }
 
     #[cfg(feature = "net")]

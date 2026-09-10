@@ -281,6 +281,12 @@ pub async fn spawn_sandbox(
     mode: SpawnMode,
     lifecycle_guard: Option<microsandbox_runtime::ipc::SandboxLifecycleGuard>,
 ) -> MicrosandboxResult<(ProcessHandle, PathBuf)> {
+    #[cfg(feature = "net")]
+    if config.ssh_broker_endpoint.is_some() && config.guest_cid.is_none() {
+        return Err(MicrosandboxError::InvalidConfig(
+            "SSH custody requires a host-reserved guest CID".into(),
+        ));
+    }
     // Durable configuration stores only host-side source references. Resolve
     // them into the private runtime configuration before the sandbox process
     // is spawned.
@@ -2445,6 +2451,13 @@ fn sandbox_cli_args(
         ));
     }
 
+    if config.guest_cid.is_some() {
+        visible.push(OsString::from("--require-launch-capability"));
+        visible.push(OsString::from(
+            microsandbox_runtime::launch::GUEST_CID_CAPABILITY,
+        ));
+    }
+
     let mut launch = LaunchConfig {
         db_path: db_path.to_path_buf(),
         db_connect_timeout_secs,
@@ -2477,6 +2490,7 @@ fn sandbox_cli_args(
             idle_timeout_secs: config.spec.lifecycle.idle_timeout_secs,
         },
         vsock: config.spec.vsock.routes.clone(),
+        guest_cid: config.guest_cid,
         #[cfg(feature = "net")]
         deployment_profile: config.spec.deployment_profile,
         bootstrap: GuestBootstrap {
@@ -2782,17 +2796,12 @@ fn sandbox_cli_args(
     // Network configuration travels as a typed value inside the JSON payload.
     #[cfg(feature = "net")]
     {
-        // Host-side SSH broker binding: the endpoint arrives as
-        // builder-only input on the sandbox config (never in the
-        // guest-visible spec). The transport identifier is the leased
-        // network slot for this launch, the per-sandbox discriminator
-        // available in this tree; the libkrun guest CID is a constant
-        // across sandboxes and is not reachable before VM build.
-        if let Some(endpoint) = config.ssh_broker_endpoint.clone() {
-            resolved_network.set_ssh_broker(Some(SshBrokerBinding::new(
-                endpoint,
-                u64::from(network_slot.get()),
-            )));
+        // Builder/spawn validation requires the supervisor's reservation.
+        // The runtime assigns this same CID to libkrun and checks the getter
+        // before guest execution; network slots only select IP/MAC addresses.
+        if let (Some(endpoint), Some(cid)) = (config.ssh_broker_endpoint.clone(), config.guest_cid)
+        {
+            resolved_network.set_ssh_broker(Some(SshBrokerBinding::new(endpoint, u64::from(cid))));
         }
         launch.network = Some(resolved_network);
         launch.sandbox_slot = network_slot.get();
@@ -2973,7 +2982,7 @@ mod tests {
     /// Return the typed launch payload generated for a sandbox configuration.
     fn render_launch(config: &SandboxConfig) -> LaunchConfig {
         let local = test_local_backend();
-        let (_, launch) = sandbox_cli_args(
+        let (visible, launch) = sandbox_cli_args(
             &local,
             config,
             42,
@@ -2994,6 +3003,12 @@ mod tests {
             None,
             None,
         );
+        let required: Vec<String> = visible
+            .windows(2)
+            .filter(|pair| pair[0] == "--require-launch-capability")
+            .map(|pair| pair[1].to_str().unwrap().to_string())
+            .collect();
+        launch.validate_capabilities(&required).unwrap();
         launch
     }
 
@@ -3326,12 +3341,13 @@ mod tests {
     }
 
     /// Builder broker input reaches the launch payload as a binding keyed
-    /// by the leased slot, while the guest-visible spec stays clean.
+    /// by the actual reserved CID, while the guest-visible spec stays clean.
     #[cfg(feature = "net")]
     #[tokio::test]
     async fn sandbox_cli_args_threads_ssh_broker_binding() {
         let config = SandboxBuilder::new("test")
             .image("/tmp/rootfs")
+            .guest_cid(65_536)
             .ssh_broker_endpoint("/run/msb/ssh-broker.sock")
             .build()
             .await
@@ -3340,7 +3356,8 @@ mod tests {
         let launch = render_launch(&config);
         let network = launch.network.as_ref().expect("network launch config");
         let binding = network.ssh_broker().expect("broker binding threaded");
-        assert_eq!(binding.transport_cid, u64::from(test_network_slot().get()));
+        assert_eq!(binding.transport_cid, 65_536);
+        assert_eq!(launch.guest_cid, Some(65_536));
         assert_eq!(
             binding.endpoint.path(),
             Path::new("/run/msb/ssh-broker.sock")

@@ -140,7 +140,20 @@ Compatibility-sensitive elements include descriptor numbers, ownership and close
 
 Sources: [`crates/runtime/lib/launch.rs`](crates/runtime/lib/launch.rs), [`crates/runtime/lib/vm.rs`](crates/runtime/lib/vm.rs), [`sdk/rust/lib/runtime/spawn.rs`](sdk/rust/lib/runtime/spawn.rs), and [`crates/cli/lib/sandbox_cmd.rs`](crates/cli/lib/sandbox_cmd.rs).
 
-This protocol has no explicit version envelope. Treat additions as optional and consider adding explicit version or capability negotiation before allowing independently versioned launchers and runtimes.
+This protocol has no explicit version envelope. Security-critical additions use
+repeatable `--require-launch-capability` argv entries. Unknown requirements fail
+before runtime state is created; runtimes predating this flag refuse it during
+argument parsing. `guest-cid-v1` requires an explicit host-reserved `guest_cid` in
+the launch payload. The runtime validates its range, assigns it to libkrun and
+checks the getter before guest execution. SSH broker attribution must equal
+that CID, never a network allocation slot. A CID alone is not instance/generation
+authorization, and these checks do not change the legacy divert wire format.
+
+Older launches without a requested CID or SSH broker binding remain supported.
+An old launcher that supplies only the former slot-based broker binding is
+refused. Supervisors must reserve and pass a CID before enabling custody; there
+is no compatibility fallback to slot identity. The reservation is transient,
+not serialized into the durable sandbox spec or inherited on restart.
 
 ## 6. Database, Configuration, and Migration History
 

@@ -21,6 +21,28 @@ let sandbox = Sandbox::builder("worker")
 
 ## SandboxBuilder
 
+### guest_cid()
+
+```rust
+fn guest_cid(self, cid: u32) -> Self
+```
+
+Assign a CID reserved by a local host supervisor to libkrun for this launch.
+The supervisor must prevent collisions across runtime processes and bind the
+CID to its own instance/generation. Values `0`, `1`, `2` and `u32::MAX` are
+reserved and rejected. The runtime checks the assigned value before guest
+execution. This does not expose new ports or change any route's bytes.
+
+This is host-side, per-launch input, not a field in `SandboxSpec` or a guest
+credential. It is not persisted or copied into a replacement/restarted task.
+Older runtimes reject the required launch capability; cloud backends reject
+the local-only setting. Other language SDKs do not expose this host embedding
+option. Normal vsock routes without an explicit CID retain automatic allocation.
+
+The Rust host-side `ssh_broker_endpoint()` setting requires this reservation;
+the network slot is never a substitute. Full SSH custody additionally requires
+instance/generation authorization and managed host trust.
+
 ### vsock()
 
 ```rust
