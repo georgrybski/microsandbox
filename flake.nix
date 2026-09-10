@@ -197,6 +197,26 @@
           };
 
           checks = {
+            # Protocol-level custody acceptance uses real OpenSSH, synthetic
+            # keys and loopback only; it does not depend on KVM or guest images.
+            ssh-termination = rustPlatform.buildRustPackage {
+              pname = "microsandbox-ssh-termination-tests";
+              inherit version src cargoLock;
+              MSB_TEST_SSH = "${pkgs.openssh}/bin/ssh";
+              buildPhase = ''
+                runHook preBuild
+                cargo test --jobs "$NIX_BUILD_CORES" --locked --offline \
+                  -p microsandbox-brokerd --lib --test divert_e2e
+                cargo test --jobs "$NIX_BUILD_CORES" --locked --offline \
+                  -p microsandbox-brokerd --test ssh_openssh -- --ignored
+                runHook postBuild
+              '';
+              installPhase = ''
+                mkdir -p $out
+              '';
+              doCheck = false;
+            };
+
             build-runtime =
               pkgs.runCommand "microsandbox-build-runtime-check"
                 {

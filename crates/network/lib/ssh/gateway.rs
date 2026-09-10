@@ -1,14 +1,11 @@
 //! SSH gateway divert plumbing: prelude framing and broker relay.
 //!
-//! The TCP proxy dials upstream as today and relays the server banner to
-//! the guest immediately while it buffers the guest first flight. Two
-//! [`SshClassifier`] instances (one per
-//! direction, fed in arrival order) decide whether the flow is SSH; the
-//! policy decision in [`super::policy`] then routes direct, deny, or
-//! divert. Divert closes the direct upstream socket, dials the broker
-//! unix socket, sends a length-prefixed CBOR prelude, and relays SSH
-//! bytes both ways. The broker reoriginates a fresh upstream dial, so the
-//! guest observes a second SSH banner after the divert.
+//! Configured SSH endpoints route to the host dispatcher before the TCP proxy
+//! opens a direct upstream connection. The dispatcher receives the framed
+//! destination prelude and the untouched guest stream, then resolves credential
+//! custody. Only that selected path may return an SSH identification string.
+//! Classifiers restrict other endpoints but cannot switch an established SSH
+//! stream to a terminating broker.
 
 use std::io;
 use std::net::SocketAddr;
@@ -283,10 +280,8 @@ pub async fn dial_broker_and_send_prelude(
 ///
 /// `initial_guest` carries the buffered guest first flight (for example
 /// the client banner) and is written to the broker before the relay
-/// loop starts. Direct-server bytes already relayed to the guest before
-/// the divert are discarded; the broker reoriginates a fresh upstream
-/// dial, so the guest observes a second SSH banner through this relay.
-/// That double banner is the visible fingerprint of a diverted session.
+/// loop starts. Call only before any direct upstream connection or server
+/// bytes: this stream must carry exactly one guest-facing SSH handshake.
 pub async fn relay_ssh_via_broker(
     broker: UnixStream,
     initial_guest: Vec<u8>,

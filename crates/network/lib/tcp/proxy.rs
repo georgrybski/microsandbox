@@ -32,7 +32,7 @@ use crate::ssh::gateway::{
     classify_ssh_directions, current_epoch_secs, dial_broker_and_send_prelude,
     relay_ssh_via_broker, ssh_flow_for_destination,
 };
-use crate::ssh::policy::decide_ssh_egress;
+use crate::ssh::policy::{SshDecision, decide_ssh_egress, decide_ssh_endpoint};
 use crate::ssh::{SshClassification, trailing_fragment_is_banner_prefix};
 use crate::tls::proxy::TlsProxy;
 use crate::tls::sni;
@@ -268,6 +268,52 @@ impl TcpProxy {
             }
         }
 
+        // Resolve once before a direct dial. The endpoint policy projects
+        // configured SSH destinations; the host dispatcher retains the full
+        // credential plan and distinguishes guest-held from broker-held keys.
+        // Neither classifier timeout nor an alternate protocol may bypass it.
+        let ssh_flow = ssh_gateway
+            .as_ref()
+            .map(|_| ssh_flow_for_destination(guest_dst, &shared, sni.as_deref()));
+        if let (Some(gateway), Some(flow)) = (ssh_gateway.as_ref(), ssh_flow.as_ref()) {
+            let egress = network_policy.evaluate_egress(guest_dst, Protocol::Tcp, &shared);
+            match decide_ssh_endpoint(flow, egress, &gateway.policy, gateway.broker.as_ref()) {
+                Some(SshDecision::Divert { endpoint }) => {
+                    let prelude =
+                        SshDivertPrelude::new(flow, gateway.transport_cid, current_epoch_secs());
+                    match dial_broker_and_send_prelude(&endpoint, &prelude).await {
+                        Ok(broker_stream) => {
+                            proxy_connect.mark_connected();
+                            return relay_ssh_via_broker(
+                                broker_stream,
+                                initial_buf,
+                                from_smoltcp,
+                                to_smoltcp,
+                                shared,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            tracing::debug!(dst = %guest_dst, %error,
+                                "SSH dispatcher unavailable; denying configured endpoint");
+                            proxy_connect.mark_policy_denied();
+                            shared.proxy_wake.wake();
+                            return Ok(());
+                        }
+                    }
+                }
+                Some(SshDecision::Deny { action }) => {
+                    if matches!(action, ViolationAction::BlockAndTerminate) {
+                        shared.trigger_termination();
+                    }
+                    proxy_connect.mark_policy_denied();
+                    shared.proxy_wake.wake();
+                    return Ok(());
+                }
+                None | Some(SshDecision::Direct) => {}
+            }
+        }
+
         // Peek for HTTP CONNECT before dialing upstream; hand off if detected.
         if let Some(tls_state) = tls_state.clone() {
             if initial_buf.is_empty() {
@@ -314,7 +360,7 @@ impl TcpProxy {
         let want_headers = enforce_http_authority
             || secrets.has_plain_http_candidates()
             || secrets.has_host_scoped_secrets();
-        let (mut initial_buf, server_sample, is_tls) =
+        let (initial_buf, server_sample, is_tls) =
             if want_headers || !secrets.secrets.is_empty() || ssh_gateway.is_some() {
                 classify_first_flight(
                     initial_buf,
@@ -332,18 +378,17 @@ impl TcpProxy {
                 (initial_buf, Vec::new(), false)
             };
 
-        // SSH gateway decision on both directions' bytes. The direct
-        // upstream socket is already open and the server banner already
-        // relayed; classification never withholds the banner. The peek
+        // Remaining, non-dispatched endpoints may be restricted by SSH
+        // classification. A direct connection must never switch SSH peers
+        // here: configured endpoint dispatch happened before the dial. The peek
         // above ran under `PEEK_BUDGET`, which intentionally matches
         // `SSH_CLASSIFY_TIMEOUT` so SSH gating adds no extra worst-case
         // latency beyond the current first-flight peek.
-        if let Some(gateway) = ssh_gateway.clone() {
+        if let (Some(gateway), Some(flow)) = (ssh_gateway, ssh_flow) {
             debug_assert_eq!(
                 PEEK_BUDGET, SSH_CLASSIFY_TIMEOUT,
                 "SSH classify window must match the first-flight peek budget"
             );
-            let flow = ssh_flow_for_destination(guest_dst, &shared, sni.as_deref());
             let egress = network_policy.evaluate_egress(guest_dst, Protocol::Tcp, &shared);
             let classification = classify_ssh_directions(&initial_buf, &server_sample);
             if classification == SshClassification::NeedMoreData {
@@ -383,43 +428,16 @@ impl TcpProxy {
                     shared.proxy_wake.wake();
                     return Ok(());
                 }
-                crate::ssh::policy::SshDecision::Divert { endpoint } => {
-                    // Close the direct upstream socket and discard buffered
-                    // direct-server bytes; the broker reoriginates a fresh
-                    // upstream dial. The guest already saw the direct banner,
-                    // so it observes a second banner through the broker relay:
-                    // that double banner is the visible fingerprint of a
-                    // diverted session.
+                crate::ssh::policy::SshDecision::Divert { .. } => {
+                    // Endpoint and policy were frozen before the direct dial;
+                    // a late divert indicates an inconsistent routing path.
+                    // Refuse instead of splicing a new SSH handshake into it.
+                    tracing::error!(dst = %guest_dst, "refusing late SSH dispatcher handoff");
                     drop(server_rx);
                     drop(server_tx);
-                    let prelude =
-                        SshDivertPrelude::new(&flow, gateway.transport_cid, current_epoch_secs());
-                    match dial_broker_and_send_prelude(&endpoint, &prelude).await {
-                        Ok(broker_stream) => {
-                            proxy_connect.mark_connected();
-                            return relay_ssh_via_broker(
-                                broker_stream,
-                                std::mem::take(&mut initial_buf),
-                                from_smoltcp,
-                                to_smoltcp,
-                                shared,
-                            )
-                            .await;
-                        }
-                        Err(error) => {
-                            // Divert-intended without a reachable broker
-                            // denies fail-closed; falling back to direct
-                            // would silently bypass broker authentication.
-                            tracing::debug!(
-                                dst = %guest_dst,
-                                %error,
-                                "ssh broker dial failed; denying divert-intended flow",
-                            );
-                            proxy_connect.mark_policy_denied();
-                            shared.proxy_wake.wake();
-                            return Ok(());
-                        }
-                    }
+                    proxy_connect.mark_policy_denied();
+                    shared.proxy_wake.wake();
+                    return Ok(());
                 }
             }
         }
@@ -2657,11 +2675,11 @@ mod tests {
 
     #[tokio::test]
     async fn ssh_chunk_split_banner_diverts_through_proxy() {
-        // Direct upstream SSH server: the guest must see its banner first —
-        // classification never withholds the banner — even though the flow
-        // diverts away afterwards.
-        let (upstream_addr, upstream_task) =
-            spawn_ssh_server(b"SSH-2.0-Upstream_1.0\r\n".to_vec()).await;
+        // Keep the direct destination open as a sentinel: routing must not
+        // contact it at all, even before sending any guest protocol bytes.
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
 
         // Broker double: asserts the u32-BE + CBOR prelude framing, then
         // behaves as the reoriginated SSH server behind the divert.
@@ -2697,11 +2715,9 @@ mod tests {
             Some(BrokerEndpoint::new(&broker_path).unwrap()),
         );
 
-        // Client banner split across two segments, as TCP may deliver it.
-        // The banner-gated peek must settle instead of falling through on
-        // the first chunk. The second chunk is sent only after the direct
-        // banner arrives, so the double-banner fingerprint is deterministic:
-        // the peek provably relayed the banner before the divert.
+        // The selected dispatcher must send its banner before the guest
+        // supplies any bytes. The later fragmented client banner is forwarded
+        // intact; it cannot influence the already selected route.
         let (from_tx, from_rx) = mpsc::channel::<Bytes>(32);
         let (to_tx, mut to_rx) = mpsc::channel::<Bytes>(32);
         let proxy_connect = Arc::new(ProxyConnectState::new());
@@ -2723,35 +2739,38 @@ mod tests {
             .try_run(),
         );
 
+        let first_banner = tokio::time::timeout(Duration::from_secs(5), to_rx.recv())
+            .await
+            .expect("dispatcher must not wait for a client banner")
+            .expect("guest channel must stay open");
+        assert_eq!(
+            first_banner.as_ref(),
+            b"SSH-2.0-Broker_1.0\r\n",
+            "only the selected SSH peer may send a banner"
+        );
         from_tx
             .send(Bytes::from_static(b"SSH-2.0-O"))
             .await
             .unwrap();
-        let direct_banner = tokio::time::timeout(Duration::from_secs(5), to_rx.recv())
-            .await
-            .expect("direct banner must arrive during the peek")
-            .expect("guest channel must stay open");
-        assert_eq!(
-            direct_banner.as_ref(),
-            b"SSH-2.0-Upstream_1.0\r\n",
-            "classification must never withhold the banner"
-        );
         from_tx
             .send(Bytes::from_static(b"penSSH_9.6\r\n"))
             .await
             .unwrap();
         drop(from_tx);
-        proxy_task.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), proxy_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
 
         assert_eq!(proxy_connect.status(), ProxyConnectStatus::Connected);
-        let mut guest_bytes = direct_banner.to_vec();
+        let mut guest_bytes = first_banner.to_vec();
         while let Ok(data) = to_rx.try_recv() {
             guest_bytes.extend_from_slice(&data);
         }
-        let guest_text = String::from_utf8_lossy(&guest_bytes).into_owned();
-        assert!(
-            guest_text.contains("SSH-2.0-Broker_1.0"),
-            "guest must observe the broker banner after the divert (double-banner fingerprint), got: {guest_text:?}"
+        assert_eq!(
+            guest_bytes, b"SSH-2.0-Broker_1.0\r\n",
+            "exactly one SSH banner"
         );
 
         let (prelude, ssh_bytes) = broker_task.await.unwrap();
@@ -2764,11 +2783,10 @@ mod tests {
             "buffered client banner must be forwarded to the broker verbatim"
         );
 
-        // The diverted-away direct upstream socket closes without replay:
-        // the buffered first flight went to the broker, not upstream.
-        assert!(
-            upstream_task.await.unwrap().is_empty(),
-            "divert must not replay guest bytes to the direct upstream"
+        assert_eq!(
+            upstream.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "dispatch must not open a direct upstream connection"
         );
         let _ = std::fs::remove_file(&broker_path);
     }
@@ -2795,8 +2813,9 @@ mod tests {
 
     #[tokio::test]
     async fn ssh_divert_broker_dial_failure_denies_fail_closed() {
-        let (upstream_addr, upstream_task) =
-            spawn_ssh_server(b"SSH-2.0-Upstream_1.0\r\n".to_vec()).await;
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
 
         // Granted flow, but the broker socket does not exist: divert-intended
         // without a reachable broker denies instead of falling back to
@@ -2808,7 +2827,7 @@ mod tests {
             Some(BrokerEndpoint::new(&missing).unwrap()),
         );
 
-        let (status, _guest_bytes) =
+        let (status, guest_bytes) =
             run_ssh_proxy_once(upstream_addr, &[b"SSH-2.0-OpenSSH_9.6\r\n"], gateway).await;
 
         assert_eq!(
@@ -2817,9 +2836,44 @@ mod tests {
             "unreachable broker must deny fail-closed, never direct"
         );
         assert!(
-            upstream_task.await.unwrap().is_empty(),
-            "denied flow must close the upstream socket without replaying guest bytes"
+            guest_bytes.is_empty(),
+            "refusal must expose no upstream bytes"
         );
+        assert_eq!(
+            upstream.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "dispatcher failure must not open a direct upstream connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_configured_endpoint_cannot_bypass_dispatch_by_omitting_or_changing_banner() {
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let addr = upstream.local_addr().unwrap();
+        for bytes in [
+            b"".as_slice(),
+            b"SSH-2.0-O",
+            b"GET / HTTP/1.1\r\n\r\n",
+            b"\x00\xff",
+        ] {
+            let gateway = ssh_gateway_for(
+                SshPolicy::new(false, vec![SshGrant::exact("127.0.0.1", addr.port())]),
+                None,
+            );
+            let (status, received) = tokio::time::timeout(
+                Duration::from_secs(1),
+                run_ssh_proxy_once(addr, &[bytes], gateway),
+            )
+            .await
+            .expect("configured endpoint refusal must not wait for classification");
+            assert_eq!(status, ProxyConnectStatus::PolicyDenied);
+            assert!(received.is_empty());
+            assert_eq!(
+                upstream.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
     }
 
     /// Minimal capturing subscriber so the fall-through test can assert the

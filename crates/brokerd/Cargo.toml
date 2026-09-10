@@ -33,3 +33,6 @@ tokio = { workspace = true, features = [
     "time",
 ] }
 zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

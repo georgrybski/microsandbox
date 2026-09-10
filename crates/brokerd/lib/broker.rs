@@ -210,24 +210,15 @@ impl Broker {
                 return;
             }
         };
-        let mut egress = match VsockStream::connect(self.config.egress_port).await {
-            Ok(egress) => egress,
-            Err(e) => {
-                eprintln!(
-                    "brokerd: egress dial for {}:{} failed: {e}",
-                    prelude.dest_host, prelude.dest_port
-                );
-                return;
-            }
+        let egress_port = self.config.egress_port;
+        let destination = (prelude.dest_host.clone(), prelude.dest_port);
+        // Keep the entire dial lazy: endpoint admission is not authorization
+        // for the guest's requested SSH principal.
+        let egress = async move {
+            let mut stream = VsockStream::connect(egress_port).await?;
+            open_egress_tunnel(&mut stream, &destination.0, destination.1).await?;
+            Ok(stream)
         };
-        if let Err(e) = open_egress_tunnel(&mut egress, &prelude.dest_host, prelude.dest_port).await
-        {
-            eprintln!(
-                "brokerd: egress tunnel for {}:{} failed: {e}",
-                prelude.dest_host, prelude.dest_port
-            );
-            return;
-        }
         eprintln!(
             "brokerd: reoriginating divert to {}:{} (cid {})",
             prelude.dest_host, prelude.dest_port, prelude.transport_cid

@@ -7,11 +7,14 @@
 //! window-change) proxy transparently, while `direct-tcpip` and subsystem
 //! (SFTP) requests are refused as out of scope for this broker.
 //!
-//! Guest authentication accepts any public key: authorization already
-//! happened at the host divert decision, and the broker holds no guest
-//! credential store to check against. The security boundary is the
-//! upstream leg — sealed-key authentication plus strict pinned host-key
-//! verification with no fallback to unverified.
+//! The guest's requested SSH username must exactly match the provisioned
+//! upstream username. It is a login principal, not a workload identity:
+//! instance attribution comes from the trusted divert context, never from
+//! a guest username or public key. The broker accepts proof with any guest
+//! public key within that context; the upstream credential stays in custody.
+//! Endpoint admission alone is not complete per-instance key authorization.
+//! The upstream dial and SSH authentication start only after the username check
+//! and guest public-key proof, with pinned host-key verification and no fallback.
 //!
 //! Upstream password or keyboard-interactive authentication has no path
 //! through the broker (there is no password custody), so only upstream
@@ -24,15 +27,16 @@
 //! default and always forwards (see [`UPSTREAM_RESPONSE_ENFORCEMENT`]).
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use microsandbox_scan::{PatternLibrary, ScanReport, ScanState, Severity};
-use russh::keys::{Algorithm, PrivateKeyWithHashAlg, PublicKey, PublicKeyBase64};
+use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg, PublicKey, PublicKeyBase64};
 use russh::server::{Auth, ChannelOpenHandle, Session};
 use russh::{ChannelId, ChannelMsg, Sig};
-use tokio::sync::{Mutex, Notify, oneshot};
+use tokio::sync::{Mutex, Notify, OnceCell, oneshot};
 
 use microsandbox_protocol::bootstrap::BrokerUpstreamHost;
 
@@ -47,6 +51,9 @@ use crate::prelude::SessionIdentity;
 
 /// Time allowed for one upstream channel-request reply.
 const REPLY_TIMEOUT_SECS: u64 = 30;
+
+/// Time allowed for upstream dialing, handshake and authentication together.
+const UPSTREAM_AUTH_TIMEOUT_SECS: u64 = 30;
 
 /// Upstream-to-guest relay enforcement switch (audit-only by default).
 ///
@@ -76,8 +83,8 @@ pub struct UpstreamPin {
 
 /// Guest-facing SSH server state shared across channels of one session.
 struct RelayShared {
-    /// Authenticated upstream client connection.
-    upstream: russh::client::Handle<UpstreamVerifier>,
+    /// Published only after guest authentication and pinned upstream setup.
+    upstream: OnceCell<russh::client::Handle<UpstreamVerifier>>,
 
     /// Upstream write halves keyed by guest channel id.
     channels: Mutex<HashMap<ChannelId, Arc<UpstreamChannel>>>,
@@ -146,9 +153,15 @@ struct UpstreamChannel {
 }
 
 /// Guest-facing SSH server handler: one per diverted connection.
-struct GuestServer {
+struct GuestServer<F> {
     /// Shared relay state for this diverted connection.
     shared: Arc<RelayShared>,
+
+    /// Lazy upstream connection and credential, unused until guest proof succeeds.
+    pending_upstream: Option<(F, Arc<PrivateKey>)>,
+
+    /// Existing host-provisioned upstream identity and server pin.
+    pin: UpstreamPin,
 }
 
 /// Upstream client handler enforcing strict pinned host-key verification.
@@ -166,6 +179,12 @@ impl UpstreamPin {
     /// Login user for upstream public-key authentication.
     pub fn user(&self) -> &str {
         &self.user
+    }
+
+    /// Match the login principal without aliases, case folding or remapping.
+    /// This does not establish the originating workload's identity.
+    fn matches_user(&self, requested: &str) -> bool {
+        !requested.is_empty() && requested == self.user
     }
 }
 
@@ -199,12 +218,12 @@ impl TerminationHandle {
         }
     }
 }
-impl GuestServer {
+impl<Upstream> GuestServer<Upstream> {
     /// Run `f` against the upstream channel for `channel`, if still present.
     ///
     /// A channel that already closed resolves to `false` so the guest gets
     /// a clean failure instead of a stalled request.
-    async fn with_channel<F, Fut>(&self, channel: ChannelId, f: F) -> bool
+    async fn with_channel<F, Fut>(&mut self, channel: ChannelId, f: F) -> bool
     where
         F: FnOnce(Arc<UpstreamChannel>) -> Fut,
         Fut: Future<Output = bool>,
@@ -217,7 +236,11 @@ impl GuestServer {
 
     /// Count and audit a guest-to-upstream scan report, then return whether
     /// the chunk may forward.
-    async fn observe_request(&self, channel: ChannelId, report: &ScanReport) -> ScanEnforcement {
+    async fn observe_request(
+        &mut self,
+        channel: ChannelId,
+        report: &ScanReport,
+    ) -> ScanEnforcement {
         self.shared
             .observe(
                 channel,
@@ -232,7 +255,7 @@ impl GuestServer {
     ///
     /// Best-effort: either leg may already be closing when enforcement
     /// fires, and a failed close carries no further action.
-    async fn close_blocked_channel(&self, channel: ChannelId, session: &mut Session) {
+    async fn close_blocked_channel(&mut self, channel: ChannelId, session: &mut Session) {
         if let Some(state) = self.shared.channels.lock().await.remove(&channel) {
             let tx = state.tx.lock().await;
             let _ = tx.close().await;
@@ -242,6 +265,15 @@ impl GuestServer {
 }
 
 impl RelayShared {
+    /// A refused guest handshake has no upstream SSH session to disconnect.
+    async fn disconnect_upstream(&self) {
+        if let Some(upstream) = self.upstream.get() {
+            let _ = upstream
+                .disconnect(russh::Disconnect::ByApplication, "", "")
+                .await;
+        }
+    }
+
     /// Count and audit one scan report, returning the relay decision.
     ///
     /// Counting and audit lines follow the report's strictest action
@@ -381,25 +413,56 @@ impl Default for TerminationHandle {
     }
 }
 
-impl russh::server::Handler for GuestServer {
+impl<F, U> russh::server::Handler for GuestServer<F>
+where
+    F: Future<Output = BrokerResult<U>> + Send + 'static,
+    U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     type Error = BrokerError;
 
     async fn auth_publickey_offered(
         &mut self,
-        _user: &str,
+        user: &str,
         _public_key: &russh::keys::PublicKey,
     ) -> Result<Auth, Self::Error> {
-        // Authorization happened at the host divert decision; the broker
-        // holds no guest credential store, so every offered key proceeds
-        // to the proof-of-possession check, which is then accepted.
-        Ok(Auth::Accept)
+        // Guest keys prove this SSH exchange, not workload identity or
+        // entitlement to a different upstream principal.
+        Ok(if self.pin.matches_user(user) {
+            Auth::Accept
+        } else {
+            Auth::reject()
+        })
     }
 
     async fn auth_publickey(
         &mut self,
-        _user: &str,
+        user: &str,
         _public_key: &russh::keys::PublicKey,
     ) -> Result<Auth, Self::Error> {
+        // Recheck the signed request independently of any earlier unsigned
+        // offer, and before reusing or authenticating an upstream session.
+        if !self.pin.matches_user(user) {
+            return Ok(Auth::reject());
+        }
+        if self.shared.upstream.get().is_some() {
+            return Ok(Auth::Accept);
+        }
+        let Some((upstream, key)) = self.pending_upstream.take() else {
+            return Ok(Auth::reject());
+        };
+        // russh calls this handler only after verifying the guest signature.
+        // In particular, host-key rejection and unsigned key offers cannot
+        // trigger an upstream connection or use the broker-owned credential.
+        let client = tokio::time::timeout(Duration::from_secs(UPSTREAM_AUTH_TIMEOUT_SECS), async {
+            let stream = upstream.await?;
+            authenticate_upstream(stream, key, &self.pin).await
+        })
+        .await
+        .map_err(|_| BrokerError::Ssh("upstream authentication timed out".to_string()))??;
+        self.shared
+            .upstream
+            .set(client)
+            .map_err(|_| BrokerError::Ssh("upstream session already initialized".to_string()))?;
         Ok(Auth::Accept)
     }
 
@@ -410,7 +473,13 @@ impl russh::server::Handler for GuestServer {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         let guest_id = channel.id();
-        let upstream = match self.shared.upstream.channel_open_session().await {
+        let Some(client) = self.shared.upstream.get() else {
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        };
+        let upstream = match client.channel_open_session().await {
             Ok(channel) => channel,
             Err(_) => {
                 reply
@@ -725,20 +794,20 @@ pub fn response_enforcement_for(report: &ScanReport) -> ScanEnforcement {
 /// Reoriginate one diverted guest session toward its pinned upstream.
 ///
 /// `guest` is the accepted divert stream (starting with the guest's first
-/// flight); `upstream` is the egress-tunneled stream to the pinned
-/// destination. brokerd runs the SSH server side on `guest` and the SSH
-/// client side on `upstream`, relaying channels until the guest session
+/// flight); `upstream` is an unpolled future opening the egress tunnel to the
+/// pinned destination. It must perform no eager connection work. brokerd runs
+/// the SSH server side on `guest` and, after authorization, the SSH client side
+/// on the resulting upstream stream, relaying channels until the guest session
 /// ends or DLP enforcement terminates it. `identity` is the validated
 /// prelude identity attributed to every scan hit; `library` is the
 /// compiled DLP match library shared across sessions.
 ///
-/// Double-banner fingerprint, stated as a technical fact: the guest
-/// already saw the direct upstream banner (relayed pre-divert by the host
-/// proxy while it buffered the first flight) and now sees a second banner
-/// from this reoriginated handshake. The two banners frame the divert.
-pub async fn reoriginate<G, U>(
+/// The host must select this route before exposing any upstream SSH bytes
+/// to the guest. Session A sees only this server's handshake; session B is
+/// independent and uses the sealed credential only after guest proof succeeds.
+pub async fn reoriginate<G, F, U>(
     guest: G,
-    upstream: U,
+    upstream: F,
     key: &BrokerKey,
     pin: &UpstreamPin,
     server_config: Arc<russh::server::Config>,
@@ -747,6 +816,74 @@ pub async fn reoriginate<G, U>(
 ) -> BrokerResult<()>
 where
     G: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    F: Future<Output = BrokerResult<U>> + Send + 'static,
+    U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let shared = Arc::new(RelayShared {
+        upstream: OnceCell::new(),
+        channels: Mutex::new(HashMap::new()),
+        tasks: Mutex::new(Vec::new()),
+        identity,
+        scan_request: Mutex::new(ScanState::new(&library)),
+        scan_response: Mutex::new(ScanState::new(&library)),
+        library,
+        termination: TerminationHandle::new(),
+        request_hits: AtomicU64::new(0),
+        response_hits: AtomicU64::new(0),
+    });
+    let session = russh::server::run_stream(
+        server_config,
+        guest,
+        GuestServer {
+            shared: Arc::clone(&shared),
+            pending_upstream: Some((upstream, Arc::new(key.private_key().clone()))),
+            pin: pin.clone(),
+        },
+    )
+    .await
+    .map_err(|e| BrokerError::Ssh(format!("guest handshake: {e}")))?;
+
+    // The guest session and per-session termination race: whichever wins
+    // tears down this session's relay tasks and upstream leg. Other
+    // sessions and the global vsock accept loop are unaffected.
+    let guest_handle = session.handle();
+    let termination = shared.termination.clone();
+    tokio::select! {
+        result = session => {
+            for task in shared.tasks.lock().await.drain(..) {
+                task.abort();
+            }
+            shared.disconnect_upstream().await;
+            result.map_err(|e| BrokerError::Ssh(format!("guest session failed: {e}")))?;
+        }
+        _ = termination.terminated() => {
+            eprintln!(
+                "brokerd: dlp terminated session (cid {} epoch {})",
+                shared.identity.cid, shared.identity.epoch
+            );
+            for task in shared.tasks.lock().await.drain(..) {
+                task.abort();
+            }
+            let _ = guest_handle
+                .disconnect(
+                    russh::Disconnect::ByApplication,
+                    "dlp terminate".to_string(),
+                    String::new(),
+                )
+                .await;
+            shared.disconnect_upstream().await;
+        }
+    }
+    Ok(())
+}
+
+/// Establish the independent upstream SSH session after guest proof succeeds.
+async fn authenticate_upstream<U>(
+    upstream: U,
+    key: Arc<PrivateKey>,
+    pin: &UpstreamPin,
+) -> BrokerResult<russh::client::Handle<UpstreamVerifier>>
+where
     U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let verifier = UpstreamVerifier {
@@ -765,10 +902,7 @@ where
         .map_err(|e| BrokerError::Ssh(format!("upstream signature algorithms: {e}")))?
         .flatten();
     let auth = client
-        .authenticate_publickey(
-            pin.user.clone(),
-            PrivateKeyWithHashAlg::new(Arc::new(key.private_key().clone()), hash),
-        )
+        .authenticate_publickey(pin.user.clone(), PrivateKeyWithHashAlg::new(key, hash))
         .await
         .map_err(|e| BrokerError::Ssh(format!("upstream public-key authentication: {e}")))?;
     if !auth.success() {
@@ -779,67 +913,7 @@ where
             "upstream public-key authentication failed".to_string(),
         ));
     }
-
-    let shared = Arc::new(RelayShared {
-        upstream: client,
-        channels: Mutex::new(HashMap::new()),
-        tasks: Mutex::new(Vec::new()),
-        identity,
-        scan_request: Mutex::new(ScanState::new(&library)),
-        scan_response: Mutex::new(ScanState::new(&library)),
-        library,
-        termination: TerminationHandle::new(),
-        request_hits: AtomicU64::new(0),
-        response_hits: AtomicU64::new(0),
-    });
-    let session = russh::server::run_stream(
-        server_config,
-        guest,
-        GuestServer {
-            shared: Arc::clone(&shared),
-        },
-    )
-    .await
-    .map_err(|e| BrokerError::Ssh(format!("guest handshake: {e}")))?;
-
-    // The guest session and per-session termination race: whichever wins
-    // tears down this session's relay tasks and upstream leg. Other
-    // sessions and the global vsock accept loop are unaffected.
-    let guest_handle = session.handle();
-    let termination = shared.termination.clone();
-    tokio::select! {
-        result = session => {
-            for task in shared.tasks.lock().await.drain(..) {
-                task.abort();
-            }
-            let _ = shared
-                .upstream
-                .disconnect(russh::Disconnect::ByApplication, "", "")
-                .await;
-            result.map_err(|e| BrokerError::Ssh(format!("guest session failed: {e}")))?;
-        }
-        _ = termination.terminated() => {
-            eprintln!(
-                "brokerd: dlp terminated session (cid {} epoch {})",
-                shared.identity.cid, shared.identity.epoch
-            );
-            for task in shared.tasks.lock().await.drain(..) {
-                task.abort();
-            }
-            let _ = guest_handle
-                .disconnect(
-                    russh::Disconnect::ByApplication,
-                    "dlp terminate".to_string(),
-                    String::new(),
-                )
-                .await;
-            let _ = shared
-                .upstream
-                .disconnect(russh::Disconnect::ByApplication, "", "")
-                .await;
-        }
-    }
-    Ok(())
+    Ok(client)
 }
 
 /// Build the guest-facing SSH server configuration.
@@ -1078,6 +1152,17 @@ mod tests {
             user: "deploy".to_string(),
             public_key: format!("{} broker-test-only", key.public_key_openssh()),
         }
+    }
+
+    #[test]
+    fn upstream_username_match_is_exact_and_nonempty() {
+        let mut pin = parse_upstream_pin(&pin_entry()).unwrap();
+        assert!(pin.matches_user("deploy"));
+        for requested in ["", "Deploy", "DEPLOY", "deploy ", " deploy", "root"] {
+            assert!(!pin.matches_user(requested), "must refuse {requested:?}");
+        }
+        pin.user.clear();
+        assert!(!pin.matches_user(""));
     }
 
     #[test]

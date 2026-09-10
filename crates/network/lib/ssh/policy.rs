@@ -2,9 +2,11 @@
 //!
 //! This module composes with the existing egress machinery without changing
 //! its semantics: the caller first evaluates the generic transport policy
-//! ([`Action`] via `NetworkPolicy::evaluate_egress`), classifies the flow
-//! with [`SshClassification`], then
-//! calls [`decide_ssh_egress`] for the final routing verdict.
+//! ([`Action`] via `NetworkPolicy::evaluate_egress`) and calls
+//! [`decide_ssh_endpoint`] before opening an upstream connection. Declared SSH
+//! endpoints route through the host dispatcher regardless of guest bytes.
+//! Classification via [`decide_ssh_egress`] can restrict other flows, but must
+//! never switch an established direct connection to a terminating SSH peer.
 //!
 //! Deny strength reuses the secrets [`ViolationAction`] vocabulary
 //! (`Block`, `BlockAndLog`, `BlockAndTerminate`) so SSH enforcement logs
@@ -18,10 +20,13 @@
 //!
 //! 1. `NetworkPolicy::evaluate_egress` (or `evaluate_egress_with_source`)
 //!    for the generic TCP `Allow`/`Deny`.
-//! 2. The streaming [`SshClassifier`](super::classifier::SshClassifier)
+//! 2. [`decide_ssh_endpoint`] before any upstream dial or protocol bytes.
+//!    A configured endpoint goes to the dispatcher, which resolves credential
+//!    custody; this routing view does not authorize a username or select a key.
+//! 3. For remaining endpoints, the streaming [`SshClassifier`](super::classifier::SshClassifier)
 //!    over the plaintext pre-key-exchange bytes (guest first flight and
 //!    server banner, each fed to its own classifier in arrival order).
-//! 3. [`decide_ssh_egress`] with the flow host/port, the classification,
+//! 4. [`decide_ssh_egress`] with the flow host/port, the classification,
 //!    the egress [`Action`], the [`SshPolicy`], and the optional
 //!    [`BrokerEndpoint`].
 //!
@@ -332,6 +337,32 @@ impl<'de> Deserialize<'de> for BrokerEndpoint {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
+/// Decide a configured SSH endpoint before any upstream connection is opened.
+///
+/// `None` means this endpoint is not configured for dispatch; the caller still
+/// enforces generic egress and any later strict SSH classification. A matching
+/// endpoint never falls through because its banner is incomplete or non-SSH.
+/// The host dispatcher decides key custody from the compiled credential plan;
+/// a divert does not itself imply SSH termination or authorize credential use.
+pub fn decide_ssh_endpoint(
+    flow: &SshFlow,
+    egress: Action,
+    ssh_policy: &SshPolicy,
+    broker: Option<&BrokerEndpoint>,
+) -> Option<SshDecision> {
+    if !ssh_policy.is_granted(flow) {
+        return None;
+    }
+    Some(match (egress, broker) {
+        (Action::Allow, Some(endpoint)) => SshDecision::Divert {
+            endpoint: endpoint.clone(),
+        },
+        _ => SshDecision::Deny {
+            action: ssh_policy.deny_action(),
+        },
+    })
+}
+
 /// Decide divert/direct/deny for an egress flow.
 ///
 /// `egress` is the generic transport verdict the caller already computed
@@ -374,23 +405,8 @@ pub fn decide_ssh_egress(
         };
     }
 
-    if ssh_policy.is_granted(flow) {
-        match egress {
-            Action::Deny => SshDecision::Deny {
-                action: ssh_policy.deny_action(),
-            },
-            // Divert-intended without a broker path denies fail-closed;
-            // falling back to direct would silently bypass broker
-            // authentication, so it is never allowed.
-            Action::Allow => match broker {
-                Some(endpoint) => SshDecision::Divert {
-                    endpoint: endpoint.clone(),
-                },
-                None => SshDecision::Deny {
-                    action: ssh_policy.deny_action(),
-                },
-            },
-        }
+    if let Some(decision) = decide_ssh_endpoint(flow, egress, ssh_policy, broker) {
+        decision
     } else if ssh_policy.strict {
         SshDecision::Deny {
             action: ssh_policy.deny_action(),
@@ -423,6 +439,32 @@ mod tests {
 
     fn broker() -> BrokerEndpoint {
         BrokerEndpoint::new("unix:///run/msb/ssh-broker.sock").expect("test broker must validate")
+    }
+
+    #[test]
+    fn endpoint_dispatch_is_independent_of_classification_and_strict_mode() {
+        for strict in [false, true] {
+            let policy = SshPolicy::new(strict, vec![SshGrant::exact("example.com", 22)]);
+            for port in [22, 2222] {
+                for egress in [Action::Allow, Action::Deny] {
+                    for endpoint in [None, Some(broker())] {
+                        let decision = decide_ssh_endpoint(
+                            &flow("example.com", port),
+                            egress,
+                            &policy,
+                            endpoint.as_ref(),
+                        );
+                        if port != 22 {
+                            assert!(decision.is_none());
+                        } else if egress == Action::Allow && endpoint.is_some() {
+                            assert!(decision.unwrap().is_divert());
+                        } else {
+                            assert!(decision.unwrap().is_deny());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

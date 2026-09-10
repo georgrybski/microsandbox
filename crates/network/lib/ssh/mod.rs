@@ -26,5 +26,5 @@ pub use gateway::{
 };
 pub use policy::{
     BrokerEndpoint, BrokerEndpointError, SshDecision, SshFlow, SshGrant, SshPolicy,
-    decide_ssh_egress,
+    decide_ssh_egress, decide_ssh_endpoint,
 };
