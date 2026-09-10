@@ -16,11 +16,12 @@
   pkgs,
   src,
   cargoLock,
+  version,
 }:
 
 pkgs.pkgsStatic.rustPlatform.buildRustPackage rec {
   pname = "microsandbox-agentd";
-  version = "0.6.16";
+  inherit version;
 
   inherit src;
 

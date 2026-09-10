@@ -81,7 +81,7 @@ matching, missing, non-executable, and incompatible fixtures.
 `crates/filesystem/build.rs` (`build_agentd`, `prebuilt` feature) resolves the
 guest agentd in this order: `build/agentd` → `MSB_AGENTD_PATH` → cached
 `OUT_DIR` copy → GitHub release download (`agentd_download_url(PREBUILT_VERSION)`,
-`PREBUILT_VERSION = CARGO_PKG_VERSION`, i.e. the v0.6.16 asset). The download
+`PREBUILT_VERSION = CARGO_PKG_VERSION`, matching the workspace release). The download
 leg is a build-time network fetch, which Nix sandboxed builds cannot use.
 The host package stages the separately built guest daemon and disables the
 `prebuilt` feature. Workspace checks stage both the daemon and the matching
@@ -107,6 +107,10 @@ export. The public package names remain `agentd`,
 `microsandbox`, `msb`, and `default` (`msb` and `default` alias `microsandbox`).
 Consumers should obtain SDK paths from the same flake input that supplies
 these packages.
+
+Package and check versions are read from `[workspace.package]` in `Cargo.toml`.
+The host runtime and guest daemon must stay on that same release when upstream
+changes are merged; packaging does not maintain a separate hardcoded version.
 
 Evaluation reads `Cargo.lock` directly from the immutable flake input, separately
 from the filtered Rust compilation source. This lets read-only derivation

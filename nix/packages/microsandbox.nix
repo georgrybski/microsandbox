@@ -1,7 +1,7 @@
 # microsandbox — msb CLI + runtime libraries, built from THIS flake's source.
 #
 # Source provenance: the fork flake supplies its filtered Rust workspace,
-# excluding local build caches and unrelated files. The fork is a 0.6.16 workspace
+# excluding local build caches and unrelated files. The fork is a Rust workspace
 # (edition 2024, resolver 3). msb is built from source via buildRustPackage
 # with the fenix-pinned toolchain for host-toolchain consistency. agentd is
 # built separately (nix/packages/agentd.nix, musl static) and assembled here.
@@ -14,6 +14,7 @@
   agentd,
   src,
   cargoLock,
+  version,
 }:
 
 let
@@ -43,7 +44,7 @@ let
 in
 rustPlatform.buildRustPackage rec {
   pname = "microsandbox";
-  version = "0.6.16";
+  inherit version;
 
   inherit src;
 

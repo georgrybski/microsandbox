@@ -114,14 +114,16 @@
           # Evaluation reads metadata from the already-fetched flake input;
           # the filtered compilation source need not exist in the store yet.
           cargoLock = import ./nix/cargo-lock.nix { lockFile = ./Cargo.lock; };
+          version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
-          agentd = pkgs.callPackage ./nix/packages/agentd.nix { inherit src cargoLock; };
+          agentd = pkgs.callPackage ./nix/packages/agentd.nix { inherit src cargoLock version; };
           msb = pkgs.callPackage ./nix/packages/microsandbox.nix {
             inherit
               src
               rustToolchain
               agentd
               cargoLock
+              version
               ;
           };
 
@@ -230,7 +232,7 @@
             # at bans.wildcards in deny.toml.
             deny = rustPlatform.buildRustPackage {
               pname = "microsandbox-deny";
-              version = "0.6.16";
+              inherit version;
               inherit src cargoLock;
               nativeBuildInputs = [ pkgs.cargo-deny ];
               buildPhase = ''
@@ -251,7 +253,7 @@
             #     --target x86_64-unknown-linux-musl -- -D warnings
             clippy = rustPlatform.buildRustPackage {
               pname = "microsandbox-clippy";
-              version = "0.6.16";
+              inherit version;
               inherit src;
               inherit cargoLock;
               cargo = clippyToolchain;
@@ -284,7 +286,7 @@
             # an isolated host test environment when that builder policy applies.
             unit = rustPlatform.buildRustPackage {
               pname = "microsandbox-unit-tests";
-              version = "0.6.16";
+              inherit version;
               inherit src;
               inherit cargoLock;
               # TLS client construction needs explicit trust roots in the sandbox.

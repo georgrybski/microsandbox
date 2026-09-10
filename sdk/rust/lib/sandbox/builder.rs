@@ -2565,7 +2565,7 @@ mod tests {
             .image("alpine")
             .port(8080, 80)
             .secret_env("OPENAI_API_KEY", "secret", "api.openai.com")
-            .network(|n| n.max_connections(128))
+            .network(|n| n.max_connections(128).strict(true))
             .build()
             .await
             .unwrap();
@@ -2577,6 +2577,7 @@ mod tests {
         let network = config.local_network_config().unwrap();
         assert_eq!(network.secrets.secrets.len(), 1);
         assert_eq!(network.max_connections, Some(128));
+        assert!(network.strict);
     }
 
     #[cfg(feature = "net")]
