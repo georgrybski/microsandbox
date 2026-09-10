@@ -188,6 +188,26 @@ The test preserves its fresh artifact directory and cleans up only its two
 named guests. A successful guest-CID test does not validate host-global CID
 reservation; that remains the embedding supervisor's responsibility.
 
+The same offline image includes `/bin/vsock-guest-probe`, a static test fixture
+using brokerd's production `VsockListener::accept` host-CID check. With the same
+explicit environment and `MSB_TEST_OLD_RUNTIME` pointing to an actual runtime
+that supports `guest-cid-v1` but predates `host-vsock-listen-v1`, run:
+
+```sh
+cargo test --locked --offline -p microsandbox --test host_vsock_listener -- --ignored --nocapture
+```
+
+This test creates two network-disabled guests with independent host listeners,
+exchanges generated binary payloads across fragmentation/size cases, rejects a
+colliding listener launch, replaces one guest with a fresh CID/path, and checks
+the unaffected guest remains usable. Normal shutdown must remove the old owned
+endpoint. The test keeps diagnostics and cleans up only its own named guests.
+It tests the real host-to-broker transport accept path, not SSH authentication,
+generation policy, certificate trust or Git operations.
+The separate older-runtime case requires an explicit unsupported-capability
+refusal before binding or creating the runtime directory, not just a generic
+launch failure.
+
 ## Devshell state isolation (proposal; queued)
 
 Devshell experimentation should never write the user's real

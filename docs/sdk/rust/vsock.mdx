@@ -59,6 +59,30 @@ fn vsock_dgram(self, host_path: impl AsRef<Path>, port: u32) -> Self
 
 Expose a host Unix datagram socket while preserving datagram boundaries. Datagram routes are unavailable on Windows.
 
+### vsock_host_listen()
+
+```rust
+fn vsock_host_listen(self, host_path: impl AsRef<Path>, guest_port: u32) -> Self
+```
+
+Unix Rust host-embedding API for the opposite direction: bind a fresh host Unix
+socket and inject accepted streams into a guest service listening on
+`guest_port`. The guest sees host CID `2`. Use an absolute, per-launch socket
+path in a private supervisor-owned directory. Existing paths cause launch
+failure; they are not replaced automatically.
+
+This setting is transient and excluded from durable workload configuration.
+Supply it again for replacement; an ordinary persisted restart does not recreate
+it. Cloud and multi-tenant deployments refuse it, and older runtimes fail the
+mandatory capability check. It is not exposed by the CLI or other language SDKs.
+It cannot share a stream port with `vsock()`; datagrams use a separate namespace.
+
+libkrun owns listener lifetime, including quiescence and normal exit. A forced
+process kill can leave the pathname, so use a new path for a new launch. Socket
+binding alone is not service readiness; the supervisor must verify its guest
+application is ready before routing dependent traffic. Neither this socket nor
+guest-supplied bytes establish another workload's identity.
+
 ### vsock_route()
 
 ```rust
