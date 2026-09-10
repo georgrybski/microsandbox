@@ -251,6 +251,12 @@ Sources: [`crates/vsock/lib/stream.rs`](crates/vsock/lib/stream.rs), [`crates/vs
 
 Use standards-compliant clients in tests and exercise connections against older running agentd versions when changing the adapter-to-agent mapping.
 
+The broker guest's divert listener accepts only a complete kernel-reported
+`AF_VSOCK` peer address with the host CID. Direct guest/local peers are refused
+before any prelude or SSH bytes are read. This verifies the host-to-broker hop,
+not the original workload: instance, generation and credential policy still
+require independent validation of the host-provided session context.
+
 ## 15. Metrics Shared-Memory ABI
 
 Metrics use a binary shared-memory structure across independently executing processes. The header and slots have fixed sizes, magic, registry version, ABI, atomics, seqlock ordering, generation counters, lifecycle states, and reserved bytes.
