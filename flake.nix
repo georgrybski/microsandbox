@@ -6,7 +6,7 @@
     # For local iteration, override tooling with a Git-filtered checkout:
     # `--override-input tooling git+file:///absolute/path/to/nix-tooling`.
     # Keep its owned pins intact; consumers follow the shared input graph.
-    tooling.url = "github:rybskiworks/nix-tooling/eae927a0da5fd04d2dfd2e7876042c6243adba65";
+    tooling.url = "github:rybskiworks/nix-tooling/1120aa22cddf4a9a3424f38aadbebadd8a963c4b";
 
     # ONE pin universe: every shared input follows tooling. Do NOT declare
     # own revs for any of these — bumps happen in nix-tooling only.
@@ -67,7 +67,7 @@
       systems = [ "x86_64-linux" ];
 
       perSystem =
-        { system, ... }:
+        { config, system, ... }:
         let
           pkgs = import inputs.nixpkgs {
             inherit system;
@@ -149,6 +149,13 @@
           msb = pkgs.callPackage ./nix/packages/microsandbox.nix {
             inherit cli agentd libkrunfw;
           };
+          handoffSource = pkgs.lib.fileset.toSource {
+            root = ./scripts/smoke/cli;
+            fileset = pkgs.lib.fileset.unions [
+              ./scripts/smoke/cli/runtime-handoff.py
+              ./scripts/smoke/cli/test_runtime_handoff.py
+            ];
+          };
 
           # Toolchain with the musl std for the agentd musl clippy gate
           # (mirrors upstream check.yml: clippy --target x86_64-unknown-linux-musl).
@@ -187,6 +194,7 @@
           packages = {
             inherit agentd brokerd msb;
             runtime-smoke-image = runtimeSmokeImage;
+            runtime-handoff-image = inputs.tooling.packages.${system}.guest-determinate-base;
             # workestrate consumes `packages.${system}.microsandbox`.
             microsandbox = msb;
             default = msb;
@@ -209,7 +217,48 @@
             }/bin/msb-test-runtime";
           };
 
+          apps.test-runtime-handoff = {
+            type = "app";
+            program = "${
+              pkgs.writeShellApplication {
+                name = "msb-test-runtime-handoff";
+                runtimeInputs = [ pkgs.python3 ];
+                text = ''
+                  exec python3 -I -B ${handoffSource}/runtime-handoff.py "$@" \
+                    --support ${inputs.tooling}/tests/nixos-image \
+                    --spec ${inputs.tooling.legacyPackages.${system}.nixosImages.smokeSpec} \
+                    --msb ${msb}/bin/msb --expected-version ${version} \
+                    --runtime-revision ${
+                      inputs.self.rev or (throw "test-runtime-handoff requires a committed Git flake")
+                    }
+                '';
+              }
+            }/bin/msb-test-runtime-handoff";
+          };
+
           checks = {
+            runtime-handoff-contract =
+              pkgs.runCommand "microsandbox-runtime-handoff-contract"
+                {
+                  nativeBuildInputs = [ pkgs.python3 ];
+                  MSB_HANDOFF_SUPPORT = "${inputs.tooling}/tests/nixos-image";
+                }
+                ''
+                  python3 -I -B ${handoffSource}/test_runtime_handoff.py -v
+                  mkdir -p "$out"
+                  touch "$out/ok"
+                '';
+
+            runtime-shutdown = config.checks.unit.overrideAttrs {
+              pname = "microsandbox-runtime-shutdown-tests";
+              buildPhase = ''
+                runHook preBuild
+                cargo test --jobs "$NIX_BUILD_CORES" --locked --offline \
+                  -p microsandbox-runtime --lib guest_shutdown_flush_timeout -- --test-threads=1
+                runHook postBuild
+              '';
+            };
+
             # Protocol-level custody acceptance uses real OpenSSH, synthetic
             # keys and loopback only; it does not depend on KVM or guest images.
             ssh-termination = rustPlatform.buildRustPackage {

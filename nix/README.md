@@ -189,6 +189,34 @@ is not part of the package build.
 
 ### Runtime acceptance on Linux
 
+The typed systemd handoff has a separate regression gate:
+
+```sh
+nix build .#checks.x86_64-linux.runtime-shutdown .#checks.x86_64-linux.runtime-handoff-contract --no-link
+nix build .#runtime-handoff-image --no-link
+nix run .#test-runtime-handoff -- --execute
+```
+
+`test-runtime-handoff` requires a committed Git flake and an already realized
+shared NixOS image. It uses the pinned nix-tooling image specification, command
+runner and retained-child supervisor without changing the common fixture. It
+boots one fresh network-disabled guest with typed `/init`, waits for the actual
+systemd/store-ready target, and arms a transient service whose stop action sleeps
+three seconds before syncing its marker and writing it to the guest console.
+Success requires that marker, the original VMM's normal exit status, a shutdown
+elapsed time of at least three and less than eight seconds, and no host fallback
+or forced child termination. An ordinary fast shutdown cannot satisfy this gate.
+
+The test admits 22 GiB free host disk and 8 GiB available memory, retains a 17 GiB
+disk/8 GiB memory floor, and bounds owned scratch and global disk growth to 4 GiB
+each. Preparation is charged to the 300-second work budget; normal cleanup has
+at most 90 additional seconds and a result past 390 seconds fails. A supervising
+caller should use an outer 405-second deadline with a final five-second kill
+grace. Import tar, logs and JSON receipt remain in the printed disposable root;
+only that root's sandbox is stopped and removed. This gate does not certify the
+full Nix daemon trust suite, workload readiness policy, SSH custody, old state or
+saved-memory restore. The portable contract check does not launch a VM.
+
 `nix run .#test-runtime` requires readable/writable `/dev/kvm` and a host
 filesystem supporting the runtime's extended attributes. Unlike pure package
 checks, this explicitly boots a real microVM outside the Nix build sandbox.
