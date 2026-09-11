@@ -272,17 +272,17 @@
         ]
       },
       "locked": {
-        "lastModified": 1789011740,
+        "lastModified": 1789114971,
         "narHash": "sha256-urW9w6VusVS0QymKF9wXehEexamIQb7cIJ+Y22Oqj5w=",
         "owner": "rybskiworks",
         "repo": "libkrunfw",
-        "rev": "3017d504988971bd84dcc5935c96aa4a81227d1e",
+        "rev": "d575b13e79368b23246be3d93d7935899dec5a3b",
         "type": "github"
       },
       "original": {
         "owner": "rybskiworks",
         "repo": "libkrunfw",
-        "rev": "3017d504988971bd84dcc5935c96aa4a81227d1e",
+        "rev": "d575b13e79368b23246be3d93d7935899dec5a3b",
         "type": "github"
       }
     },
