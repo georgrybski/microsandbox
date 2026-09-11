@@ -24,6 +24,8 @@ fn error_type_str(err: &MicrosandboxError) -> &'static str {
         MicrosandboxError::SandboxNotFound(_) => "SandboxNotFound",
         MicrosandboxError::SandboxAlreadyExists(_) => "SandboxAlreadyExists",
         MicrosandboxError::SandboxReplaced { .. } => "SandboxReplaced",
+        MicrosandboxError::SandboxLaunchChanged { .. } => "SandboxLaunchChanged",
+        MicrosandboxError::LaunchBindingUnsupported => "Unsupported",
         MicrosandboxError::SandboxStillRunning(_) => "SandboxStillRunning",
         MicrosandboxError::SandboxNotRunning(_) => "SandboxNotRunning",
         MicrosandboxError::Runtime(_) => "Runtime",
@@ -39,6 +41,15 @@ fn error_type_str(err: &MicrosandboxError) -> &'static str {
         #[cfg(windows)]
         MicrosandboxError::WindowsHostSetup(_) => "WindowsHostSetup",
         MicrosandboxError::ExecTimeout(_) => "ExecTimeout",
+        MicrosandboxError::ExecInterrupted(outcome)
+            if matches!(
+                outcome.reason,
+                microsandbox::ExecInterruptionReason::Timeout(_)
+            ) =>
+        {
+            "ExecTimeout"
+        }
+        MicrosandboxError::ExecInterrupted(_) => "ExecInterrupted",
         MicrosandboxError::ExecFailed(_) => "ExecFailed",
         MicrosandboxError::Terminal(_) => "Terminal",
         MicrosandboxError::SandboxFsOps(_) => "SandboxFsOps",

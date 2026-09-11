@@ -20,6 +20,10 @@ use crate::error::{AgentdError, AgentdResult};
 use crate::process::{ProcessExitWatcher, ProcessIdentity, ProcessManager};
 use crate::rlimit;
 
+mod io;
+pub use io::OutputChunk;
+use io::{OutputSender, StdinQueue};
+
 //--------------------------------------------------------------------------------------------------
 // Constants
 //--------------------------------------------------------------------------------------------------
@@ -129,17 +133,17 @@ pub struct ExecSession {
     /// The PTY master fd (only for PTY mode, used for writing and resize).
     pty_master: Option<OwnedFd>,
 
-    /// The child's stdin (only for pipe mode).
-    stdin: Option<tokio::process::ChildStdin>,
+    /// Ordered bounded input writer, independent of agent dispatch.
+    stdin: StdinQueue,
 }
 
 /// Output from a session that the agent loop should forward to the host.
 pub enum SessionOutput {
     /// Data from stdout (or PTY master).
-    Stdout(Vec<u8>),
+    Stdout(OutputChunk),
 
     /// Data from stderr (pipe mode only).
-    Stderr(Vec<u8>),
+    Stderr(OutputChunk),
 
     /// The process has exited with the given code.
     Exited(i32),
@@ -315,15 +319,11 @@ impl ExecSession {
         self.process_identity.pid() as u32
     }
 
-    /// Writes data to the process's stdin (or PTY master).
-    pub async fn write_stdin(&self, data: &[u8]) -> AgentdResult<()> {
-        if let Some(ref master) = self.pty_master {
-            blocking_write_fd(master.as_raw_fd(), data).await
-        } else if let Some(ref stdin) = self.stdin {
-            blocking_write_fd(stdin.as_raw_fd(), data).await
-        } else {
-            Ok(())
-        }
+    /// Queue bounded stdin without waiting for the child. An empty chunk queues
+    /// pipe EOF after accepted data; PTY EOF remains a no-op. Delivery failures
+    /// are reported separately and never imply process termination.
+    pub fn enqueue_stdin(&mut self, data: Vec<u8>) -> AgentdResult<()> {
+        self.stdin.enqueue(data)
     }
 
     /// Resizes the PTY (only applicable for TTY sessions).
@@ -343,7 +343,8 @@ impl ExecSession {
         Ok(())
     }
 
-    /// Sends a signal to the spawned process and everything it started.
+    /// Sends a signal to the registered process group. Descendants that create
+    /// a different group/session are not covered by this cleanup mechanism.
     ///
     /// The child is made a session leader at spawn (both pipe and PTY modes),
     /// so signalling the negative pid reaches its whole process group. A bare
@@ -355,14 +356,6 @@ impl ExecSession {
             .map_err(|e| AgentdError::ExecSession(format!("invalid signal {signum}: {e}")))?;
         self.process_manager
             .signal_process_group(self.process_identity, sig as i32)
-    }
-
-    /// Closes the process's stdin.
-    ///
-    /// For pipe mode, drops the `ChildStdin` handle which closes the fd.
-    /// For PTY mode, this is a no-op (the PTY master stays open for output).
-    pub fn close_stdin(&mut self) {
-        self.stdin.take();
     }
 }
 
@@ -568,14 +561,21 @@ impl ExecSession {
         }
         let reader_fd = unsafe { OwnedFd::from_raw_fd(reader_fd) };
 
-        // Spawn background reader task.
-        tokio::spawn(pty_reader_task(id, reader_fd, exit_watcher, tx));
+        let output = OutputSender::new(tx);
+        let stdin = StdinQueue::new(pty.master.as_raw_fd(), true, id, output.clone()).inspect_err(
+            |_| {
+                let _ =
+                    process_manager.signal_process_group(process_identity, Signal::SIGKILL as i32);
+            },
+        )?;
+        // Reader and input share nonblocking file status, but each owns its FD.
+        tokio::spawn(pty_reader_task(id, reader_fd, exit_watcher, output));
 
         Ok(Self {
             process_identity,
             process_manager: Arc::clone(process_manager),
             pty_master: Some(pty.master),
-            stdin: None,
+            stdin,
         })
     }
 
@@ -641,14 +641,24 @@ impl ExecSession {
         } = spawn_piped_process(cmd, process_manager)?;
         let process_identity = exit_watcher.identity();
 
-        // Spawn background reader task.
-        tokio::spawn(pipe_reader_task(id, stdout, stderr, exit_watcher, tx));
+        let input = stdin
+            .as_ref()
+            .ok_or_else(|| AgentdError::ExecSession("missing pipe stdin".into()))?;
+        let output = OutputSender::new(tx);
+        let queued_stdin = StdinQueue::new(input.as_raw_fd(), false, id, output.clone())
+            .inspect_err(|_| {
+                let _ =
+                    process_manager.signal_process_group(process_identity, Signal::SIGKILL as i32);
+            })?;
+        // Only the queue worker retains the pipe write FD, so ordered EOF closes it.
+        drop(stdin);
+        tokio::spawn(pipe_reader_task(id, stdout, stderr, exit_watcher, output));
 
         Ok(Self {
             process_identity,
             process_manager: Arc::clone(process_manager),
             pty_master: None,
-            stdin,
+            stdin: queued_stdin,
         })
     }
 }
@@ -1101,90 +1111,27 @@ fn agentd_to_io_error(err: AgentdError) -> std::io::Error {
     std::io::Error::other(err.to_string())
 }
 
-/// Writes data to a raw fd using a blocking task, handling short writes.
-async fn blocking_write_fd(fd: RawFd, data: &[u8]) -> AgentdResult<()> {
-    let data = data.to_vec();
-    tokio::task::spawn_blocking(move || {
-        let mut written = 0;
-        while written < data.len() {
-            let ptr = unsafe { data.as_ptr().add(written) as *const libc::c_void };
-            let ret = unsafe { libc::write(fd, ptr, data.len() - written) };
-            if ret < 0 {
-                let err = std::io::Error::last_os_error();
-                let code = err.raw_os_error();
-                if code == Some(libc::EAGAIN) || code == Some(libc::EWOULDBLOCK) {
-                    wait_fd_writable(fd)?;
-                    continue;
-                }
-                if code == Some(libc::EINTR) {
-                    continue;
-                }
-                return Err(AgentdError::Io(err));
-            }
-            if ret == 0 {
-                wait_fd_writable(fd)?;
-                continue;
-            }
-            written += ret as usize;
-        }
-        Ok(())
-    })
-    .await
-    .map_err(|e| AgentdError::ExecSession(format!("stdin write join error: {e}")))?
-}
-
-fn wait_fd_writable(fd: RawFd) -> AgentdResult<()> {
-    let mut pollfd = libc::pollfd {
-        fd,
-        events: libc::POLLOUT,
-        revents: 0,
-    };
-
-    loop {
-        let ret = unsafe { libc::poll(&mut pollfd, 1, -1) };
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(AgentdError::Io(err));
-        }
-        if ret == 0 {
-            continue;
-        }
-        // Any positive return means the fd is actionable: POLLOUT lets the
-        // next write make progress, and POLLHUP/POLLERR/POLLNVAL will cause
-        // the next write to fail with a real errno (typically EPIPE) which
-        // is more meaningful than poll's revents.
-        return Ok(());
-    }
-}
-
 /// Background task that reads from a PTY master fd and sends output events.
 async fn pty_reader_task(
     id: u32,
     master_fd: OwnedFd,
     exit_watcher: ProcessExitWatcher,
-    tx: mpsc::UnboundedSender<(u32, SessionOutput)>,
+    tx: OutputSender,
 ) {
     let tx_output = tx.clone();
     let read_result = tokio::task::spawn_blocking(move || {
-        // PTY masters are safer with a dedicated blocking read loop than with
-        // edge-driven readiness. Fast writers followed by process exit can
-        // strand the tail behind a missed wakeup/HUP transition.
+        // Poll/read owns a separate descriptor. Keep the shared open-file
+        // description nonblocking so an input deadline can always be enforced.
         let raw = master_fd.as_raw_fd();
-        let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
-        if flags >= 0 {
-            unsafe { libc::fcntl(raw, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
-        }
+        let runtime = tokio::runtime::Handle::current();
 
         loop {
             let mut buf = [0u8; 4096];
             let n = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
 
             if n > 0 {
-                if tx_output
-                    .send((id, SessionOutput::Stdout(buf[..n as usize].to_vec())))
+                if runtime
+                    .block_on(tx_output.send(id, buf[..n as usize].to_vec(), false))
                     .is_err()
                 {
                     break;
@@ -1199,6 +1146,17 @@ async fn pty_reader_task(
             let err = std::io::Error::last_os_error();
             match err.raw_os_error() {
                 Some(libc::EINTR) => continue,
+                Some(libc::EAGAIN) => {
+                    let mut poll = libc::pollfd {
+                        fd: raw,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    unsafe {
+                        libc::poll(&mut poll, 1, 100);
+                    }
+                    continue;
+                }
                 Some(libc::EIO) => break,
                 _ => break,
             }
@@ -1209,7 +1167,7 @@ async fn pty_reader_task(
     let _ = read_result;
 
     let code = exit_watcher.await;
-    let _ = tx.send((id, SessionOutput::Exited(code)));
+    tx.exited(id, code);
 }
 
 /// Background task that reads from piped stdout/stderr and sends output events.
@@ -1218,7 +1176,7 @@ async fn pipe_reader_task(
     stdout: Option<tokio::process::ChildStdout>,
     stderr: Option<tokio::process::ChildStderr>,
     exit_watcher: ProcessExitWatcher,
-    tx: mpsc::UnboundedSender<(u32, SessionOutput)>,
+    tx: OutputSender,
 ) {
     let mut stdout = stdout;
     let mut stderr = stderr;
@@ -1242,7 +1200,7 @@ async fn pipe_reader_task(
                         stdout_eof = true;
                     }
                     Ok(n) => {
-                        let _ = tx.send((id, SessionOutput::Stdout(stdout_buf[..n].to_vec())));
+                        if tx.send(id, stdout_buf[..n].to_vec(), false).await.is_err() { return; }
                     }
                 }
             }
@@ -1258,7 +1216,7 @@ async fn pipe_reader_task(
                         stderr_eof = true;
                     }
                     Ok(n) => {
-                        let _ = tx.send((id, SessionOutput::Stderr(stderr_buf[..n].to_vec())));
+                        if tx.send(id, stderr_buf[..n].to_vec(), true).await.is_err() { return; }
                     }
                 }
             }
@@ -1267,7 +1225,7 @@ async fn pipe_reader_task(
 
     let code = exit_watcher.await;
 
-    let _ = tx.send((id, SessionOutput::Exited(code)));
+    tx.exited(id, code);
 }
 
 //--------------------------------------------------------------------------------------------------

@@ -1655,7 +1655,7 @@ type NetworkOptions struct {
 	DenyDomains         []string                   `json:"deny_domains,omitempty"`
 	DenyDomainSuffixes  []string                   `json:"deny_domain_suffixes,omitempty"`
 	TLS                 *TLSOptions                `json:"tls,omitempty"`
-	Strict             *bool                      `json:"strict,omitempty"`
+	Strict              *bool                      `json:"strict,omitempty"`
 	Ports               map[uint16]uint16          `json:"ports,omitempty"`
 	PortBindings        []PortBindingOptions       `json:"port_bindings,omitempty"`
 	IPv4Pool            string                     `json:"ipv4_pool,omitempty"`
@@ -3087,8 +3087,22 @@ const (
 	ExecEventExited
 	ExecEventFailed
 	ExecEventStdinError
-	ExecEventDone // all events consumed; no further Recv calls needed
+	ExecEventDone        // all events consumed; no further Recv calls needed
+	ExecEventInterrupted // append without renumbering existing public kinds
 )
+
+// ExecInterruptionDetail is a tagged reason or termination observation.
+// Value contains a timeout duration, observed exit code, or spawn-failure detail.
+type ExecInterruptionDetail struct {
+	Kind  string          `json:"kind"`
+	Value json.RawMessage `json:"value,omitempty"`
+}
+
+// ExecInterruption separates the operation failure from process-exit evidence.
+type ExecInterruption struct {
+	Reason      ExecInterruptionDetail `json:"reason"`
+	Termination ExecInterruptionDetail `json:"termination"`
+}
 
 // ExecFailure carries the structured payload for ExecEventFailed events.
 // All fields are best-effort — on serialisation failure the runtime falls
@@ -3103,11 +3117,12 @@ type ExecFailure struct {
 
 // ExecStreamEvent is one event from a streaming exec session.
 type ExecStreamEvent struct {
-	Kind     ExecEventKind
-	PID      uint32       // ExecEventStarted
-	Data     []byte       // ExecEventStdout / ExecEventStderr
-	ExitCode int          // ExecEventExited
-	Failure  *ExecFailure // ExecEventFailed / ExecEventStdinError
+	Kind         ExecEventKind
+	PID          uint32            // ExecEventStarted
+	Data         []byte            // ExecEventStdout / ExecEventStderr
+	ExitCode     int               // ExecEventExited
+	Failure      *ExecFailure      // ExecEventFailed / ExecEventStdinError
+	Interruption *ExecInterruption // ExecEventInterrupted; ExitCode is not valid
 }
 
 // ExecSink is a write-only sink for sending data to a running process's stdin.
@@ -3246,11 +3261,12 @@ func (h *ExecStreamHandle) Recv(ctx context.Context) (*ExecStreamEvent, error) {
 		return nil, err
 	}
 	var raw struct {
-		Event string          `json:"event"`
-		PID   uint32          `json:"pid"`
-		Data  string          `json:"data"` // base64
-		Code  int             `json:"code"`
-		Error json.RawMessage `json:"error"`
+		Event        string            `json:"event"`
+		PID          uint32            `json:"pid"`
+		Data         string            `json:"data"` // base64
+		Code         int               `json:"code"`
+		Error        json.RawMessage   `json:"error"`
+		Interruption *ExecInterruption `json:"interruption"`
 	}
 	if err := json.Unmarshal([]byte(out), &raw); err != nil {
 		return nil, fmt.Errorf("parse exec event: %w", err)
@@ -3298,6 +3314,12 @@ func (h *ExecStreamHandle) Recv(ctx context.Context) (*ExecStreamEvent, error) {
 		ev.Failure = &f
 	case "done":
 		ev.Kind = ExecEventDone
+	case "interrupted":
+		if raw.Interruption == nil || raw.Interruption.Reason.Kind == "" || raw.Interruption.Termination.Kind == "" {
+			return nil, fmt.Errorf("exec interruption lacks reason or termination observation")
+		}
+		ev.Kind = ExecEventInterrupted
+		ev.Interruption = raw.Interruption
 	default:
 		return nil, fmt.Errorf("unknown exec event: %q", raw.Event)
 	}

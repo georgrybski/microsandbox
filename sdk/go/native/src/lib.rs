@@ -523,6 +523,15 @@ impl From<MicrosandboxError> for FfiError {
             MicrosandboxError::VolumeNotFound(_) => error_kind::VOLUME_NOT_FOUND,
             MicrosandboxError::VolumeAlreadyExists(_) => error_kind::VOLUME_ALREADY_EXISTS,
             MicrosandboxError::ExecTimeout(_) => error_kind::EXEC_TIMEOUT,
+            MicrosandboxError::ExecInterrupted(outcome)
+                if matches!(
+                    outcome.reason,
+                    microsandbox::ExecInterruptionReason::Timeout(_)
+                ) =>
+            {
+                error_kind::EXEC_TIMEOUT
+            }
+            MicrosandboxError::LaunchBindingUnsupported => error_kind::UNSUPPORTED_OPERATION,
             MicrosandboxError::NoDefaultCommand => error_kind::NO_DEFAULT_COMMAND,
             MicrosandboxError::InvalidConfig(_) => error_kind::INVALID_CONFIG,
             MicrosandboxError::SandboxFsOps(_) => error_kind::FILESYSTEM,
@@ -5148,6 +5157,9 @@ pub unsafe extern "C" fn msb_exec_recv(
                             });
                             serde_json::json!({"event":"stdin_error","error":payload}).to_string()
                         }
+                        Some(ExecEvent::Interrupted(outcome)) => {
+                            serde_json::json!({"event":"interrupted","interruption":outcome}).to_string()
+                        }
                     };
                     Ok::<_, FfiError>(json)
                 }
@@ -5163,9 +5175,8 @@ pub unsafe extern "C" fn msb_exec_recv(
     }
 }
 
-/// Release the exec handle. Does not kill the running process; use
-/// msb_sandbox_exec_stream then msb_exec_close after the process exits,
-/// or msb_exec_signal/kill to terminate it first.
+/// Release the exec handle. Dropping its event owner before completion requests
+/// bounded cleanup on the original session; this is not termination proof.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn msb_exec_close(
     cancel_id: u64,

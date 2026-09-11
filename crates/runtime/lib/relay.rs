@@ -9,6 +9,10 @@
 //! handshake so that the relay can route agent responses back to the correct
 //! client without rewriting frame headers.
 
+#[cfg(test)]
+mod bounded_tests;
+mod client;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,19 +23,24 @@ use bytes::{Bytes, BytesMut};
 use microsandbox_filesystem::{BindIdentityMap, BindIdentityMapHandle};
 use microsandbox_protocol::codec::{self, MAX_FRAME_SIZE};
 use microsandbox_protocol::core::{InitAck, InitResolved, RelayClientDisconnected};
-use microsandbox_protocol::exec::{ExecRequest, ExecSignal, ExecStderr, ExecStdout};
+use microsandbox_protocol::exec::{
+    ExecExited, ExecFailed, ExecRequest, ExecSignal, ExecStderr, ExecStdout,
+};
 use microsandbox_protocol::message::{
     FLAG_SESSION_START, FLAG_SHUTDOWN, FLAG_TERMINAL, FRAME_HEADER_SIZE, Message, MessageType,
 };
 use microsandbox_protocol::{AGENT_RELAY_ID_RANGE_STEP, AGENT_RELAY_MAX_CLIENTS};
 #[cfg(unix)]
 use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::UnixListener;
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::{NamedPipeServer, PipeMode, ServerOptions};
 use tokio::sync::{Mutex, mpsc, watch};
+use tokio::task::JoinSet;
+
+use self::client::{ClientOutput, ClientState, QueuedFrame};
 
 use crate::clock::spawn_clock_sync_task;
 use crate::console::ConsoleSharedState;
@@ -44,7 +53,7 @@ use crate::{RuntimeError, RuntimeResult};
 
 /// Metadata recorded for each observed exec session. Populated by
 /// `client_reader_task` when an `ExecRequest` arrives, consumed by
-/// the ring reader's tap, and removed on `ExecExited`.
+/// the ring reader's tap, and removed on a matching exec terminal.
 #[derive(Debug, Clone, Copy)]
 struct SessionInfo {
     /// Monotonic per-relay session id. Distinct from the protocol
@@ -72,22 +81,14 @@ type SessionRegistry = std::sync::Mutex<HashMap<u32, SessionInfo>>;
 /// Size of the length prefix in the wire format.
 const LEN_PREFIX_SIZE: usize = 4;
 
-/// Capacity of the per-client write channel.
-const CLIENT_WRITE_CHANNEL_CAPACITY: usize = 64;
+/// Finite local cleanup submission; lack of completion retains the slot.
+const CLIENT_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const GUEST_DECODE_SLICE: usize = 64 * 1024;
+const GUEST_TURN_BYTES: usize = 256 * 1024;
 
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
-
-/// State for a connected client.
-struct ClientState {
-    /// Active session IDs owned by this client (tracked for disconnect cleanup).
-    active_sessions: HashSet<u32>,
-    /// Channel for sending frames to this client's writer task.
-    /// Using a channel avoids holding the client mutex across async writes.
-    /// Uses `Bytes` for zero-copy frame forwarding from the ring buffer.
-    write_tx: mpsc::Sender<Bytes>,
-}
 
 /// The agent relay running in the sandbox process.
 ///
@@ -458,7 +459,10 @@ impl AgentRelay {
             clients_for_reader,
             log_writer_for_reader,
             registry_for_reader,
+            Arc::clone(&used_slots),
         ));
+
+        let mut client_tasks = JoinSet::new();
 
         // Accept loop.
         loop {
@@ -513,29 +517,13 @@ impl AgentRelay {
                                 continue;
                             }
 
-                            // Spawn a per-client writer task so the ring reader
-                            // never holds the mutex across async writes.
-                            let (write_tx, mut write_rx) =
-                                mpsc::channel::<Bytes>(CLIENT_WRITE_CHANNEL_CAPACITY);
-                            tokio::spawn(async move {
-                                while let Some(data) = write_rx.recv().await {
-                                    if let Err(e) = writer_half.write_all(&data).await {
-                                        tracing::error!(
-                                            "agent relay: client writer slot={slot} failed: {e}"
-                                        );
-                                        break;
-                                    }
-                                }
-                            });
-
-                            // Register the client.
-                            {
-                                let mut map = clients.lock().await;
-                                map.insert(slot, ClientState {
-                                    active_sessions: HashSet::new(),
-                                    write_tx,
-                                });
-                            }
+                            let (output, write_rx, cancelled) = ClientOutput::new();
+                            let reader_cancelled = output.subscribe();
+                            clients.lock().await.insert(slot, ClientState::new(output));
+                            client_tasks.spawn(client_writer_task(
+                                slot, writer_half, write_rx, cancelled,
+                                Arc::clone(&clients), Arc::clone(&used_slots),
+                            ));
 
                             // Spawn a reader task for this client.
                             let agent_tx_clone = agent_tx.clone();
@@ -545,7 +533,7 @@ impl AgentRelay {
                             let registry_clone = Arc::clone(&session_registry);
                             let next_id_clone = Arc::clone(&next_session_id);
 
-                            tokio::spawn(client_reader_task(
+                            client_tasks.spawn(client_reader_task(
                                 slot,
                                 reader_half,
                                 agent_tx_clone,
@@ -556,6 +544,7 @@ impl AgentRelay {
                                 next_id_clone,
                                 id_start,
                                 id_end_exclusive,
+                                reader_cancelled,
                             ));
                         }
                         Err(e) => {
@@ -567,6 +556,11 @@ impl AgentRelay {
                     if *shutdown.borrow() {
                         tracing::info!("agent relay: shutdown signal received");
                         break;
+                    }
+                }
+                completed = client_tasks.join_next(), if !client_tasks.is_empty() => {
+                    if let Some(Err(error)) = completed {
+                        tracing::warn!(%error, "agent relay: client task failed; unresolved ownership remains fenced");
                     }
                 }
             }
@@ -583,6 +577,19 @@ impl AgentRelay {
         clock_sync_handle.abort();
         ring_writer_handle.abort();
         ring_reader_handle.abort();
+        for client in clients.lock().await.values() {
+            client.output.close();
+        }
+        if tokio::time::timeout(
+            CLIENT_CLEANUP_TIMEOUT + std::time::Duration::from_secs(1),
+            async { while client_tasks.join_next().await.is_some() {} },
+        )
+        .await
+        .is_err()
+        {
+            client_tasks.abort_all();
+            while client_tasks.join_next().await.is_some() {}
+        }
 
         Ok(())
     }
@@ -724,16 +731,6 @@ fn tap_frame_into_log(frame: &RawFrame, writer: &LogWriter, session_registry: &S
         }
         _ => {}
     }
-
-    // Drop the registry entry on any terminal frame (ExecExited,
-    // ExecFailed) so we don't leak `SessionInfo` for the lifetime of
-    // the relay. The flag is set on both — checking it here covers
-    // every terminal exec frame uniformly.
-    if (frame.flags & FLAG_TERMINAL) != 0
-        && let Ok(mut registry) = session_registry.lock()
-    {
-        registry.remove(&msg.id);
-    }
 }
 
 /// Background task that pushes client frames into the rx_ring for the guest.
@@ -778,6 +775,7 @@ async fn ring_reader_task(
     clients: Arc<Mutex<HashMap<u32, ClientState>>>,
     log_writer: Option<Arc<LogWriter>>,
     session_registry: Arc<SessionRegistry>,
+    used_slots: Arc<Mutex<HashSet<u32>>>,
 ) {
     // Wrap the tx_wake read fd in AsyncFd for tokio-driven notification.
     #[cfg(unix)]
@@ -792,7 +790,8 @@ async fn ring_reader_task(
     };
 
     let mut buf = BytesMut::new();
-    let mut frames = Vec::new();
+
+    let mut pending_chunk = Bytes::new();
 
     loop {
         // Wait for the wake pipe to become readable.
@@ -825,58 +824,170 @@ async fn ring_reader_task(
 
         // Drain the wake pipe and pop all available chunks.
         shared.tx_wake.drain();
-        while let Some(chunk) = shared.tx_ring.pop() {
-            buf.extend_from_slice(&chunk);
-        }
+        drain_guest_turn(
+            &shared,
+            &mut buf,
+            &mut pending_chunk,
+            &clients,
+            &used_slots,
+            log_writer.as_deref(),
+            &session_registry,
+        )
+        .await;
+        tokio::task::yield_now().await;
+    }
+}
 
-        // Extract all complete frames first, then route them.
-        // This avoids holding the client mutex across async writes.
-        while let Some(frame) = try_extract_frame(&mut buf) {
-            frames.push(frame);
-        }
-
-        for frame in frames.drain(..) {
-            let client_slot = frame.id / AGENT_RELAY_ID_RANGE_STEP;
-            let client_slot = client_slot.min(AGENT_RELAY_MAX_CLIENTS - 1);
-
-            let is_terminal = (frame.flags & FLAG_TERMINAL) != 0;
-
-            // Tap every exec session's stdout/stderr into `exec.log`
-            // when a log writer is attached. The CBOR decode is only
-            // done when there is a writer, so the no-capture path is
-            // unchanged.
-            if let Some(writer) = log_writer.as_ref() {
-                tap_frame_into_log(&frame, writer, &session_registry);
+/// Retain at most one incomplete legal frame, plus one decode slice. Do not
+/// accumulate an unbounded frame batch while the producer refills the ring.
+/// The input cursor also owns at most one original console chunk; queue size
+/// and allocation limits in that producer are a separate transport boundary.
+#[allow(clippy::too_many_arguments)]
+async fn drain_guest_turn(
+    shared: &ConsoleSharedState,
+    buf: &mut BytesMut,
+    pending_chunk: &mut Bytes,
+    clients: &Mutex<HashMap<u32, ClientState>>,
+    used_slots: &Mutex<HashSet<u32>>,
+    log_writer: Option<&LogWriter>,
+    session_registry: &SessionRegistry,
+) -> usize {
+    let (mut consumed, mut popped) = (0usize, 0usize);
+    while consumed < GUEST_TURN_BYTES {
+        if pending_chunk.is_empty() {
+            if popped >= 64 {
+                break;
             }
-
-            // Acquire lock briefly to get session bookkeeping + clone writer.
-            // Then release before the async write to avoid blocking other clients.
-            let writer_result = {
-                let mut map = clients.lock().await;
-                if let Some(client) = map.get_mut(&client_slot) {
-                    if is_terminal {
-                        client.active_sessions.remove(&frame.id);
-                    }
-                    Ok(client.write_tx.clone())
-                } else {
-                    Err(frame.id)
-                }
+            let Some(chunk) = shared.tx_ring.pop() else {
+                break;
             };
+            *pending_chunk = Bytes::from(chunk);
+            popped += 1;
+            if pending_chunk.is_empty() {
+                continue;
+            }
+        }
+        let size = pending_chunk
+            .len()
+            .min(GUEST_DECODE_SLICE)
+            .min(GUEST_TURN_BYTES - consumed);
+        let slice = pending_chunk.split_to(size);
+        buf.extend_from_slice(&slice);
+        consumed += size;
+        while let Some(frame) = try_extract_frame(buf) {
+            if let Some(writer) = log_writer {
+                tap_frame_into_log(&frame, writer, session_registry);
+            }
+            route_client_frame(frame, clients, used_slots, session_registry).await;
+        }
+    }
+    if !pending_chunk.is_empty() || !shared.tx_ring.is_empty() {
+        // The wake pipe was drained before this turn. Preserve notification
+        // for remaining bytes even when the producer is now idle.
+        shared.tx_wake.wake();
+    }
+    consumed
+}
 
-            match writer_result {
-                Ok(write_tx) => {
-                    if write_tx.send(frame.data).await.is_err() {
-                        tracing::error!("agent relay: write channel closed for slot={client_slot}");
-                    }
+/// Only a correctly typed terminal from the agent completes tracked exec
+/// ownership. Client-originated flags and unrelated terminal frames do not.
+fn is_exec_terminal(frame: &RawFrame) -> bool {
+    if frame.flags & FLAG_TERMINAL == 0 {
+        return false;
+    }
+    let Ok(message) = decode_frame(&frame.data) else {
+        return false;
+    };
+    match message.t {
+        MessageType::ExecExited => message.payload::<ExecExited>().is_ok(),
+        MessageType::ExecFailed => message.payload::<ExecFailed>().is_ok(),
+        _ => false,
+    }
+}
+
+async fn route_client_frame(
+    frame: RawFrame,
+    clients: &Mutex<HashMap<u32, ClientState>>,
+    used_slots: &Mutex<HashSet<u32>>,
+    session_registry: &SessionRegistry,
+) {
+    let slot = (frame.id / AGENT_RELAY_ID_RANGE_STEP).min(AGENT_RELAY_MAX_CLIENTS - 1);
+    let terminal = is_exec_terminal(&frame);
+    {
+        let mut map = clients.lock().await;
+        if let Some(client) = map.get_mut(&slot) {
+            if terminal && client.active_sessions.remove(&frame.id) {
+                // Optional logging has already observed the frame. Retire
+                // bookkeeping regardless of logging before publishing the
+                // terminal and allowing this exact exec ID to be reused.
+                if let Ok(mut registry) = session_registry.lock() {
+                    registry.remove(&frame.id);
                 }
-                Err(id) => {
-                    tracing::debug!(
-                        "agent relay: no client for slot={client_slot} id={id} (frame dropped)"
-                    );
-                }
+            }
+            if !client.output.is_closed() && !client.output.try_send(frame.data) {
+                tracing::warn!(
+                    slot,
+                    "agent relay: bounded client output failed; disconnecting only this client"
+                );
             }
         }
     }
+    release_finished_slot(slot, clients, used_slots).await;
+}
+
+async fn release_finished_slot(
+    slot: u32,
+    clients: &Mutex<HashMap<u32, ClientState>>,
+    used_slots: &Mutex<HashSet<u32>>,
+) {
+    let released = {
+        let mut map = clients.lock().await;
+        if map.get(&slot).is_some_and(ClientState::can_release) {
+            map.remove(&slot);
+            true
+        } else {
+            false
+        }
+    };
+    if released {
+        used_slots.lock().await.remove(&slot);
+        tracing::debug!(
+            slot,
+            "agent relay: closed client and observed exec terminals released slot"
+        );
+    }
+}
+
+async fn client_writer_task(
+    slot: u32,
+    mut writer: impl AsyncWrite + Unpin + Send + 'static,
+    mut queued: mpsc::Receiver<QueuedFrame>,
+    mut cancelled: watch::Receiver<bool>,
+    clients: Arc<Mutex<HashMap<u32, ClientState>>>,
+    used_slots: Arc<Mutex<HashSet<u32>>>,
+) {
+    while !*cancelled.borrow() {
+        let frame = tokio::select! {
+            _ = cancelled.changed() => break,
+            frame = queued.recv() => match frame { Some(frame) => frame, None => break },
+        };
+        let written = tokio::select! {
+            _ = cancelled.changed() => break,
+            written = writer.write_all(&frame.bytes) => written,
+        };
+        if written.is_err() {
+            break;
+        }
+    }
+    // Drop both the queued payload permits and actual socket half before the
+    // slot can be recycled. Closing one split half alone cannot wake its reader.
+    drop(queued);
+    drop(writer);
+    if let Some(client) = clients.lock().await.get_mut(&slot) {
+        client.output.close();
+        client.writer_finished = true;
+    }
+    release_finished_slot(slot, &clients, &used_slots).await;
 }
 
 /// Read a single raw frame from an async reader (used for client connections).
@@ -949,9 +1060,17 @@ async fn client_reader_task(
     next_session_id: Arc<AtomicU64>,
     id_start: u32,
     id_end_exclusive: u32,
+    mut cancelled: watch::Receiver<bool>,
 ) {
     loop {
-        let frame = match read_raw_frame(&mut reader).await {
+        if *cancelled.borrow() {
+            break;
+        }
+        let incoming = tokio::select! {
+            _ = cancelled.changed() => break,
+            incoming = read_raw_frame(&mut reader) => incoming,
+        };
+        let frame = match incoming {
             Ok(f) => f,
             Err(_) => {
                 tracing::info!("agent relay: client disconnected slot={slot}");
@@ -961,7 +1080,6 @@ async fn client_reader_task(
 
         // Track session starts for disconnect cleanup.
         let is_session_start = (frame.flags & FLAG_SESSION_START) != 0;
-        let is_terminal = (frame.flags & FLAG_TERMINAL) != 0;
         let is_shutdown = (frame.flags & FLAG_SHUTDOWN) != 0;
 
         if !is_client_frame_allowed(frame.id, frame.flags, id_start, id_end_exclusive) {
@@ -994,11 +1112,32 @@ async fn client_reader_task(
         // FLAG_SESSION_START is set on both ExecRequest and FsRequest,
         // so we decode the type to disambiguate.
         let mut is_exec_session_start = false;
+        let decoded = decode_frame(frame.data.as_ref()).ok();
+        if !is_session_start
+            && decoded
+                .as_ref()
+                .is_some_and(|msg| msg.t == MessageType::ExecRequest)
+        {
+            tracing::warn!(slot, "agent relay: exec opening omitted session-start flag");
+            break;
+        }
         if is_session_start
-            && let Ok(msg) = decode_frame(frame.data.as_ref())
+            && let Some(msg) = decoded
             && msg.t == MessageType::ExecRequest
         {
             is_exec_session_start = true;
+            let mut map = clients.lock().await;
+            if !map
+                .get_mut(&slot)
+                .is_some_and(|client| client.start_exec(frame.id))
+            {
+                tracing::warn!(
+                    slot,
+                    id = frame.id,
+                    "agent relay: duplicate, closed or exhausted exec ownership"
+                );
+                break;
+            }
             let pty = msg.payload::<ExecRequest>().map(|r| r.tty).unwrap_or(false);
             let session_id = next_session_id.fetch_add(1, Ordering::SeqCst);
             if let Ok(mut registry) = session_registry.lock() {
@@ -1012,102 +1151,99 @@ async fn client_reader_task(
             }
         }
 
-        // Only acquire the lock when session bookkeeping is needed.
-        // Data frames (the vast majority) skip the lock entirely.
-        if is_exec_session_start || is_terminal {
-            let mut map = clients.lock().await;
-            if let Some(client) = map.get_mut(&slot) {
-                if is_exec_session_start {
-                    client.active_sessions.insert(frame.id);
-                }
-                if is_terminal {
+        // Forward frame to ring writer (bounded — applies backpressure).
+        let submitted = tokio::select! {
+            _ = cancelled.changed() => false,
+            submitted = agent_tx.send(frame.data.to_vec()) => submitted.is_ok(),
+        };
+        if !submitted {
+            // Tokio channel send is cancellation-safe: this opening frame was
+            // not submitted, so there is no guest exec to retain or terminate.
+            if is_exec_session_start {
+                if let Some(client) = clients.lock().await.get_mut(&slot) {
                     client.active_sessions.remove(&frame.id);
                 }
+                if let Ok(mut registry) = session_registry.lock() {
+                    registry.remove(&frame.id);
+                }
             }
-        }
-
-        // Forward frame to ring writer (bounded — applies backpressure).
-        if agent_tx.send(frame.data.to_vec()).await.is_err() {
             tracing::error!("agent relay: ring writer channel closed");
             break;
         }
     }
 
+    drop(reader);
+
     // Client disconnected — send SIGKILL for each active session.
     let active_sessions = {
         let mut map = clients.lock().await;
-        if let Some(client) = map.remove(&slot) {
-            client.active_sessions
+        if let Some(client) = map.get_mut(&slot) {
+            client.output.close();
+            client.active_sessions.clone()
         } else {
             HashSet::new()
         }
     };
 
-    if !active_sessions.is_empty() {
-        tracing::info!(
-            "agent relay: cleaning up {} active sessions for slot={slot}",
-            active_sessions.len()
+    let submitted = matches!(
+        tokio::time::timeout(
+            CLIENT_CLEANUP_TIMEOUT,
+            submit_disconnect_cleanup(&agent_tx, &active_sessions, id_start, id_end_exclusive),
+        )
+        .await,
+        Ok(Ok(()))
+    );
+    if let Some(client) = clients.lock().await.get_mut(&slot) {
+        client.cleanup_finished = submitted;
+    }
+    if !submitted {
+        tracing::warn!(
+            slot,
+            "agent relay: cleanup submission unconfirmed; retaining correlation slot"
         );
-
-        for session_id in active_sessions {
-            let kill_msg = match Message::with_payload(
-                MessageType::ExecSignal,
-                session_id,
-                &ExecSignal { signal: 9 }, // SIGKILL
-            ) {
-                Ok(msg) => msg,
-                Err(e) => {
-                    tracing::error!(
-                        "agent relay: failed to encode SIGKILL for session {session_id}: {e}"
-                    );
-                    continue;
-                }
-            };
-
-            let mut buf = Vec::new();
-            if let Err(e) = codec::encode_to_buf(&kill_msg, &mut buf) {
-                tracing::error!(
-                    "agent relay: failed to encode SIGKILL frame for session {session_id}: {e}"
-                );
-                continue;
-            }
-
-            if agent_tx.send(buf).await.is_err() {
-                tracing::error!("agent relay: ring writer channel closed during cleanup");
-                break;
-            }
-        }
     }
+    release_finished_slot(slot, &clients, &used_slots).await;
+}
 
-    let disconnected = RelayClientDisconnected {
-        id_start,
-        id_end_exclusive,
-    };
-    let disconnect_msg =
-        match Message::with_payload(MessageType::RelayClientDisconnected, 0, &disconnected) {
-            Ok(msg) => msg,
-            Err(e) => {
-                tracing::error!("agent relay: failed to encode relay disconnect event: {e}");
-                used_slots.lock().await.remove(&slot);
-                tracing::debug!("agent relay: slot={slot} released");
-                return;
-            }
-        };
-    let mut buf = Vec::new();
-    match codec::encode_to_buf(&disconnect_msg, &mut buf) {
-        Ok(()) => {
-            if agent_tx.send(buf).await.is_err() {
-                tracing::error!("agent relay: ring writer channel closed during fs cleanup");
-            }
-        }
-        Err(e) => {
-            tracing::error!("agent relay: failed to encode relay disconnect frame: {e}");
-        }
+/// Submission is not process termination. A closed slot still retains each
+/// exec ID until a valid agent terminal arrives, even after SIGKILL was queued.
+async fn submit_disconnect_cleanup(
+    agent_tx: &mpsc::Sender<Vec<u8>>,
+    active_sessions: &HashSet<u32>,
+    id_start: u32,
+    id_end_exclusive: u32,
+) -> RuntimeResult<()> {
+    for &session_id in active_sessions {
+        let kill = Message::with_payload(
+            MessageType::ExecSignal,
+            session_id,
+            &ExecSignal { signal: 9 },
+        )
+        .map_err(|error| RuntimeError::Custom(error.to_string()))?;
+        let mut bytes = Vec::new();
+        codec::encode_to_buf(&kill, &mut bytes)
+            .map_err(|error| RuntimeError::Custom(error.to_string()))?;
+        agent_tx
+            .send(bytes)
+            .await
+            .map_err(|_| RuntimeError::Custom("agent relay: cleanup channel closed".into()))?;
     }
-
-    // Release the client slot.
-    used_slots.lock().await.remove(&slot);
-    tracing::debug!("agent relay: slot={slot} released");
+    let disconnected = Message::with_payload(
+        MessageType::RelayClientDisconnected,
+        0,
+        &RelayClientDisconnected {
+            id_start,
+            id_end_exclusive,
+        },
+    )
+    .map_err(|error| RuntimeError::Custom(error.to_string()))?;
+    let mut bytes = Vec::new();
+    codec::encode_to_buf(&disconnected, &mut bytes)
+        .map_err(|error| RuntimeError::Custom(error.to_string()))?;
+    agent_tx
+        .send(bytes)
+        .await
+        .map_err(|_| RuntimeError::Custom("agent relay: disconnect cleanup channel closed".into()))
 }
 
 /// Return whether a client-originated frame may be forwarded to agentd.

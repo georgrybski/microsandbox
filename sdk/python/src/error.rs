@@ -67,6 +67,15 @@ pub fn to_py_err(err: microsandbox::MicrosandboxError) -> PyErr {
             SandboxStillRunning(_) => ("SandboxStillRunningError", err.to_string()),
             SandboxNotRunning(_) => ("SandboxNotRunningError", err.to_string()),
             ExecTimeout(_) => ("ExecTimeoutError", err.to_string()),
+            ExecInterrupted(outcome)
+                if matches!(
+                    outcome.reason,
+                    microsandbox::ExecInterruptionReason::Timeout(_)
+                ) =>
+            {
+                ("ExecTimeoutError", err.to_string())
+            }
+            LaunchBindingUnsupported => ("UnsupportedOperationError", err.to_string()),
             SandboxFsOps(_) => ("FilesystemError", err.to_string()),
             ImageNotFound(_) => ("ImageNotFoundError", err.to_string()),
             ImageInUse(_) => ("ImageInUseError", err.to_string()),

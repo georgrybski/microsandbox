@@ -252,5 +252,30 @@ fn exec_event_to_js(event: RustExecEvent) -> ExecEvent {
             data: Some(payload.message.into_bytes().into()),
             code: payload.errno,
         },
+        RustExecEvent::Interrupted(outcome) => ExecEvent {
+            event_type: "interrupted".to_string(),
+            pid: None,
+            data: Some(serde_json::json!(outcome).to_string().into_bytes().into()),
+            code: None,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interrupted_event_keeps_observed_exit_separate_from_reason() {
+        let event = exec_event_to_js(RustExecEvent::Interrupted(microsandbox::ExecInterruption {
+            reason: microsandbox::ExecInterruptionReason::Cancelled,
+            termination: microsandbox::ExecTermination::Exited(137),
+        }));
+        assert_eq!(event.event_type, "interrupted");
+        assert!(event.code.is_none());
+        let data: serde_json::Value = serde_json::from_slice(event.data.as_ref().unwrap()).unwrap();
+        assert_eq!(data["reason"]["kind"], "cancelled");
+        assert_eq!(data["termination"]["kind"], "exited");
+        assert_eq!(data["termination"]["value"], 137);
     }
 }
