@@ -39,6 +39,15 @@ def validate_delayed_stop(record, validate_stop):
             "host shutdown forwarding was not observed")
 
 
+def retire_stopped_fixture(fixture, validate_stop):
+    validate_delayed_stop(fixture.report["stops"][0], validate_stop)
+    # The selected VMM has already exited normally. Remove its stopped record
+    # before inherited cleanup, which otherwise requests another stop.
+    fixture.command(["remove", fixture.name], timeout=10)
+    fixture.attempted = False
+    fixture.report["delayed_flush"] = True
+
+
 def validate_result(report):
     require(not report.get("error"), "primary runtime failure")
     require(report.get("typed_init") is True and report.get("activation") is True,
@@ -147,8 +156,7 @@ def fixture_type(support):
             require(marker not in smoke_full.log_text(self.capture_logs(), source="system").splitlines(),
                     "flush marker existed before stopping")
             smoke_full.stop(self, marker)
-            validate_delayed_stop(self.report["stops"][0], smoke_contract.validate_stop)
-            self.report["delayed_flush"] = True
+            retire_stopped_fixture(self, smoke_contract.validate_stop)
 
     return HandoffFixture
 

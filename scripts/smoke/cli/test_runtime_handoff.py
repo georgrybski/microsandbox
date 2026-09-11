@@ -81,6 +81,46 @@ class HandoffContract(unittest.TestCase):
         self.assertLess(script.index("/bin/sync -f"), script.index("> /dev/console"))
         self.assertEqual(script.count("fixed-marker"), 2)
 
+    def test_validated_stop_removed_before_clearing_cleanup_ownership(self):
+        fixture = mock.Mock(name="fixture")
+        fixture.name, fixture.attempted = "owned-sandbox", True
+        fixture.report = {"stops": [self.stop()]}
+
+        def removed(argv, timeout):
+            self.assertTrue(fixture.attempted)
+            self.assertNotIn("delayed_flush", fixture.report)
+            self.assertEqual(argv, ["remove", "owned-sandbox"])
+            self.assertEqual(timeout, 10)
+
+        fixture.command.side_effect = removed
+        handoff.retire_stopped_fixture(fixture, validate_stop)
+        fixture.command.assert_called_once()
+        self.assertFalse(fixture.attempted)
+        self.assertTrue(fixture.report["delayed_flush"])
+
+    def test_invalid_stop_retains_cleanup_ownership_without_removal(self):
+        fixture = mock.Mock()
+        fixture.attempted = True
+        stop = self.stop()
+        stop["runtime_exit"]["status"] = 1
+        fixture.report = {"stops": [stop]}
+        with self.assertRaises(ValueError):
+            handoff.retire_stopped_fixture(fixture, validate_stop)
+        self.assertTrue(fixture.attempted)
+        self.assertNotIn("delayed_flush", fixture.report)
+        fixture.command.assert_not_called()
+
+    def test_failed_or_interrupted_remove_retains_cleanup_ownership(self):
+        for error in (RuntimeError("remove failed"), InterruptedError("cancelled")):
+            fixture = mock.Mock()
+            fixture.attempted = True
+            fixture.report = {"stops": [self.stop()]}
+            fixture.command.side_effect = error
+            with self.subTest(error=error), self.assertRaises(type(error)):
+                handoff.retire_stopped_fixture(fixture, validate_stop)
+            self.assertTrue(fixture.attempted)
+            self.assertNotIn("delayed_flush", fixture.report)
+
     def test_only_complete_result_passes(self):
         report = self.report()
         handoff.validate_result(report)
