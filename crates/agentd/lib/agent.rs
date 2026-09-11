@@ -56,6 +56,10 @@ const SERIAL_READ_BUF_SIZE: usize = 64 * 1024;
 /// Maximum allowed input buffer size (frame size limit + 4 bytes for length prefix).
 const MAX_INPUT_BUF_SIZE: usize = MAX_FRAME_SIZE as usize + 4;
 
+/// Aggregate serialized output. Slow serial readers cannot grow host replies
+/// indefinitely or stop this loop from reading cancellation requests.
+const MAX_OUTPUT_BUF_SIZE: usize = 8 * 1024 * 1024;
+
 /// Maximum time to wait for the host to acknowledge the init context.
 const INIT_ACK_TIMEOUT_SECS: u64 = 60;
 
@@ -206,6 +210,9 @@ pub async fn run(
     // Main loop.
     'agent: loop {
         tokio::select! {
+            result = flush_write_once(&async_port, &mut serial_out_buf), if !serial_out_buf.is_empty() => {
+                result?;
+            }
             failure = process_manager_failure.changed() => {
                 let error = match failure {
                     Ok(()) => process_manager_failure
@@ -282,6 +289,7 @@ pub async fn run(
                                         out_before,
                                         &mut activity,
                                     );
+                                    check_output_bound(&serial_out_buf)?;
                                     publish_heartbeat_snapshot(&heartbeat_tx, &state, &activity);
                                     continue;
                                 }
@@ -305,13 +313,13 @@ pub async fn run(
                                     out_before,
                                     &mut activity,
                                 );
+                                check_output_bound(&serial_out_buf)?;
                                 publish_heartbeat_snapshot(&heartbeat_tx, &state, &activity);
                             }
 
-                            // Flush any outgoing messages.
-                            if !serial_out_buf.is_empty() {
-                                flush_write_buf(&async_port, &mut serial_out_buf).await?;
-                            }
+                            // Give writable/session readiness a turn instead of
+                            // draining an unbounded stream of host requests.
+                            break;
                         }
                         Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                         Ok(Err(_)) if !handoff::is_pid_1() => {
@@ -327,11 +335,11 @@ pub async fn run(
             }
 
             // Receive output events from session reader tasks.
-            Some((id, output)) = session_rx.recv() => {
+            Some((id, output)) = session_rx.recv(), if serial_out_buf.len() < MAX_OUTPUT_BUF_SIZE - MAX_FRAME_SIZE as usize - 4 => {
                 match output {
                     SessionOutput::Stdout(data) => {
                         let len = data.len();
-                        let msg = Message::with_payload(MessageType::ExecStdout, id, &ExecStdout { data })
+                        let msg = Message::with_payload(MessageType::ExecStdout, id, &ExecStdout { data: data.into_data() })
                             .map_err(|e| AgentdError::ExecSession(format!("encode stdout: {e}")))?;
                         codec::encode_to_buf(&msg, &mut serial_out_buf)
                             .map_err(|e| AgentdError::ExecSession(format!("encode stdout frame: {e}")))?;
@@ -340,7 +348,7 @@ pub async fn run(
                     }
                     SessionOutput::Stderr(data) => {
                         let len = data.len();
-                        let msg = Message::with_payload(MessageType::ExecStderr, id, &ExecStderr { data })
+                        let msg = Message::with_payload(MessageType::ExecStderr, id, &ExecStderr { data: data.into_data() })
                             .map_err(|e| AgentdError::ExecSession(format!("encode stderr: {e}")))?;
                         codec::encode_to_buf(&msg, &mut serial_out_buf)
                             .map_err(|e| AgentdError::ExecSession(format!("encode stderr frame: {e}")))?;
@@ -369,9 +377,7 @@ pub async fn run(
                 }
                 publish_heartbeat_snapshot(&heartbeat_tx, &state, &activity);
 
-                if !serial_out_buf.is_empty() {
-                    flush_write_buf(&async_port, &mut serial_out_buf).await?;
-                }
+                check_output_bound(&serial_out_buf)?;
             }
         }
     }
@@ -554,10 +560,7 @@ async fn handle_message(
                 return Ok(());
             };
             if let Some(session) = state.sessions.get_mut(&msg.id) {
-                if stdin.data.is_empty() {
-                    // Empty data signals EOF — close stdin.
-                    session.close_stdin();
-                } else if let Err(e) = session.write_stdin(&stdin.data).await {
+                if let Err(e) = session.enqueue_stdin(stdin.data) {
                     let payload = stdin_error_payload(&e);
                     eprintln!("stdin write error on session {}: {e}", msg.id);
                     let reply =
@@ -1233,15 +1236,32 @@ fn write_all_to_fd(fd: i32, mut buf: &[u8], deadline: Instant) -> AgentdResult<(
 /// Flushes the write buffer to the async fd.
 async fn flush_write_buf(fd: &AsyncFd<std::fs::File>, buf: &mut Vec<u8>) -> AgentdResult<()> {
     while !buf.is_empty() {
-        let mut guard = fd.writable().await?;
-        match guard.try_io(|inner| write_to_fd(inner.get_ref().as_raw_fd(), buf)) {
-            Ok(Ok(n)) => {
-                buf.drain(..n);
-            }
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_would_block) => continue,
+        flush_write_once(fd, buf).await?;
+    }
+    Ok(())
+}
+
+/// One cancellation-safe readiness/write step. Used directly by the main
+/// select so pending output never owns the read/control path.
+async fn flush_write_once(fd: &AsyncFd<std::fs::File>, buf: &mut Vec<u8>) -> AgentdResult<()> {
+    let mut guard = fd.writable().await?;
+    match guard.try_io(|inner| write_to_fd(inner.get_ref().as_raw_fd(), buf)) {
+        Ok(Ok(0)) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into()),
+        Ok(Ok(n)) => {
+            buf.drain(..n);
         }
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => {}
+        Ok(Err(error)) => return Err(error.into()),
+        Err(_would_block) => {}
+    }
+    Ok(())
+}
+
+fn check_output_bound(buf: &[u8]) -> AgentdResult<()> {
+    if buf.len() > MAX_OUTPUT_BUF_SIZE {
+        return Err(AgentdError::ExecSession(
+            "serial output buffer exceeded maximum size; disconnecting".into(),
+        ));
     }
     Ok(())
 }
@@ -1305,6 +1325,49 @@ async fn request_guest_poweroff() -> AgentdResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_exec_serial_output_refuses_aggregate_overflow() {
+        assert!(check_output_bound(&vec![0; MAX_OUTPUT_BUF_SIZE]).is_ok());
+        assert!(check_output_bound(&vec![0; MAX_OUTPUT_BUF_SIZE + 1]).is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_exec_blocked_serial_output_keeps_control_readable() {
+        use std::os::fd::OwnedFd;
+        let (port, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        port.set_nonblocking(true).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        // Fill only this fixture socket's outbound buffer; its inbound path
+        // remains independent, just like the single console AsyncFd in run.
+        let payload = [0_u8; 4096];
+        loop {
+            match write_to_fd(port.as_raw_fd(), &payload) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("fill fixture socket: {e}"),
+            }
+        }
+        let port = AsyncFd::new(File::from(OwnedFd::from(port))).unwrap();
+        assert_eq!(write_to_fd(peer.as_raw_fd(), b"cancel").unwrap(), 6);
+        let mut pending = vec![1; 16];
+        time::timeout(Duration::from_secs(1), async {
+            loop {
+                tokio::select! {
+                    result = flush_write_once(&port, &mut pending) => { result.unwrap(); },
+                    readiness = port.readable() => {
+                        let mut ready = readiness.unwrap();
+                        let mut bytes = [0; 6];
+                        if let Ok(Ok(n)) = ready.try_io(|fd| read_from_fd(fd.get_ref().as_raw_fd(), &mut bytes)) {
+                            assert_eq!(&bytes[..n], b"cancel");
+                            break;
+                        }
+                    }
+                }
+            }
+        }).await.unwrap();
+        assert_eq!(pending, vec![1; 16]);
+    }
     use microsandbox_protocol::message::PROTOCOL_VERSION;
 
     #[test]

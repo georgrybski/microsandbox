@@ -748,6 +748,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "bincode"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36eaf5d7b090263e8150820482d5d93cd964a81e4019913c972f4edcc6edb740"
+dependencies = [
+ "bincode_derive",
+ "serde",
+ "unty",
+]
+
+[[package]]
+name = "bincode_derive"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf95709a440f45e986983918d0e8a1f30a9b1df04918fc828670606804ac3c09"
+dependencies = [
+ "virtue",
+]
+
+[[package]]
 name = "bit-vec"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2312,12 +2332,12 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "flate2"
-version = "1.1.9"
+version = "1.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
+checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
 dependencies = [
  "crc32fast",
- "miniz_oxide",
+ "miniz_oxide 0.9.1",
  "zlib-rs",
 ]
 
@@ -2637,9 +2657,9 @@ dependencies = [
 
 [[package]]
 name = "granit-parser"
-version = "1.1.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ccd1be9ebf2bd5520dbfcfb72b70ef492f654061299a097056f3e73410e38ec"
+checksum = "65ec0d45986cd51c847c75c5b69a00852c4fc84d0e5e79f041173f73437d0cdf"
 dependencies = [
  "arraydeque",
  "smallvec",
@@ -2982,9 +3002,9 @@ dependencies = [
 
 [[package]]
 name = "hyper"
-version = "1.11.0"
+version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d22053281f852e11534f5198498373cbb59295120a20771d90f7ed1897490a72"
+checksum = "27b501faa50e7a26c3d3560ca625132f4078a17771f4810baf70475ae48cbe43"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3517,7 +3537,9 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b3c06ff73c7ce03e780887ec2389d62d2a2a9ddf471ab05c2ff69207cd3f3b4"
 dependencies = [
+ "serde",
  "vmm-sys-util",
+ "zerocopy",
 ]
 
 [[package]]
@@ -3729,9 +3751,9 @@ dependencies = [
 
 [[package]]
 name = "lru"
-version = "0.18.2"
+version = "0.18.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d2f2f9b4ba7e6b24d95e7e899329d35be83bcded72c8540cdd5368932d1d90a"
+checksum = "ff9840bcc50b71349309900da0ce7279aa336ae71d73250b07998932c7d97c25"
 dependencies = [
  "hashbrown 0.17.1",
 ]
@@ -3822,7 +3844,7 @@ dependencies = [
 
 [[package]]
 name = "microsandbox"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "anyhow",
  "astral-tokio-tar",
@@ -3888,7 +3910,7 @@ dependencies = [
 
 [[package]]
 name = "microsandbox-agent-client"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "ciborium",
  "microsandbox-protocol",
@@ -3901,7 +3923,7 @@ dependencies = [
 
 [[package]]
 name = "microsandbox-agentd"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -3918,7 +3940,7 @@ dependencies = [
 
 [[package]]
 name = "microsandbox-brokerd"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "ciborium",
  "libc",
@@ -3928,6 +3950,7 @@ dependencies = [
  "russh",
  "serde",
  "serde_bytes",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "zeroize",
@@ -3935,7 +3958,7 @@ dependencies = [
 
 [[package]]
 name = "microsandbox-cli"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3980,7 +4003,7 @@ dependencies = [
 
 [[package]]
 name = "microsandbox-db"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "async-trait",
  "sea-orm",
@@ -3992,7 +4015,7 @@ dependencies = [
 
 [[package]]
 name = "microsandbox-filesystem"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "globset",
  "libc",
@@ -4009,7 +4032,7 @@ dependencies = [
 
 [[package]]
 name = "microsandbox-go"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "base64 0.23.1",
  "cbindgen",
@@ -4027,7 +4050,7 @@ dependencies = [
 
 [[package]]
 name = "microsandbox-image"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "astral-tokio-tar",
  "async-compression",
@@ -4055,7 +4078,7 @@ dependencies = [
 
 [[package]]
 name = "microsandbox-metrics"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "chrono",
  "libc",
@@ -4067,7 +4090,7 @@ dependencies = [
 
 [[package]]
 name = "microsandbox-metrics-collector"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4095,7 +4118,7 @@ dependencies = [
 
 [[package]]
 name = "microsandbox-migration"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "sea-orm-migration",
  "serde_json",
@@ -4104,7 +4127,7 @@ dependencies = [
 
 [[package]]
 name = "microsandbox-network"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -4126,7 +4149,7 @@ dependencies = [
  "msb_krun",
  "msb_krun_utils",
  "parking_lot",
- "pem",
+ "pem 3.0.6",
  "percent-encoding",
  "rcgen",
  "resolv-conf",
@@ -4150,7 +4173,7 @@ dependencies = [
 
 [[package]]
 name = "microsandbox-node"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "bytes",
  "chrono",
@@ -4167,7 +4190,7 @@ dependencies = [
 
 [[package]]
 name = "microsandbox-protocol"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "chrono",
  "ciborium",
@@ -4176,14 +4199,16 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "sha2 0.11.0",
  "strum 0.28.0",
  "thiserror 2.0.20",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
 name = "microsandbox-py"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "chrono",
  "futures",
@@ -4200,7 +4225,7 @@ dependencies = [
 
 [[package]]
 name = "microsandbox-runtime"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "bytes",
  "chrono",
@@ -4235,7 +4260,7 @@ dependencies = [
 
 [[package]]
 name = "microsandbox-scan"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "base64 0.23.1",
  "hex",
@@ -4248,7 +4273,7 @@ dependencies = [
 
 [[package]]
 name = "microsandbox-types"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "chrono",
  "dprint-plugin-typescript",
@@ -4266,7 +4291,7 @@ dependencies = [
 
 [[package]]
 name = "microsandbox-types-macros"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4275,7 +4300,7 @@ dependencies = [
 
 [[package]]
 name = "microsandbox-utils"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "dirs",
  "libc",
@@ -4288,7 +4313,7 @@ dependencies = [
 
 [[package]]
 name = "microsandbox-vsock"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "libc",
  "msb_krun",
@@ -4315,6 +4340,15 @@ name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+dependencies = [
+ "adler2",
+]
+
+[[package]]
+name = "miniz_oxide"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
  "simd-adler32",
@@ -4366,7 +4400,7 @@ dependencies = [
  "async-trait",
  "cfg-if",
  "libc",
- "miniz_oxide",
+ "miniz_oxide 0.8.9",
  "msb-vm-memory",
  "nix 0.30.1",
  "page_size",
@@ -4379,8 +4413,7 @@ dependencies = [
 [[package]]
 name = "msb-vm-memory"
 version = "0.18.0-msb.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c31dfbf17e640f6d661ae17e098b87c019821fe3eb4aba0e9eeada4ba678096"
+source = "git+https://github.com/superradcompany/rust-vmm?rev=f798d4f274db22a3c458ba756900db2cd03e6fe9#f798d4f274db22a3c458ba756900db2cd03e6fe9"
 dependencies = [
  "libc",
  "thiserror 2.0.20",
@@ -4389,8 +4422,8 @@ dependencies = [
 
 [[package]]
 name = "msb_krun"
-version = "0.1.32"
-source = "git+https://github.com/rybskiworks/libkrun?rev=dc9f5f16a2384ab4c84d50c01f9613f9e1879705#dc9f5f16a2384ab4c84d50c01f9613f9e1879705"
+version = "0.1.34"
+source = "git+https://github.com/rybskiworks/libkrun?rev=5b81726df87807876e11939995df2eb6688be173#5b81726df87807876e11939995df2eb6688be173"
 dependencies = [
  "crossbeam-channel",
  "kvm-bindings",
@@ -4408,8 +4441,8 @@ dependencies = [
 
 [[package]]
 name = "msb_krun_arch"
-version = "0.1.32"
-source = "git+https://github.com/rybskiworks/libkrun?rev=dc9f5f16a2384ab4c84d50c01f9613f9e1879705#dc9f5f16a2384ab4c84d50c01f9613f9e1879705"
+version = "0.1.34"
+source = "git+https://github.com/rybskiworks/libkrun?rev=5b81726df87807876e11939995df2eb6688be173#5b81726df87807876e11939995df2eb6688be173"
 dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
@@ -4422,13 +4455,13 @@ dependencies = [
 
 [[package]]
 name = "msb_krun_arch_gen"
-version = "0.1.32"
-source = "git+https://github.com/rybskiworks/libkrun?rev=dc9f5f16a2384ab4c84d50c01f9613f9e1879705#dc9f5f16a2384ab4c84d50c01f9613f9e1879705"
+version = "0.1.34"
+source = "git+https://github.com/rybskiworks/libkrun?rev=5b81726df87807876e11939995df2eb6688be173#5b81726df87807876e11939995df2eb6688be173"
 
 [[package]]
 name = "msb_krun_cpuid"
-version = "0.1.32"
-source = "git+https://github.com/rybskiworks/libkrun?rev=dc9f5f16a2384ab4c84d50c01f9613f9e1879705#dc9f5f16a2384ab4c84d50c01f9613f9e1879705"
+version = "0.1.34"
+source = "git+https://github.com/rybskiworks/libkrun?rev=5b81726df87807876e11939995df2eb6688be173#5b81726df87807876e11939995df2eb6688be173"
 dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
@@ -4437,9 +4470,10 @@ dependencies = [
 
 [[package]]
 name = "msb_krun_devices"
-version = "0.1.32"
-source = "git+https://github.com/rybskiworks/libkrun?rev=dc9f5f16a2384ab4c84d50c01f9613f9e1879705#dc9f5f16a2384ab4c84d50c01f9613f9e1879705"
+version = "0.1.34"
+source = "git+https://github.com/rybskiworks/libkrun?rev=5b81726df87807876e11939995df2eb6688be173#5b81726df87807876e11939995df2eb6688be173"
 dependencies = [
+ "bincode",
  "bitflags 1.3.2",
  "capng",
  "caps",
@@ -4458,6 +4492,7 @@ dependencies = [
  "msb_krun_utils",
  "nix 0.30.1",
  "rand 0.9.4",
+ "serde",
  "tokio",
  "virtio-bindings",
  "vm-fdt",
@@ -4466,19 +4501,20 @@ dependencies = [
 
 [[package]]
 name = "msb_krun_hvf"
-version = "0.1.32"
-source = "git+https://github.com/rybskiworks/libkrun?rev=dc9f5f16a2384ab4c84d50c01f9613f9e1879705#dc9f5f16a2384ab4c84d50c01f9613f9e1879705"
+version = "0.1.34"
+source = "git+https://github.com/rybskiworks/libkrun?rev=5b81726df87807876e11939995df2eb6688be173#5b81726df87807876e11939995df2eb6688be173"
 dependencies = [
  "crossbeam-channel",
  "libloading 0.8.9",
  "log",
  "msb_krun_arch",
+ "serde",
 ]
 
 [[package]]
 name = "msb_krun_kernel"
-version = "0.1.32"
-source = "git+https://github.com/rybskiworks/libkrun?rev=dc9f5f16a2384ab4c84d50c01f9613f9e1879705#dc9f5f16a2384ab4c84d50c01f9613f9e1879705"
+version = "0.1.34"
+source = "git+https://github.com/rybskiworks/libkrun?rev=5b81726df87807876e11939995df2eb6688be173#5b81726df87807876e11939995df2eb6688be173"
 dependencies = [
  "msb-vm-memory",
  "msb_krun_utils",
@@ -4486,8 +4522,8 @@ dependencies = [
 
 [[package]]
 name = "msb_krun_polly"
-version = "0.1.32"
-source = "git+https://github.com/rybskiworks/libkrun?rev=dc9f5f16a2384ab4c84d50c01f9613f9e1879705#dc9f5f16a2384ab4c84d50c01f9613f9e1879705"
+version = "0.1.34"
+source = "git+https://github.com/rybskiworks/libkrun?rev=5b81726df87807876e11939995df2eb6688be173#5b81726df87807876e11939995df2eb6688be173"
 dependencies = [
  "libc",
  "msb_krun_utils",
@@ -4495,16 +4531,16 @@ dependencies = [
 
 [[package]]
 name = "msb_krun_smbios"
-version = "0.1.32"
-source = "git+https://github.com/rybskiworks/libkrun?rev=dc9f5f16a2384ab4c84d50c01f9613f9e1879705#dc9f5f16a2384ab4c84d50c01f9613f9e1879705"
+version = "0.1.34"
+source = "git+https://github.com/rybskiworks/libkrun?rev=5b81726df87807876e11939995df2eb6688be173#5b81726df87807876e11939995df2eb6688be173"
 dependencies = [
  "msb-vm-memory",
 ]
 
 [[package]]
 name = "msb_krun_utils"
-version = "0.1.32"
-source = "git+https://github.com/rybskiworks/libkrun?rev=dc9f5f16a2384ab4c84d50c01f9613f9e1879705#dc9f5f16a2384ab4c84d50c01f9613f9e1879705"
+version = "0.1.34"
+source = "git+https://github.com/rybskiworks/libkrun?rev=5b81726df87807876e11939995df2eb6688be173#5b81726df87807876e11939995df2eb6688be173"
 dependencies = [
  "bitflags 1.3.2",
  "crossbeam-channel",
@@ -4518,9 +4554,10 @@ dependencies = [
 
 [[package]]
 name = "msb_krun_vmm"
-version = "0.1.32"
-source = "git+https://github.com/rybskiworks/libkrun?rev=dc9f5f16a2384ab4c84d50c01f9613f9e1879705#dc9f5f16a2384ab4c84d50c01f9613f9e1879705"
+version = "0.1.34"
+source = "git+https://github.com/rybskiworks/libkrun?rev=5b81726df87807876e11939995df2eb6688be173#5b81726df87807876e11939995df2eb6688be173"
 dependencies = [
+ "bincode",
  "bzip2",
  "crossbeam-channel",
  "flate2",
@@ -4539,6 +4576,7 @@ dependencies = [
  "msb_krun_polly",
  "msb_krun_utils",
  "nix 0.30.1",
+ "serde",
  "windows-sys 0.61.2",
  "zstd",
 ]
@@ -5214,6 +5252,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pem"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d354a98a3d1251555de99e8fdd8afda05573c31b82f59063a7b0a29b5527f120"
+dependencies = [
+ "base64 0.23.1",
+ "serde_core",
+]
+
+[[package]]
 name = "pem-rfc7468"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5871,11 +5919,11 @@ dependencies = [
 
 [[package]]
 name = "rcgen"
-version = "0.14.9"
+version = "0.14.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "091e7a8e7d86e6feb87a27ce8e2cba29d49eff9507afeebefab7eeb2ca667fb4"
+checksum = "8774e05a7d0de114588e6a28fe7e71694b82614ed569d86d8b389dfbc98b8ad8"
 dependencies = [
- "pem",
+ "pem 4.0.0",
  "ring",
  "rustls-pki-types",
  "time",
@@ -6731,9 +6779,9 @@ dependencies = [
 
 [[package]]
 name = "serde-saphyr"
-version = "1.1.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1ec1f5cac0eb96063c64b28705255a7ed6e7d77f95c1d25e9f8b8c928006ce1"
+checksum = "3afb591f9cdb6223c88ba39269aff895620c7f0716dc42b705b5733d5c7c0823"
 dependencies = [
  "annotate-snippets",
  "encoding_rs_io",
@@ -7691,14 +7739,14 @@ dependencies = [
 
 [[package]]
 name = "test-init"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "test-macros"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7707,7 +7755,7 @@ dependencies = [
 
 [[package]]
 name = "test-utils"
-version = "0.6.16"
+version = "0.6.18"
 dependencies = [
  "tempfile",
  "test-macros",
@@ -8355,6 +8403,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "unty"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
+
+[[package]]
 name = "ureq"
 version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8472,6 +8526,12 @@ name = "virtio-bindings"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "091f1f09cfbf2a78563b562e7a949465cce1aef63b6065645188d995162f8868"
+
+[[package]]
+name = "virtue"
+version = "0.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
 
 [[package]]
 name = "vm-fdt"
@@ -8700,9 +8760,9 @@ dependencies = [
 
 [[package]]
 name = "which"
-version = "8.0.5"
+version = "8.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f3ef584124b911bcc3875c2f1472e80f24361ceb789bd1c62b3e9a3df9ff43c"
+checksum = "bae2f2b2b816647a1cab1acc91f5bd20812d53cb344382635ec2181940c8034f"
 dependencies = [
  "libc",
 ]

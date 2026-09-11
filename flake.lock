@@ -115,6 +115,18 @@
         "url": "file:///dev/null"
       }
     },
+    "devenv-root_3": {
+      "flake": false,
+      "locked": {
+        "narHash": "sha256-d6xi4mKdjkX2JFicDIv5niSzpyI0m/Hnm8GGAIU04kY=",
+        "type": "file",
+        "url": "file:///dev/null"
+      },
+      "original": {
+        "type": "file",
+        "url": "file:///dev/null"
+      }
+    },
     "fenix": {
       "inputs": {
         "nixpkgs": [
@@ -228,6 +240,49 @@
         "owner": "cachix",
         "repo": "git-hooks.nix",
         "rev": "27555e2624241fb116b49095df4caaee85a25691",
+        "type": "github"
+      }
+    },
+    "libkrunfw": {
+      "inputs": {
+        "devenv": [
+          "libkrunfw",
+          "tooling",
+          "devenv"
+        ],
+        "devenv-root": "devenv-root_2",
+        "flake-parts": [
+          "flake-parts"
+        ],
+        "git-hooks": [
+          "libkrunfw",
+          "tooling",
+          "git-hooks"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "tooling": [
+          "tooling"
+        ],
+        "treefmt-nix": [
+          "libkrunfw",
+          "tooling",
+          "treefmt-nix"
+        ]
+      },
+      "locked": {
+        "lastModified": 1789011740,
+        "narHash": "sha256-urW9w6VusVS0QymKF9wXehEexamIQb7cIJ+Y22Oqj5w=",
+        "owner": "rybskiworks",
+        "repo": "libkrunfw",
+        "rev": "3017d504988971bd84dcc5935c96aa4a81227d1e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "rybskiworks",
+        "repo": "libkrunfw",
+        "rev": "3017d504988971bd84dcc5935c96aa4a81227d1e",
         "type": "github"
       }
     },
@@ -377,6 +432,7 @@
           "tooling",
           "git-hooks"
         ],
+        "libkrunfw": "libkrunfw",
         "mk-shell-bin": "mk-shell-bin",
         "nix2container": "nix2container",
         "nixpkgs": [
@@ -432,7 +488,7 @@
     "tooling": {
       "inputs": {
         "devenv": "devenv",
-        "devenv-root": "devenv-root_2",
+        "devenv-root": "devenv-root_3",
         "fenix": "fenix",
         "flake-parts": "flake-parts",
         "git-hooks": "git-hooks",

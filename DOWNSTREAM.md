@@ -5,9 +5,8 @@ maintained as the microVM substrate for workestrate.
 
 ## Upstream base
 
-- Merge base: `d32705d9`, at upstream v0.6.16 (`e36792d`).
-- As of 2026-09-06, `upstream/main` has since advanced ~11 commits to
-  `e25cae31` (per local refs; not yet merged here).
+- Upstream 0.6.18 at `fa3e43902e9bc49e1d85cc0a7298e13fe2374026` is merged
+  into this branch with its ancestry preserved.
 
 ## Downstream delta
 
@@ -16,6 +15,17 @@ maintained as the microVM substrate for workestrate.
 - Nested virtualization as a first-class, default-off spec option
   (`nested_virt` / `--nested-virt`).
 - agentd offline-build fix (staged-agentd path override for nix builds).
+- Pinned fork runtime and source-built firmware with shared Nix tooling inputs.
+- A credential-free KVM lifecycle smoke app (`nix run .#test-runtime`).
+- Host-reserved guest CIDs projected through the launcher into libkrun, with
+  explicit old-runtime refusal and no network-slot substitution for SSH.
+
+The terminating SSH broker integration is incomplete. Configured endpoints now
+select dispatch before upstream connection/bytes; actual OpenSSH tests cover
+two-session termination, exact username matching and independent host-key
+verification. Generation-bound multi-instance authorization, managed host
+certificates and shared broker VM lifecycle still need integration. Native
+protocol tests and guest-CID tests do not establish full SSH custody acceptance.
 
 ## CI model: two contracts
 
@@ -43,8 +53,9 @@ model, homeless-shelter rationale, and the fail-closed nix contract:
 
 - Upstream code remains Apache-2.0; this fork preserves that license (LICENSE
   is unmodified).
-- The built msb package redistributes libkrunfw, which embeds a
-  GPL-2.0-licensed Linux kernel image. Corresponding source per GPL-2.0 §3:
-  https://github.com/superradcompany/libkrunfw (branch krunfw), pinned as the
-  `vendor/libkrunfw` submodule gitlink (`c5503d82`). See the provenance
-  comment block in `nix/packages/microsandbox.nix`.
+- The Nix runtime links libkrunfw, which embeds a GPL-2.0-licensed Linux kernel.
+  Its source is the `rybskiworks/libkrunfw` revision selected by the `libkrunfw`
+  input in `flake.lock`; that flake pins the kernel tarball and applies its
+  in-tree patches. See `nix/README.md` and `nix/packages/microsandbox.nix`.
+  The upstream `vendor/libkrunfw` submodule and prebuilt release downloads are
+  separate input paths, not the firmware provenance of this Nix package.

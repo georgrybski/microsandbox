@@ -358,6 +358,7 @@ async fn drive_stream(handle: &mut ExecHandle, timeout: Option<Duration>) -> any
             }
             ExecEvent::Exited { code } => return Ok(code),
             ExecEvent::Failed(payload) => anyhow::bail!("exec failed to start: {payload:?}"),
+            ExecEvent::Interrupted(outcome) => anyhow::bail!("exec interrupted: {outcome}"),
             ExecEvent::StdinError(err) => {
                 // Surface the failure instead of silently dropping host input.
                 eprintln!("msb: warning: failed to forward stdin to guest: {err:?}");

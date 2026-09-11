@@ -117,6 +117,7 @@ def test_new_enum_domains_have_canonical_values() -> None:
     assert NamedVolumeMode.ENSURE_EXISTS.value == "ensure-exists"
     assert Stdin.pipe()._mode is StdinMode.PIPE
     assert ExecEventType.STDIN_ERROR.value == "stdin_error"
+    assert ExecEventType.INTERRUPTED.value == "interrupted"
     assert PullEventType.LAYER_DOWNLOAD_VERIFYING.value == "layer_download_verifying"
     assert PlannedChangeKind.SECRET.value == "secret"
     assert ChangeKind.UPDATED.value == "updated"
@@ -214,6 +215,11 @@ def test_native_config_boundaries_accept_concrete_types() -> None:
         )
 
     assert str(concrete.value) == str(baseline.value)
+
+
+def test_network_serializes_strict_mode() -> None:
+    assert Network(strict=True)._to_dict()["strict"] is True
+    assert "strict" not in Network()._to_dict()
 
 
 def test_sandbox_create_accepts_documented_container_protocols() -> None:

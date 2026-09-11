@@ -752,11 +752,12 @@ impl SandboxBuilder {
     /// Set the host-side SSH broker endpoint divert-intended flows dial.
     ///
     /// Host-side only: the endpoint never enters the guest-visible
-    /// network spec. Spawn joins it with the leased-slot transport
-    /// identifier on the resolved config; without it, divert-intended
-    /// flows deny fail-closed.
+    /// network spec. Requires [`Self::guest_cid`] from a host supervisor's
+    /// reservation; missing identity fails launch instead of substituting
+    /// a network slot. Without an endpoint, divert-intended flows deny.
     ///
     /// ```ignore
+    /// .guest_cid(65_536) // Reserve this CID in the host supervisor first.
     /// .ssh_broker_endpoint("/run/msb/ssh-broker.sock")
     /// ```
     #[cfg(feature = "net")]
@@ -766,6 +767,25 @@ impl SandboxBuilder {
             Err(error) => {
                 if self.build_error.is_none() {
                     self.build_error = Some(MicrosandboxError::InvalidConfig(error.to_string()));
+                }
+            }
+        }
+        self
+    }
+
+    /// Assign a host-reserved CID to this VM's existing libkrun vsock device.
+    ///
+    /// This is local, per-launch supervisor input, not a durable workload
+    /// property or an authorization token. The supervisor must prevent reuse
+    /// across processes and bind its own instance/generation before launch.
+    /// Older runtimes refuse the required launch capability. A restored task
+    /// must receive a fresh reservation, never copy a persisted CID.
+    pub fn guest_cid(mut self, cid: u32) -> Self {
+        match microsandbox_runtime::launch::validate_guest_cid(cid) {
+            Ok(()) => self.config.guest_cid = Some(cid),
+            Err(error) => {
+                if self.build_error.is_none() {
+                    self.build_error = Some(MicrosandboxError::InvalidConfig(error));
                 }
             }
         }
@@ -911,6 +931,27 @@ impl SandboxBuilder {
             port,
             socket_type: VsockSocketType::Stream,
         });
+        self
+    }
+
+    /// Bind a fresh host Unix socket and forward accepted streams to a guest port.
+    ///
+    /// This is host-to-guest, unlike [`Self::vsock`]. The guest service accepts
+    /// ordinary vsock streams from host CID 2. Supply an absolute, per-launch
+    /// path in a private supervisor-owned directory. Existing paths cause an
+    /// error; libkrun owns binding and cleanup. A bound transport does not prove
+    /// guest-service readiness.
+    ///
+    /// The setting is local and transient, not persisted in the task spec or
+    /// inherited on restart. Cloud backends and older runtimes refuse it.
+    #[cfg(unix)]
+    pub fn vsock_host_listen(mut self, host_path: impl AsRef<Path>, guest_port: u32) -> Self {
+        self.config
+            .host_vsock_listeners
+            .push(microsandbox_runtime::launch::HostVsockListener {
+                host_socket: host_path.as_ref().to_path_buf(),
+                guest_port,
+            });
         self
     }
 
@@ -1507,6 +1548,13 @@ impl SandboxBuilder {
             return Err(err);
         }
 
+        #[cfg(feature = "net")]
+        if self.config.ssh_broker_endpoint.is_some() && self.config.guest_cid.is_none() {
+            return Err(MicrosandboxError::InvalidConfig(
+                "SSH custody requires a host-reserved guest CID".into(),
+            ));
+        }
+
         if self.config.spec.name.is_empty() {
             return Err(crate::MicrosandboxError::InvalidConfig(
                 "sandbox name is required".into(),
@@ -1638,7 +1686,7 @@ impl SandboxBuilder {
     /// Validate the stable route key and the host resources it references.
     fn validate_vsock_routes(&self) -> MicrosandboxResult<()> {
         if self.config.spec.deployment_profile == DeploymentProfile::MultiTenant
-            && !self.config.spec.vsock.is_empty()
+            && (!self.config.spec.vsock.is_empty() || !self.config.host_vsock_listeners.is_empty())
         {
             return Err(MicrosandboxError::InvalidConfig(
                 "host vsock routes are disabled for multi-tenant deployments".into(),
@@ -1646,6 +1694,11 @@ impl SandboxBuilder {
         }
 
         let mut routes = HashSet::new();
+        microsandbox_runtime::launch::validate_host_vsock_listeners(
+            &self.config.host_vsock_listeners,
+            &self.config.spec.vsock.routes,
+        )
+        .map_err(MicrosandboxError::InvalidConfig)?;
 
         for route in &self.config.spec.vsock.routes {
             #[cfg(unix)]
@@ -2462,6 +2515,40 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn host_vsock_listeners_are_transient_and_validate_with_existing_routes() {
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .vsock_host_listen("/run/launch/in.sock", 5000)
+            .vsock_dgram("/run/events.sock", 5000)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(config.host_vsock_listeners.len(), 1);
+        let json = serde_json::to_value(&config).unwrap();
+        assert!(json.get("host_vsock_listeners").is_none());
+        assert!(!json.to_string().contains("/run/launch/in.sock"));
+        let restored: super::super::SandboxConfig = serde_json::from_value(json).unwrap();
+        assert!(restored.host_vsock_listeners.is_empty());
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .vsock_host_listen("/run/launch/in.sock", 5000)
+            .vsock("/run/out.sock", 5000)
+            .build()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("duplicate vsock stream port"));
+        let err = SandboxBuilder::new("test")
+            .image("alpine")
+            .deployment_profile(DeploymentProfile::MultiTenant)
+            .vsock_host_listen("/run/launch/in.sock", 5000)
+            .build()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("multi-tenant"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn test_builder_rejects_duplicate_vsock_route_key() {
         let err = SandboxBuilder::new("test")
             .image("alpine")
@@ -2565,7 +2652,7 @@ mod tests {
             .image("alpine")
             .port(8080, 80)
             .secret_env("OPENAI_API_KEY", "secret", "api.openai.com")
-            .network(|n| n.max_connections(128))
+            .network(|n| n.max_connections(128).strict(true))
             .build()
             .await
             .unwrap();
@@ -2577,6 +2664,7 @@ mod tests {
         let network = config.local_network_config().unwrap();
         assert_eq!(network.secrets.secrets.len(), 1);
         assert_eq!(network.max_connections, Some(128));
+        assert!(network.strict);
     }
 
     #[cfg(feature = "net")]
@@ -2705,6 +2793,7 @@ mod tests {
     async fn test_builder_sets_ssh_broker_endpoint_off_spec() {
         let config = SandboxBuilder::new("test")
             .image("alpine")
+            .guest_cid(65_536)
             .ssh_broker_endpoint("/run/msb/ssh-broker.sock")
             .build()
             .await
@@ -2725,6 +2814,42 @@ mod tests {
                 .contains("ssh-broker.sock"),
             "guest-visible spec must not name the host broker socket"
         );
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn test_builder_rejects_broker_endpoint_without_reserved_cid() {
+        let error = SandboxBuilder::new("test")
+            .image("alpine")
+            .ssh_broker_endpoint("/run/msb/ssh-broker.sock")
+            .build()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("host-reserved guest CID"));
+    }
+
+    #[tokio::test]
+    async fn test_guest_cid_is_validated_and_never_persisted() {
+        for cid in [0, 1, 2, u32::MAX] {
+            let error = SandboxBuilder::new("test")
+                .image("alpine")
+                .guest_cid(cid)
+                .build()
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("invalid guest CID"));
+        }
+        let config = SandboxBuilder::new("test")
+            .image("alpine")
+            .guest_cid(65_536)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(config.guest_cid, Some(65_536));
+        let json = serde_json::to_value(&config).unwrap();
+        assert!(json.get("guest_cid").is_none());
+        let restored: crate::SandboxConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.guest_cid, None);
     }
 
     #[cfg(feature = "net")]

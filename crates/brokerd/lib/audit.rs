@@ -11,7 +11,86 @@ use std::fmt;
 
 use microsandbox_scan::{ActionSet, PatternDigest, PatternId};
 
+use crate::policy::RelayContext;
 use crate::prelude::SessionIdentity;
+use microsandbox_protocol::broker::Id;
+
+/// Audit coordinates follow the admitted transport mode. Managed launches do
+/// not invent CID/epoch values from their unrelated logical identities.
+pub(crate) enum AuditIdentity {
+    Legacy(SessionIdentity),
+    Managed(RelayContext),
+}
+
+impl AuditIdentity {
+    pub(crate) fn emit(
+        &self,
+        channel: u32,
+        direction: ChannelDirection,
+        credential_id: Option<String>,
+        pattern_id: PatternId,
+        digest: PatternDigest,
+        action: ActionSet,
+    ) {
+        eprintln!(
+            "brokerd: dlp {}",
+            self.render(
+                channel,
+                direction,
+                credential_id,
+                pattern_id,
+                digest,
+                action
+            )
+        );
+    }
+
+    fn render(
+        &self,
+        channel: u32,
+        direction: ChannelDirection,
+        credential_id: Option<String>,
+        pattern_id: PatternId,
+        digest: PatternDigest,
+        action: ActionSet,
+    ) -> String {
+        match self {
+            Self::Legacy(identity) => AuditRecord::new(
+                *identity,
+                channel,
+                direction,
+                credential_id,
+                pattern_id,
+                digest,
+                action,
+            )
+            .render(),
+            Self::Managed(context) => {
+                let session = context.fence.session();
+                format!(
+                    "broker={} controller={} connection={} launch={:?} generation={} revision={} policy={} channel={} direction={} credential={:?} pattern={} digest={} action={}",
+                    session.broker.to_hex(),
+                    session.controller.to_hex(),
+                    session.connection,
+                    context.launch.instance,
+                    Id::from_bytes(context.launch.generation)
+                        .expect("admitted generation")
+                        .to_hex(),
+                    context.revision,
+                    Id::from_bytes(context.digest)
+                        .expect("admitted policy")
+                        .to_hex(),
+                    channel,
+                    direction,
+                    credential_id.as_deref().unwrap_or("-"),
+                    pattern_id,
+                    digest,
+                    action
+                )
+            }
+        }
+    }
+}
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -125,6 +204,51 @@ impl fmt::Display for ChannelDirection {
 mod tests {
     use super::*;
     use microsandbox_scan::{PatternDigest, PatternId};
+
+    #[test]
+    fn managed_audit_uses_full_admitted_launch_without_legacy_coordinates() {
+        use crate::policy::{Launch, PolicyStore};
+        let mut store = PolicyStore::new([1; 32], 1, 1).unwrap();
+        let context = RelayContext {
+            fence: store.connect([2; 32]).unwrap(),
+            launch: Launch {
+                instance: "context/workload/instance".into(),
+                generation: [3; 32],
+            },
+            revision: 4,
+            digest: [5; 32],
+            host: "git.example".into(),
+            port: 22,
+        };
+        let source = record();
+        let rendered = AuditIdentity::Managed(context).render(
+            source.channel,
+            source.direction,
+            source.credential_id.clone(),
+            source.pattern_id,
+            source.digest,
+            source.action,
+        );
+        assert!(rendered.contains("launch=\"context/workload/instance\""));
+        assert!(rendered.contains(&format!("broker={}", "01".repeat(32))));
+        assert!(rendered.contains(&format!("controller={}", "02".repeat(32))));
+        assert!(rendered.contains("revision=4"));
+        assert!(rendered.contains(&format!("generation={}", "03".repeat(32))));
+        assert!(rendered.contains(&format!("policy={}", "05".repeat(32))));
+        assert!(!rendered.contains("cid=") && !rendered.contains("epoch="));
+        assert!(!rendered.contains("pattern-bytes-001"));
+        assert_eq!(
+            AuditIdentity::Legacy(identity()).render(
+                source.channel,
+                source.direction,
+                source.credential_id.clone(),
+                source.pattern_id,
+                source.digest,
+                source.action
+            ),
+            source.render()
+        );
+    }
 
     fn identity() -> SessionIdentity {
         SessionIdentity {

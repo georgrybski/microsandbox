@@ -577,6 +577,9 @@ pub struct NetworkSpec {
     #[config_patch(nested)]
     pub tls: Option<TlsConfig>,
 
+    /// Require hostname-based policy allows to use inspectable application authority.
+    pub strict: bool,
+
     /// Secret injection subdocument.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[config_patch(nested)]
@@ -1761,6 +1764,7 @@ impl Default for NetworkSpec {
             policy: None,
             dns: None,
             tls: None,
+            strict: false,
             secrets: None,
             max_connections: None,
             rate_limiter: None,

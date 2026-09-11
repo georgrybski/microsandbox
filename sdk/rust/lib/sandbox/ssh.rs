@@ -1063,9 +1063,12 @@ impl SshSession {
         };
         let rows = pty.as_ref().map(|p| p.rows).unwrap_or(24);
         let cols = pty.as_ref().map(|p| p.cols).unwrap_or(80);
-        let handle = crate::sandbox::exec::agent::exec_stream_with_pty_size(
-            self.settings.sandbox.backend().as_ref(),
-            self.settings.sandbox.name(),
+        let client = match self.settings.sandbox.backend().kind() {
+            crate::backend::BackendKind::Local => self.settings.sandbox.bound_agent().await?,
+            _ => self.agent_client().await?,
+        };
+        let handle = crate::sandbox::exec::agent::exec_stream_connected(
+            client,
             self.settings.sandbox.config(),
             cmd,
             opts,
@@ -1112,6 +1115,15 @@ impl SshSession {
                         break;
                     }
                     ExecEvent::StdinError(_) => {}
+                    ExecEvent::Interrupted(outcome) => {
+                        let message = Bytes::from(format!("exec interrupted: {outcome}\n"));
+                        let _ = session_handle.extended_data(channel, 1, message).await;
+                        // Never manufacture a successful SSH exit status from
+                        // a timeout, lost transport, or unconfirmed termination.
+                        let _ = session_handle.eof(channel).await;
+                        let _ = session_handle.close(channel).await;
+                        break;
+                    }
                 }
             }
         });

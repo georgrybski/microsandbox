@@ -82,6 +82,18 @@ pub enum AgentClientError {
     #[error("agent correlation id range exhausted")]
     IdRangeExhausted,
 
+    /// A retained session control was used after terminal or transport closure.
+    #[error("agent session {0} no longer accepts sends")]
+    SessionClosed(u32),
+
+    /// An owned-session message exceeded its bounded encoded-body limit.
+    #[error("agent session message exceeds the send byte limit")]
+    SessionSendTooLarge,
+
+    /// The nonblocking owned-session writer byte or frame budget is exhausted.
+    #[error("agent session writer queue is full")]
+    SessionWriteQueueFull,
+
     /// The operation is not implemented yet.
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),

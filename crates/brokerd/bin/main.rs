@@ -1,9 +1,10 @@
 //! Binary entry point for `microsandbox-brokerd`.
 //!
-//! Runs as PID 1 inside the broker VM. Performs minimal synchronous init
-//! (essential filesystems, optional block-root pivot — never guest
-//! networking), moves the sealed bootstrap key into custody, then enters
-//! the async broker loop.
+//! `brokerd service` runs under an ordinary guest service manager with explicit
+//! credentials and direct protected management, without opening the console or
+//! performing PID 1 initialization. Help is strictly nonbinding. The legacy
+//! no-argument PID 1 path retains minimal filesystem init, sealed bootstrap key
+//! custody and its console-bound async broker loop.
 
 use std::process;
 
@@ -33,6 +34,35 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 fn run() -> Result<(), BrokerError> {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments.first().map(String::as_str) == Some("service") {
+        use microsandbox_brokerd::service::{self, ServiceCommand};
+        return match ServiceCommand::parse(&arguments[1..]).map_err(|_| {
+            BrokerError::Protocol("invalid service arguments; use brokerd service --help".into())
+        })? {
+            ServiceCommand::Help => {
+                print!("{}", service::HELP);
+                Ok(())
+            }
+            ServiceCommand::Run(options) => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime
+                    .block_on(service::run(options))
+                    .map_err(|error| BrokerError::Protocol(error.to_string()))
+            }
+        };
+    }
+    if arguments == ["--help"] || arguments == ["-h"] {
+        println!("brokerd: legacy PID 1 mode with no arguments, or brokerd service --help");
+        return Ok(());
+    }
+    if !arguments.is_empty() {
+        return Err(BrokerError::Protocol(
+            "unknown brokerd command; use brokerd service --help".into(),
+        ));
+    }
     // Mount only what console discovery needs, then receive the typed
     // bootstrap frame that the host queued before entering the VM.
     init::prepare_bootstrap_console()?;

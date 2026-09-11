@@ -57,7 +57,7 @@ use crate::{
 /// default, lazily initialised) or [`LocalBackend::builder`] (programmatic).
 pub struct LocalBackend {
     config: Arc<GlobalConfig>,
-    db: OnceCell<DbPools>,
+    db: OnceCell<LocalDatabase>,
     selection_source: BackendSelectionSource,
     profile: Option<String>,
 }
@@ -100,6 +100,30 @@ pub struct LocalBackendBuilder {
 struct MigrationLock {
     #[cfg(unix)]
     file: File,
+}
+
+/// Keep the database inode alive alongside its pools. Replacing the pathname
+/// must not let a still-open old pool authorize a connection to a new runtime.
+struct LocalDatabase {
+    pools: DbPools,
+    #[cfg(target_os = "linux")]
+    file: File,
+    #[cfg(target_os = "linux")]
+    path: PathBuf,
+}
+
+impl std::ops::Deref for LocalDatabase {
+    type Target = DbPools;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pools
+    }
+}
+
+impl std::fmt::Debug for LocalDatabase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalDatabase").finish_non_exhaustive()
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -160,6 +184,22 @@ impl LocalBackend {
                     .await
             })
             .await
+            .map(|database| &database.pools)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn launch_database_identity(&self) -> MicrosandboxResult<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let database = self
+            .db
+            .get()
+            .ok_or(MicrosandboxError::LaunchBindingUnsupported)?;
+        let pinned = database.file.metadata()?;
+        let current = std::fs::symlink_metadata(&database.path)?;
+        if !current.is_file() || (current.dev(), current.ino()) != (pinned.dev(), pinned.ino()) {
+            return Err(MicrosandboxError::LaunchBindingUnsupported);
+        }
+        Ok((pinned.dev(), pinned.ino()))
     }
 
     /// Borrow this backend's [`GlobalConfig`].
@@ -670,12 +710,23 @@ async fn connect_and_migrate(
     db_dir: &Path,
     database: &DatabaseConfig,
     snapshots_dir: &Path,
-) -> MicrosandboxResult<DbPools> {
+) -> MicrosandboxResult<LocalDatabase> {
     tokio::fs::create_dir_all(db_dir).await?;
     let _migration_lock = acquire_migration_lock(db_dir).await?;
     refuse_incomplete_self_downgrade(db_dir)?;
 
     let db_path = db_dir.join(microsandbox_utils::DB_FILENAME);
+    #[cfg(target_os = "linux")]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&db_path)?
+    };
     let pools = DbPools::open(
         &db_path,
         database.max_connections,
@@ -709,7 +760,23 @@ async fn connect_and_migrate(
     reconcile_result?;
     clear_result?;
 
-    Ok(pools)
+    let database = LocalDatabase {
+        pools,
+        #[cfg(target_os = "linux")]
+        file,
+        #[cfg(target_os = "linux")]
+        path: db_path,
+    };
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let pinned = database.file.metadata()?;
+        let current = std::fs::symlink_metadata(&database.path)?;
+        if !current.is_file() || (pinned.dev(), pinned.ino()) != (current.dev(), current.ino()) {
+            return Err(MicrosandboxError::LaunchBindingUnsupported);
+        }
+    }
+    Ok(database)
 }
 
 /// Refuse normal startup while a durable self-downgrade operation owns local
@@ -1124,6 +1191,73 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("database schema is newer"));
+    }
+
+    #[tokio::test]
+    async fn test_connect_and_migrate_upgrades_v0_6_15_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_dir = tmp.path().join("db");
+        let db_path = db_dir.join(microsandbox_utils::DB_FILENAME);
+        std::fs::create_dir_all(&db_dir).unwrap();
+
+        let db = microsandbox_db::connection::DbWriteConnection::open(
+            &db_path,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let released_prefix_len = schema_metadata::migration_ids()
+            .position(|id| id == schema_metadata::SHARED_CPU_ALLOCATION_MIGRATION_ID)
+            .unwrap()
+            + 1;
+        Migrator::up(db.inner(), Some(released_prefix_len as u32))
+            .await
+            .unwrap();
+
+        // v0.6.15 ended with this schema-free compatibility marker. Insert
+        // its migration row to reproduce a database last opened by v0.6.15.
+        db.inner()
+            .execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO seaql_migrations (version, applied_at) VALUES (?, ?)",
+                [
+                    schema_metadata::MOUNT_OWNER_CONFIG_MIGRATION_ID.into(),
+                    1_i64.into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        drop(db);
+
+        let pools = connect_and_migrate(
+            &db_dir,
+            &DatabaseConfig::default(),
+            &tmp.path().join("snapshots"),
+        )
+        .await
+        .unwrap();
+        let network_slot_migration = pools
+            .read()
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "SELECT version FROM seaql_migrations WHERE version = ?",
+                [schema_metadata::SANDBOX_NETWORK_SLOT_MIGRATION_ID.into()],
+            ))
+            .await
+            .unwrap();
+        let network_slot_column = pools
+            .read()
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT name FROM pragma_table_info('sandbox') WHERE name = 'network_slot'"
+                    .to_owned(),
+            ))
+            .await
+            .unwrap();
+
+        assert!(network_slot_migration.is_some());
+        assert!(network_slot_column.is_some());
     }
 
     #[tokio::test]

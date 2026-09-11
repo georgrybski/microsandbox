@@ -74,7 +74,8 @@ impl VsockListener {
         })
     }
 
-    /// Accept the next host-injected divert stream.
+    /// Accept the next divert stream only when its kernel-reported peer is
+    /// `VMADDR_CID_HOST`. A prelude cannot assert authority for this hop.
     pub async fn accept(&self) -> io::Result<VsockStream> {
         loop {
             let mut guard = self.inner.readable().await?;
@@ -216,16 +217,47 @@ fn sockaddr_vm(cid: u32, port: u32) -> libc::sockaddr_vm {
     addr
 }
 
-/// Accept one pending connection on a listen socket.
+/// Accept one pending connection and verify host origin before reading bytes.
 fn accept_one(listen_fd: i32) -> io::Result<OwnedFd> {
-    let fd = unsafe { libc::accept(listen_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+    let mut peer: libc::sockaddr_vm = unsafe { mem::zeroed() };
+    let mut peer_len = mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t;
+    // SAFETY: both output pointers refer to writable storage of the supplied
+    // length. The returned address comes from the kernel, not the peer payload.
+    let fd = unsafe {
+        libc::accept(
+            listen_fd,
+            &mut peer as *mut libc::sockaddr_vm as *mut libc::sockaddr,
+            &mut peer_len,
+        )
+    };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: `fd` is a freshly accepted socket owned by this function.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    validate_host_peer(&peer, peer_len)?;
     set_nonblocking(&owned)?;
     Ok(owned)
+}
+
+/// Authorize the immediate transport peer, not the original workload identity.
+/// The latter must still be verified against host-installed instance policy.
+fn validate_host_peer(peer: &libc::sockaddr_vm, len: libc::socklen_t) -> io::Result<()> {
+    if len as usize != mem::size_of::<libc::sockaddr_vm>()
+        || peer.svm_family != libc::AF_VSOCK as libc::sa_family_t
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "broker divert peer is not a complete vsock address",
+        ));
+    }
+    if peer.svm_cid != VMADDR_CID_HOST {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("broker divert requires host CID, received {}", peer.svm_cid),
+        ));
+    }
+    Ok(())
 }
 
 /// Check a nonblocking connect for completion via `SO_ERROR`.
@@ -291,4 +323,61 @@ fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    use super::*;
+
+    #[test]
+    fn only_complete_kernel_host_addresses_are_accepted() {
+        let size = mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t;
+        for cid in [0, 1, VMADDR_CID_HOST, 3, 65_536, u32::MAX] {
+            for len in [0, size - 1, size, size + 1] {
+                for family in [libc::AF_UNSPEC, libc::AF_UNIX, libc::AF_VSOCK] {
+                    let mut peer = sockaddr_vm(cid, 4000);
+                    peer.svm_family = family as libc::sa_family_t;
+                    assert_eq!(
+                        validate_host_peer(&peer, len).is_ok(),
+                        cid == VMADDR_CID_HOST && len == size && family == libc::AF_VSOCK,
+                        "cid={cid}, len={len}, family={family}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_host_peer_is_a_permission_denial() {
+        let peer = sockaddr_vm(65_536, 4000);
+        let error = validate_host_peer(
+            &peer,
+            mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn accept_rejects_wrong_transport_before_returning_a_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wrong-transport.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut client = UnixStream::connect(&path).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        assert_eq!(
+            accept_one(listener.as_raw_fd()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let mut byte = [0];
+        assert_eq!(std::io::Read::read(&mut client, &mut byte).unwrap(), 0);
+    }
 }

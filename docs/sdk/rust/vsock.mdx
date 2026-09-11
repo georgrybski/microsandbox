@@ -21,6 +21,28 @@ let sandbox = Sandbox::builder("worker")
 
 ## SandboxBuilder
 
+### guest_cid()
+
+```rust
+fn guest_cid(self, cid: u32) -> Self
+```
+
+Assign a CID reserved by a local host supervisor to libkrun for this launch.
+The supervisor must prevent collisions across runtime processes and bind the
+CID to its own instance/generation. Values `0`, `1`, `2` and `u32::MAX` are
+reserved and rejected. The runtime checks the assigned value before guest
+execution. This does not expose new ports or change any route's bytes.
+
+This is host-side, per-launch input, not a field in `SandboxSpec` or a guest
+credential. It is not persisted or copied into a replacement/restarted task.
+Older runtimes reject the required launch capability; cloud backends reject
+the local-only setting. Other language SDKs do not expose this host embedding
+option. Normal vsock routes without an explicit CID retain automatic allocation.
+
+The Rust host-side `ssh_broker_endpoint()` setting requires this reservation;
+the network slot is never a substitute. Full SSH custody additionally requires
+instance/generation authorization and managed host trust.
+
 ### vsock()
 
 ```rust
@@ -36,6 +58,30 @@ fn vsock_dgram(self, host_path: impl AsRef<Path>, port: u32) -> Self
 ```
 
 Expose a host Unix datagram socket while preserving datagram boundaries. Datagram routes are unavailable on Windows.
+
+### vsock_host_listen()
+
+```rust
+fn vsock_host_listen(self, host_path: impl AsRef<Path>, guest_port: u32) -> Self
+```
+
+Unix Rust host-embedding API for the opposite direction: bind a fresh host Unix
+socket and inject accepted streams into a guest service listening on
+`guest_port`. The guest sees host CID `2`. Use an absolute, per-launch socket
+path in a private supervisor-owned directory. Existing paths cause launch
+failure; they are not replaced automatically.
+
+This setting is transient and excluded from durable workload configuration.
+Supply it again for replacement; an ordinary persisted restart does not recreate
+it. Cloud and multi-tenant deployments refuse it, and older runtimes fail the
+mandatory capability check. It is not exposed by the CLI or other language SDKs.
+It cannot share a stream port with `vsock()`; datagrams use a separate namespace.
+
+libkrun owns listener lifetime, including quiescence and normal exit. A forced
+process kill can leave the pathname, so use a new path for a new launch. Socket
+binding alone is not service readiness; the supervisor must verify its guest
+application is ready before routing dependent traffic. Neither this socket nor
+guest-supplied bytes establish another workload's identity.
 
 ### vsock_route()
 

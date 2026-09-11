@@ -32,7 +32,7 @@ use crate::ssh::gateway::{
     classify_ssh_directions, current_epoch_secs, dial_broker_and_send_prelude,
     relay_ssh_via_broker, ssh_flow_for_destination,
 };
-use crate::ssh::policy::decide_ssh_egress;
+use crate::ssh::policy::{SshDecision, decide_ssh_egress, decide_ssh_endpoint};
 use crate::ssh::{SshClassification, trailing_fragment_is_banner_prefix};
 use crate::tls::proxy::TlsProxy;
 use crate::tls::sni;
@@ -83,6 +83,7 @@ pub(crate) struct TcpProxy {
     network_policy: Arc<NetworkPolicy>,
     secrets: Arc<SecretsConfig>,
     tls_state: Option<Arc<TlsState>>,
+    strict: bool,
     proxy_connect: Arc<ProxyConnectState>,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
     ssh_gateway: Option<Arc<SshGatewayConfig>>,
@@ -149,6 +150,7 @@ impl TcpProxy {
         network_policy: Arc<NetworkPolicy>,
         secrets: Arc<SecretsConfig>,
         tls_state: Option<Arc<TlsState>>,
+        strict: bool,
         proxy_connect: Arc<ProxyConnectState>,
         outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
         ssh_gateway: Option<Arc<SshGatewayConfig>>,
@@ -162,6 +164,7 @@ impl TcpProxy {
             network_policy,
             secrets,
             tls_state,
+            strict,
             proxy_connect,
             outbound_proxy,
             ssh_gateway,
@@ -194,6 +197,7 @@ impl TcpProxy {
             network_policy,
             secrets,
             tls_state,
+            strict,
             proxy_connect,
             outbound_proxy,
             ssh_gateway,
@@ -226,7 +230,25 @@ impl TcpProxy {
                 &shared,
                 source,
             ) {
-                EgressEvaluation::Allow => {}
+                EgressEvaluation::Allow => {
+                    if strict_hostname_allow_is_opaque(
+                        strict,
+                        &network_policy,
+                        guest_dst,
+                        &shared,
+                        sni.as_deref(),
+                        &initial_buf,
+                    ) {
+                        tracing::debug!(
+                            sni = sni.as_deref(),
+                            dst = %guest_dst,
+                            "TCP egress denied by strict hostname policy",
+                        );
+                        proxy_connect.mark_policy_denied();
+                        shared.proxy_wake.wake();
+                        return Ok(());
+                    }
+                }
                 EgressEvaluation::Deny => {
                     tracing::debug!(
                         dst = %guest_dst,
@@ -246,6 +268,52 @@ impl TcpProxy {
             }
         }
 
+        // Resolve once before a direct dial. The endpoint policy projects
+        // configured SSH destinations; the host dispatcher retains the full
+        // credential plan and distinguishes guest-held from broker-held keys.
+        // Neither classifier timeout nor an alternate protocol may bypass it.
+        let ssh_flow = ssh_gateway
+            .as_ref()
+            .map(|_| ssh_flow_for_destination(guest_dst, &shared, sni.as_deref()));
+        if let (Some(gateway), Some(flow)) = (ssh_gateway.as_ref(), ssh_flow.as_ref()) {
+            let egress = network_policy.evaluate_egress(guest_dst, Protocol::Tcp, &shared);
+            match decide_ssh_endpoint(flow, egress, &gateway.policy, gateway.broker.as_ref()) {
+                Some(SshDecision::Divert { endpoint }) => {
+                    let prelude =
+                        SshDivertPrelude::new(flow, gateway.transport_cid, current_epoch_secs());
+                    match dial_broker_and_send_prelude(&endpoint, &prelude).await {
+                        Ok(broker_stream) => {
+                            proxy_connect.mark_connected();
+                            return relay_ssh_via_broker(
+                                broker_stream,
+                                initial_buf,
+                                from_smoltcp,
+                                to_smoltcp,
+                                shared,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            tracing::debug!(dst = %guest_dst, %error,
+                                "SSH dispatcher unavailable; denying configured endpoint");
+                            proxy_connect.mark_policy_denied();
+                            shared.proxy_wake.wake();
+                            return Ok(());
+                        }
+                    }
+                }
+                Some(SshDecision::Deny { action }) => {
+                    if matches!(action, ViolationAction::BlockAndTerminate) {
+                        shared.trigger_termination();
+                    }
+                    proxy_connect.mark_policy_denied();
+                    shared.proxy_wake.wake();
+                    return Ok(());
+                }
+                None | Some(SshDecision::Direct) => {}
+            }
+        }
+
         // Peek for HTTP CONNECT before dialing upstream; hand off if detected.
         if let Some(tls_state) = tls_state.clone() {
             if initial_buf.is_empty() {
@@ -262,6 +330,7 @@ impl TcpProxy {
                     shared,
                     network_policy,
                     tls_state,
+                    strict,
                     proxy_connect,
                     outbound_proxy,
                     None,
@@ -287,9 +356,12 @@ impl TcpProxy {
         // (`is_tls` only matters for deciding whether to build the handler).
         // SSH gating also needs this peek so the server banner reaches the
         // guest immediately while both directions are sampled.
-        let want_headers = secrets.has_plain_http_candidates() || secrets.has_host_scoped_secrets();
-        let (mut initial_buf, server_sample, is_tls) =
-            if !secrets.secrets.is_empty() || ssh_gateway.is_some() {
+        let enforce_http_authority = network_policy.has_domain_rules();
+        let want_headers = enforce_http_authority
+            || secrets.has_plain_http_candidates()
+            || secrets.has_host_scoped_secrets();
+        let (initial_buf, server_sample, is_tls) =
+            if want_headers || !secrets.secrets.is_empty() || ssh_gateway.is_some() {
                 classify_first_flight(
                     initial_buf,
                     &mut from_smoltcp,
@@ -306,18 +378,17 @@ impl TcpProxy {
                 (initial_buf, Vec::new(), false)
             };
 
-        // SSH gateway decision on both directions' bytes. The direct
-        // upstream socket is already open and the server banner already
-        // relayed; classification never withholds the banner. The peek
+        // Remaining, non-dispatched endpoints may be restricted by SSH
+        // classification. A direct connection must never switch SSH peers
+        // here: configured endpoint dispatch happened before the dial. The peek
         // above ran under `PEEK_BUDGET`, which intentionally matches
         // `SSH_CLASSIFY_TIMEOUT` so SSH gating adds no extra worst-case
         // latency beyond the current first-flight peek.
-        if let Some(gateway) = ssh_gateway.clone() {
+        if let (Some(gateway), Some(flow)) = (ssh_gateway, ssh_flow) {
             debug_assert_eq!(
                 PEEK_BUDGET, SSH_CLASSIFY_TIMEOUT,
                 "SSH classify window must match the first-flight peek budget"
             );
-            let flow = ssh_flow_for_destination(guest_dst, &shared, sni.as_deref());
             let egress = network_policy.evaluate_egress(guest_dst, Protocol::Tcp, &shared);
             let classification = classify_ssh_directions(&initial_buf, &server_sample);
             if classification == SshClassification::NeedMoreData {
@@ -357,43 +428,16 @@ impl TcpProxy {
                     shared.proxy_wake.wake();
                     return Ok(());
                 }
-                crate::ssh::policy::SshDecision::Divert { endpoint } => {
-                    // Close the direct upstream socket and discard buffered
-                    // direct-server bytes; the broker reoriginates a fresh
-                    // upstream dial. The guest already saw the direct banner,
-                    // so it observes a second banner through the broker relay:
-                    // that double banner is the visible fingerprint of a
-                    // diverted session.
+                crate::ssh::policy::SshDecision::Divert { .. } => {
+                    // Endpoint and policy were frozen before the direct dial;
+                    // a late divert indicates an inconsistent routing path.
+                    // Refuse instead of splicing a new SSH handshake into it.
+                    tracing::error!(dst = %guest_dst, "refusing late SSH dispatcher handoff");
                     drop(server_rx);
                     drop(server_tx);
-                    let prelude =
-                        SshDivertPrelude::new(&flow, gateway.transport_cid, current_epoch_secs());
-                    match dial_broker_and_send_prelude(&endpoint, &prelude).await {
-                        Ok(broker_stream) => {
-                            proxy_connect.mark_connected();
-                            return relay_ssh_via_broker(
-                                broker_stream,
-                                std::mem::take(&mut initial_buf),
-                                from_smoltcp,
-                                to_smoltcp,
-                                shared,
-                            )
-                            .await;
-                        }
-                        Err(error) => {
-                            // Divert-intended without a reachable broker
-                            // denies fail-closed; falling back to direct
-                            // would silently bypass broker authentication.
-                            tracing::debug!(
-                                dst = %guest_dst,
-                                %error,
-                                "ssh broker dial failed; denying divert-intended flow",
-                            );
-                            proxy_connect.mark_policy_denied();
-                            shared.proxy_wake.wake();
-                            return Ok(());
-                        }
-                    }
+                    proxy_connect.mark_policy_denied();
+                    shared.proxy_wake.wake();
+                    return Ok(());
                 }
             }
         }
@@ -417,6 +461,7 @@ impl TcpProxy {
                 shared,
                 network_policy,
                 tls_state,
+                strict,
                 proxy_connect,
                 outbound_proxy,
                 Some(proxy_stream),
@@ -425,8 +470,18 @@ impl TcpProxy {
         }
 
         let mut late_connect_state = tls_state;
-        let mut secrets_handler: Option<SecretsHandler> = if !secrets.secrets.is_empty() && !is_tls
-        {
+        let mut secrets_handler: Option<SecretsHandler> = if is_tls {
+            None
+        } else if enforce_http_authority {
+            let host = extract_http_host(&initial_buf).unwrap_or_default();
+            Some(SecretsHandler::new_plain_http_policy(
+                &secrets,
+                &host,
+                guest_dst,
+                network_policy.clone(),
+                shared.clone(),
+            ))
+        } else if !secrets.secrets.is_empty() {
             Some(match extract_http_host(&initial_buf) {
                 Some(host) => {
                     SecretsHandler::new_plain_http(&secrets, &host, guest_dst.ip(), &shared)
@@ -498,6 +553,7 @@ impl TcpProxy {
                                     shared,
                                     network_policy,
                                     tls_state,
+                                    strict,
                                     proxy_connect,
                                     outbound_proxy,
                                     Some(proxy_stream),
@@ -596,6 +652,7 @@ pub fn spawn_tcp_proxy(
     network_policy: Arc<NetworkPolicy>,
     secrets: Arc<SecretsConfig>,
     tls_state: Option<Arc<TlsState>>,
+    strict: bool,
     proxy_connect: Arc<ProxyConnectState>,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
     ssh_gateway: Option<Arc<SshGatewayConfig>>,
@@ -609,12 +666,36 @@ pub fn spawn_tcp_proxy(
         network_policy,
         secrets,
         tls_state,
+        strict,
         proxy_connect,
         outbound_proxy,
         ssh_gateway,
     );
 
     handle.spawn(proxy.run());
+}
+
+fn strict_hostname_allow_is_opaque(
+    strict: bool,
+    network_policy: &NetworkPolicy,
+    guest_dst: SocketAddr,
+    shared: &SharedState,
+    sni: Option<&str>,
+    initial_buf: &[u8],
+) -> bool {
+    if !strict {
+        return false;
+    }
+
+    let source = if let Some(name) = sni {
+        HostnameSource::Sni(name)
+    } else if initial_buf.is_empty() || initial_buf.first() == Some(&0x16) {
+        HostnameSource::CacheOnly
+    } else {
+        return false;
+    };
+
+    network_policy.allows_egress_via_hostname(guest_dst, Protocol::Tcp, shared, source)
 }
 
 /// Forward an HTTP CONNECT tunnel: dial the proxy, splice the handshake,
@@ -632,6 +713,7 @@ async fn handle_connect_tunnel(
     shared: Arc<SharedState>,
     network_policy: Arc<NetworkPolicy>,
     tls_state: Arc<TlsState>,
+    strict: bool,
     proxy_connect: Arc<ProxyConnectState>,
     outbound_proxy: Option<Arc<ResolvedOutboundProxy>>,
     preconnected_proxy: Option<TcpStream>,
@@ -665,6 +747,25 @@ async fn handle_connect_tunnel(
     };
 
     if !connect_req.target.is_intercepted(&tls_state) {
+        let tunnel_dst = connect_req.target.guest_dst(guest_dst, &shared);
+        if strict
+            && let Some(expected_sni) = connect_req.target.expected_sni.as_deref()
+            && network_policy.allows_egress_via_hostname(
+                tunnel_dst,
+                Protocol::Tcp,
+                &shared,
+                HostnameSource::Sni(expected_sni),
+            )
+        {
+            tracing::debug!(
+                sni = %expected_sni,
+                dst = %tunnel_dst,
+                "CONNECT tunnel denied by strict hostname policy",
+            );
+            proxy_connect.mark_policy_denied();
+            shared.proxy_wake.wake();
+            return Ok(());
+        }
         proxy_stream.write_all(&connect_headers).await?;
         proxy_stream.flush().await?;
         let (proxy_resp, header_end) = read_connect_response_headers(&mut proxy_stream).await?;
@@ -737,6 +838,7 @@ async fn handle_connect_tunnel(
         shared,
         tls_state,
         network_policy,
+        strict,
         proxy_connect,
         // Unused: `upstream_stream` is already `Some` below, so the
         // outbound proxy (already applied when dialing `proxy_stream`
@@ -1371,6 +1473,7 @@ mod tests {
             Arc::new(SharedState::new(4)),
             Arc::new(NetworkPolicy::default()),
             tls_state,
+            false,
             proxy_connect.clone(),
             Some(Arc::new(outbound_proxy)),
             None,
@@ -1581,6 +1684,16 @@ mod tests {
             destination: Destination::Domain(domain.parse().unwrap()),
             protocols: vec![Protocol::Tcp],
             ports: vec![PortRange::single(443)],
+            action: Action::Allow,
+        }
+    }
+
+    fn allow_tcp(domain: &str, port: u16) -> Rule {
+        Rule {
+            direction: crate::policy::Direction::Egress,
+            destination: Destination::Domain(domain.parse().unwrap()),
+            protocols: vec![Protocol::Tcp],
+            ports: vec![PortRange::single(port)],
             action: Action::Allow,
         }
     }
@@ -1946,14 +2059,52 @@ mod tests {
         handle: JoinHandle<Vec<u8>>,
         server_addr: SocketAddr,
     ) -> Vec<u8> {
+        relay_through_proxy_with_policy(
+            request,
+            Arc::new(SharedState::new(4)),
+            Arc::new(NetworkPolicy::default()),
+            secrets,
+            handle,
+            server_addr,
+        )
+        .await
+    }
+
+    async fn relay_through_proxy_with_policy(
+        request: Vec<u8>,
+        shared: Arc<SharedState>,
+        policy: Arc<NetworkPolicy>,
+        secrets: SecretsConfig,
+        handle: JoinHandle<Vec<u8>>,
+        server_addr: SocketAddr,
+    ) -> Vec<u8> {
+        relay_chunks_through_proxy_with_policy(
+            vec![request],
+            shared,
+            policy,
+            secrets,
+            handle,
+            server_addr,
+        )
+        .await
+    }
+
+    async fn relay_chunks_through_proxy_with_policy(
+        chunks: Vec<Vec<u8>>,
+        shared: Arc<SharedState>,
+        policy: Arc<NetworkPolicy>,
+        secrets: SecretsConfig,
+        handle: JoinHandle<Vec<u8>>,
+        server_addr: SocketAddr,
+    ) -> Vec<u8> {
         let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
         let (to_tx, _to_rx) = mpsc::channel::<Bytes>(8);
-        let shared = SharedState::new(4);
-        let policy = Arc::new(NetworkPolicy::default());
         let secrets = Arc::new(secrets);
         let proxy_connect = Arc::new(ProxyConnectState::new());
 
-        from_tx.send(Bytes::from(request)).await.unwrap();
+        for chunk in chunks {
+            from_tx.send(Bytes::from(chunk)).await.unwrap();
+        }
         drop(from_tx);
 
         TcpProxy::new(
@@ -1961,10 +2112,11 @@ mod tests {
             UpstreamTcpTarget::direct(server_addr),
             from_rx,
             to_tx,
-            Arc::new(shared),
+            shared,
             policy,
             secrets,
             None,
+            false,
             proxy_connect,
             None,
             None,
@@ -1974,6 +2126,226 @@ mod tests {
         .unwrap();
 
         handle.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn plain_http_domain_policy_allows_matching_host() {
+        let (addr, sink) = spawn_sink().await;
+        let shared = Arc::new(shared_with("allowed.example", "127.0.0.1"));
+        let policy = Arc::new(NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![allow_tcp("allowed.example", addr.port())],
+        });
+
+        let wire = relay_through_proxy_with_policy(
+            b"GET / HTTP/1.1\r\nHost: allowed.example\r\n\r\n".to_vec(),
+            shared,
+            policy,
+            SecretsConfig::default(),
+            sink,
+            addr,
+        )
+        .await;
+
+        assert_eq!(wire, b"GET / HTTP/1.1\r\nHost: allowed.example\r\n\r\n");
+    }
+
+    #[tokio::test]
+    async fn plain_http_domain_policy_blocks_host_switch() {
+        let (addr, sink) = spawn_sink().await;
+        let shared = Arc::new(shared_with("allowed.example", "127.0.0.1"));
+        let policy = Arc::new(NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![allow_tcp("allowed.example", addr.port())],
+        });
+
+        let wire = relay_through_proxy_with_policy(
+            b"GET / HTTP/1.1\r\nHost: denied.example\r\n\r\n".to_vec(),
+            shared,
+            policy,
+            SecretsConfig::default(),
+            sink,
+            addr,
+        )
+        .await;
+
+        assert!(
+            wire.is_empty(),
+            "switched HTTP authority must not reach upstream, got: {wire:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_http_domain_policy_blocks_keep_alive_host_switch() {
+        let (addr, sink) = spawn_sink().await;
+        let shared = Arc::new(shared_with("allowed.example", "127.0.0.1"));
+        let policy = Arc::new(NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![allow_tcp("allowed.example", addr.port())],
+        });
+
+        let wire = relay_chunks_through_proxy_with_policy(
+            vec![
+                b"GET /one HTTP/1.1\r\nHost: allowed.example\r\n\r\n".to_vec(),
+                b"GET /two HTTP/1.1\r\nHost: denied.example\r\n\r\n".to_vec(),
+            ],
+            shared,
+            policy,
+            SecretsConfig::default(),
+            sink,
+            addr,
+        )
+        .await;
+
+        assert_eq!(wire, b"GET /one HTTP/1.1\r\nHost: allowed.example\r\n\r\n");
+    }
+
+    #[test]
+    fn strict_hostname_allow_blocks_sni_authority_before_tcp_dial() {
+        let dst = SocketAddr::new("127.0.0.1".parse().unwrap(), 443);
+        let shared = shared_with("allowed.example", "127.0.0.1");
+        let policy = NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![allow_tcp("allowed.example", dst.port())],
+        };
+
+        assert!(strict_hostname_allow_is_opaque(
+            true,
+            &policy,
+            dst,
+            &shared,
+            Some("allowed.example"),
+            &synthetic_client_hello("allowed.example"),
+        ));
+    }
+
+    #[test]
+    fn strict_hostname_allow_blocks_tls_without_sni_before_tcp_dial() {
+        let dst = SocketAddr::new("127.0.0.1".parse().unwrap(), 443);
+        let shared = shared_with("allowed.example", "127.0.0.1");
+        let policy = NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![allow_tcp("allowed.example", dst.port())],
+        };
+
+        assert!(strict_hostname_allow_is_opaque(
+            true,
+            &policy,
+            dst,
+            &shared,
+            None,
+            &[0x16, 0x03, 0x01],
+        ));
+    }
+
+    #[test]
+    fn strict_hostname_allow_leaves_plain_http_for_authority_validation() {
+        let dst = SocketAddr::new("127.0.0.1".parse().unwrap(), 80);
+        let shared = shared_with("allowed.example", "127.0.0.1");
+        let policy = NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![allow_tcp("allowed.example", dst.port())],
+        };
+
+        assert!(!strict_hostname_allow_is_opaque(
+            true,
+            &policy,
+            dst,
+            &shared,
+            None,
+            b"GET / HTTP/1.1\r\n",
+        ));
+    }
+
+    #[tokio::test]
+    async fn strict_mode_blocks_hostname_allowed_opaque_tls() {
+        let dst = SocketAddr::new("127.0.0.1".parse().unwrap(), 443);
+        let shared = Arc::new(shared_with("allowed.example", "127.0.0.1"));
+        let policy = Arc::new(NetworkPolicy {
+            default_egress: Action::Deny,
+            default_ingress: Action::Allow,
+            rules: vec![allow_tcp("allowed.example", dst.port())],
+        });
+        let proxy_connect = Arc::new(ProxyConnectState::new());
+        let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
+        let (to_tx, _to_rx) = mpsc::channel::<Bytes>(8);
+
+        from_tx
+            .send(Bytes::from(synthetic_client_hello("allowed.example")))
+            .await
+            .unwrap();
+        drop(from_tx);
+
+        TcpProxy::new(
+            dst,
+            UpstreamTcpTarget::direct(dst),
+            from_rx,
+            to_tx,
+            shared,
+            policy,
+            Arc::new(SecretsConfig::default()),
+            None,
+            true,
+            proxy_connect.clone(),
+            None,
+            None,
+        )
+        .try_run()
+        .await
+        .unwrap();
+
+        assert_eq!(proxy_connect.status(), ProxyConnectStatus::PolicyDenied);
+    }
+
+    #[tokio::test]
+    async fn strict_mode_leaves_default_allowed_opaque_tls_to_policy() {
+        let dst = SocketAddr::new("127.0.0.1".parse().unwrap(), 9);
+        let shared = Arc::new(SharedState::new(4));
+        let policy = Arc::new(NetworkPolicy {
+            default_egress: Action::Allow,
+            default_ingress: Action::Allow,
+            rules: vec![Rule::deny_egress(Destination::Domain(
+                "blocked.example".parse().unwrap(),
+            ))],
+        });
+        let proxy_connect = Arc::new(ProxyConnectState::new());
+        let (from_tx, from_rx) = mpsc::channel::<Bytes>(8);
+        let (to_tx, _to_rx) = mpsc::channel::<Bytes>(8);
+
+        from_tx
+            .send(Bytes::from(synthetic_client_hello("allowed.example")))
+            .await
+            .unwrap();
+        drop(from_tx);
+
+        let result = TcpProxy::new(
+            dst,
+            UpstreamTcpTarget::direct(dst),
+            from_rx,
+            to_tx,
+            shared,
+            policy,
+            Arc::new(SecretsConfig::default()),
+            None,
+            true,
+            proxy_connect.clone(),
+            None,
+            None,
+        )
+        .try_run()
+        .await;
+
+        assert!(result.is_err(), "dummy upstream should refuse the dial");
+        assert_eq!(
+            proxy_connect.status(),
+            ProxyConnectStatus::UpstreamConnectFailed
+        );
     }
 
     #[tokio::test]
@@ -2008,6 +2380,7 @@ mod tests {
             Arc::new(NetworkPolicy::default()),
             Arc::new(secrets),
             None,
+            false,
             proxy_connect,
             None,
             None,
@@ -2081,6 +2454,7 @@ mod tests {
             Arc::new(NetworkPolicy::default()),
             Arc::new(secrets),
             None,
+            false,
             proxy_connect,
             None,
             None,
@@ -2184,6 +2558,7 @@ mod tests {
             Arc::new(NetworkPolicy::default()),
             Arc::new(secrets),
             None,
+            false,
             proxy_connect,
             None,
             None,
@@ -2282,6 +2657,7 @@ mod tests {
             Arc::new(NetworkPolicy::allow_all()),
             Arc::new(SecretsConfig::default()),
             None,
+            false,
             proxy_connect.clone(),
             None,
             gateway,
@@ -2299,11 +2675,11 @@ mod tests {
 
     #[tokio::test]
     async fn ssh_chunk_split_banner_diverts_through_proxy() {
-        // Direct upstream SSH server: the guest must see its banner first —
-        // classification never withholds the banner — even though the flow
-        // diverts away afterwards.
-        let (upstream_addr, upstream_task) =
-            spawn_ssh_server(b"SSH-2.0-Upstream_1.0\r\n".to_vec()).await;
+        // Keep the direct destination open as a sentinel: routing must not
+        // contact it at all, even before sending any guest protocol bytes.
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
 
         // Broker double: asserts the u32-BE + CBOR prelude framing, then
         // behaves as the reoriginated SSH server behind the divert.
@@ -2339,11 +2715,9 @@ mod tests {
             Some(BrokerEndpoint::new(&broker_path).unwrap()),
         );
 
-        // Client banner split across two segments, as TCP may deliver it.
-        // The banner-gated peek must settle instead of falling through on
-        // the first chunk. The second chunk is sent only after the direct
-        // banner arrives, so the double-banner fingerprint is deterministic:
-        // the peek provably relayed the banner before the divert.
+        // The selected dispatcher must send its banner before the guest
+        // supplies any bytes. The later fragmented client banner is forwarded
+        // intact; it cannot influence the already selected route.
         let (from_tx, from_rx) = mpsc::channel::<Bytes>(32);
         let (to_tx, mut to_rx) = mpsc::channel::<Bytes>(32);
         let proxy_connect = Arc::new(ProxyConnectState::new());
@@ -2357,6 +2731,7 @@ mod tests {
                 Arc::new(NetworkPolicy::allow_all()),
                 Arc::new(SecretsConfig::default()),
                 None,
+                false,
                 proxy_connect.clone(),
                 None,
                 gateway,
@@ -2364,35 +2739,38 @@ mod tests {
             .try_run(),
         );
 
+        let first_banner = tokio::time::timeout(Duration::from_secs(5), to_rx.recv())
+            .await
+            .expect("dispatcher must not wait for a client banner")
+            .expect("guest channel must stay open");
+        assert_eq!(
+            first_banner.as_ref(),
+            b"SSH-2.0-Broker_1.0\r\n",
+            "only the selected SSH peer may send a banner"
+        );
         from_tx
             .send(Bytes::from_static(b"SSH-2.0-O"))
             .await
             .unwrap();
-        let direct_banner = tokio::time::timeout(Duration::from_secs(5), to_rx.recv())
-            .await
-            .expect("direct banner must arrive during the peek")
-            .expect("guest channel must stay open");
-        assert_eq!(
-            direct_banner.as_ref(),
-            b"SSH-2.0-Upstream_1.0\r\n",
-            "classification must never withhold the banner"
-        );
         from_tx
             .send(Bytes::from_static(b"penSSH_9.6\r\n"))
             .await
             .unwrap();
         drop(from_tx);
-        proxy_task.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), proxy_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
 
         assert_eq!(proxy_connect.status(), ProxyConnectStatus::Connected);
-        let mut guest_bytes = direct_banner.to_vec();
+        let mut guest_bytes = first_banner.to_vec();
         while let Ok(data) = to_rx.try_recv() {
             guest_bytes.extend_from_slice(&data);
         }
-        let guest_text = String::from_utf8_lossy(&guest_bytes).into_owned();
-        assert!(
-            guest_text.contains("SSH-2.0-Broker_1.0"),
-            "guest must observe the broker banner after the divert (double-banner fingerprint), got: {guest_text:?}"
+        assert_eq!(
+            guest_bytes, b"SSH-2.0-Broker_1.0\r\n",
+            "exactly one SSH banner"
         );
 
         let (prelude, ssh_bytes) = broker_task.await.unwrap();
@@ -2405,11 +2783,10 @@ mod tests {
             "buffered client banner must be forwarded to the broker verbatim"
         );
 
-        // The diverted-away direct upstream socket closes without replay:
-        // the buffered first flight went to the broker, not upstream.
-        assert!(
-            upstream_task.await.unwrap().is_empty(),
-            "divert must not replay guest bytes to the direct upstream"
+        assert_eq!(
+            upstream.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "dispatch must not open a direct upstream connection"
         );
         let _ = std::fs::remove_file(&broker_path);
     }
@@ -2436,8 +2813,9 @@ mod tests {
 
     #[tokio::test]
     async fn ssh_divert_broker_dial_failure_denies_fail_closed() {
-        let (upstream_addr, upstream_task) =
-            spawn_ssh_server(b"SSH-2.0-Upstream_1.0\r\n".to_vec()).await;
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
 
         // Granted flow, but the broker socket does not exist: divert-intended
         // without a reachable broker denies instead of falling back to
@@ -2449,7 +2827,7 @@ mod tests {
             Some(BrokerEndpoint::new(&missing).unwrap()),
         );
 
-        let (status, _guest_bytes) =
+        let (status, guest_bytes) =
             run_ssh_proxy_once(upstream_addr, &[b"SSH-2.0-OpenSSH_9.6\r\n"], gateway).await;
 
         assert_eq!(
@@ -2458,9 +2836,44 @@ mod tests {
             "unreachable broker must deny fail-closed, never direct"
         );
         assert!(
-            upstream_task.await.unwrap().is_empty(),
-            "denied flow must close the upstream socket without replaying guest bytes"
+            guest_bytes.is_empty(),
+            "refusal must expose no upstream bytes"
         );
+        assert_eq!(
+            upstream.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "dispatcher failure must not open a direct upstream connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_configured_endpoint_cannot_bypass_dispatch_by_omitting_or_changing_banner() {
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let addr = upstream.local_addr().unwrap();
+        for bytes in [
+            b"".as_slice(),
+            b"SSH-2.0-O",
+            b"GET / HTTP/1.1\r\n\r\n",
+            b"\x00\xff",
+        ] {
+            let gateway = ssh_gateway_for(
+                SshPolicy::new(false, vec![SshGrant::exact("127.0.0.1", addr.port())]),
+                None,
+            );
+            let (status, received) = tokio::time::timeout(
+                Duration::from_secs(1),
+                run_ssh_proxy_once(addr, &[bytes], gateway),
+            )
+            .await
+            .expect("configured endpoint refusal must not wait for classification");
+            assert_eq!(status, ProxyConnectStatus::PolicyDenied);
+            assert!(received.is_empty());
+            assert_eq!(
+                upstream.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
     }
 
     /// Minimal capturing subscriber so the fall-through test can assert the
@@ -2537,6 +2950,7 @@ mod tests {
             Arc::new(NetworkPolicy::allow_all()),
             Arc::new(SecretsConfig::default()),
             None,
+            false,
             proxy_connect.clone(),
             None,
             gateway,
@@ -2589,6 +3003,7 @@ mod tests {
                 Arc::new(NetworkPolicy::allow_all()),
                 Arc::new(SecretsConfig::default()),
                 None,
+                false,
                 proxy_connect.clone(),
                 None,
                 gateway,

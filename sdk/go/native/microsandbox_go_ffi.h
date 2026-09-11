@@ -545,9 +545,8 @@ char *msb_sandbox_exec_default_stream(uint64_t cancel_id,
 char *msb_exec_recv(uint64_t cancel_id, Handle exec_handle, unsigned char *buf, uintptr_t buf_len);
 
 /**
- * Release the exec handle. Does not kill the running process; use
- * msb_sandbox_exec_stream then msb_exec_close after the process exits,
- * or msb_exec_signal/kill to terminate it first.
+ * Release the exec handle. Dropping its event owner before completion requests
+ * bounded cleanup on the original session; this is not termination proof.
  */
 char *msb_exec_close(uint64_t cancel_id, Handle exec_handle, unsigned char *buf, uintptr_t buf_len);
 

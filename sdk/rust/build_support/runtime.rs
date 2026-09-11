@@ -101,15 +101,25 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, MutexGuard};
 
     const VERSION: &str = "0.6.16";
     const FIRMWARE: &str = "libkrunfw.so.5.6.1";
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    static FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 
-    struct Fixture(PathBuf);
+    struct Fixture {
+        root: PathBuf,
+        _guard: MutexGuard<'static, ()>,
+    }
 
     impl Fixture {
         fn new(version: &str) -> Self {
+            // A concurrent fork can retain a fixture's writable descriptor
+            // until exec, causing ETXTBSY when another test executes that file.
+            let guard = FIXTURE_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             let root = std::env::temp_dir().join(format!(
                 "msb-build-runtime-{}-{}",
                 std::process::id(),
@@ -125,39 +135,46 @@ mod tests {
             .unwrap();
             fs::set_permissions(root.join("bin/msb"), fs::Permissions::from_mode(0o555)).unwrap();
             fs::write(root.join("lib").join(FIRMWARE), "fixture firmware").unwrap();
-            Self(root)
+            Self {
+                root,
+                _guard: guard,
+            }
         }
 
         fn validate(&self) -> io::Result<BuildRuntime> {
-            validate(&self.0, "msb", FIRMWARE, VERSION)
+            validate(&self.root, "msb", FIRMWARE, VERSION)
         }
     }
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            for path in [&self.0, &self.0.join("bin"), &self.0.join("lib")] {
+            for path in [&self.root, &self.root.join("bin"), &self.root.join("lib")] {
                 let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o755));
             }
-            let _ = fs::remove_dir_all(&self.0);
+            let _ = fs::remove_dir_all(&self.root);
         }
     }
 
     #[test]
     fn accepts_matching_runtime_in_read_only_directories() {
         let fixture = Fixture::new(VERSION);
-        for path in [&fixture.0, &fixture.0.join("bin"), &fixture.0.join("lib")] {
+        for path in [
+            &fixture.root,
+            &fixture.root.join("bin"),
+            &fixture.root.join("lib"),
+        ] {
             fs::set_permissions(path, fs::Permissions::from_mode(0o555)).unwrap();
         }
         let runtime = fixture.validate().unwrap();
-        assert_eq!(runtime.msb, fixture.0.join("bin/msb"));
-        assert_eq!(runtime.firmware, fixture.0.join("lib").join(FIRMWARE));
-        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 2);
+        assert_eq!(runtime.msb, fixture.root.join("bin/msb"));
+        assert_eq!(runtime.firmware, fixture.root.join("lib").join(FIRMWARE));
+        assert_eq!(fs::read_dir(&fixture.root).unwrap().count(), 2);
     }
 
     #[test]
     fn missing_directory_is_not_created() {
         let fixture = Fixture::new(VERSION);
-        let missing = fixture.0.join("missing");
+        let missing = fixture.root.join("missing");
         assert!(validate(&missing, "msb", FIRMWARE, VERSION).is_err());
         assert!(!missing.exists());
     }
@@ -165,15 +182,15 @@ mod tests {
     #[test]
     fn rejects_missing_binary_without_installing_it() {
         let fixture = Fixture::new(VERSION);
-        fs::remove_file(fixture.0.join("bin/msb")).unwrap();
+        fs::remove_file(fixture.root.join("bin/msb")).unwrap();
         assert!(fixture.validate().is_err());
-        assert!(!fixture.0.join("bin/msb").exists());
+        assert!(!fixture.root.join("bin/msb").exists());
     }
 
     #[test]
     fn rejects_missing_firmware_without_installing_it() {
         let fixture = Fixture::new(VERSION);
-        let firmware = fixture.0.join("lib").join(FIRMWARE);
+        let firmware = fixture.root.join("lib").join(FIRMWARE);
         fs::remove_file(&firmware).unwrap();
         assert!(fixture.validate().is_err());
         assert!(!firmware.exists());
@@ -190,7 +207,11 @@ mod tests {
     #[test]
     fn rejects_non_executable_binary() {
         let fixture = Fixture::new(VERSION);
-        fs::set_permissions(fixture.0.join("bin/msb"), fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(
+            fixture.root.join("bin/msb"),
+            fs::Permissions::from_mode(0o444),
+        )
+        .unwrap();
         assert!(fixture.validate().is_err());
     }
 
@@ -215,6 +236,8 @@ mod tests {
             assert!(from_override(Some(root.into()), "msb", FIRMWARE, VERSION).is_err());
         }
         let fixture = Fixture::new("0.0.0");
-        assert!(from_override(Some(fixture.0.clone().into()), "msb", FIRMWARE, VERSION).is_err());
+        assert!(
+            from_override(Some(fixture.root.clone().into()), "msb", FIRMWARE, VERSION).is_err()
+        );
     }
 }

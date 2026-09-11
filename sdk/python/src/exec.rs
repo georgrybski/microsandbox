@@ -297,5 +297,34 @@ fn convert_exec_event(event: microsandbox::ExecEvent) -> PyExecEvent {
             data: Some(payload.message.into_bytes()),
             code: payload.errno,
         },
+        microsandbox::ExecEvent::Interrupted(outcome) => PyExecEvent {
+            event_type: "interrupted",
+            pid: None,
+            // Tagged reason/termination JSON. No exit code is synthesized.
+            data: Some(serde_json::json!(outcome).to_string().into_bytes()),
+            code: None,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interrupted_event_preserves_uncertainty_without_exit_code() {
+        let event = convert_exec_event(microsandbox::ExecEvent::Interrupted(
+            microsandbox::ExecInterruption {
+                reason: microsandbox::ExecInterruptionReason::Timeout(
+                    std::time::Duration::from_secs(3),
+                ),
+                termination: microsandbox::ExecTermination::Unconfirmed,
+            },
+        ));
+        assert_eq!(event.event_type, "interrupted");
+        assert!(event.code.is_none());
+        let data: serde_json::Value = serde_json::from_slice(&event.data.unwrap()).unwrap();
+        assert_eq!(data["reason"]["kind"], "timeout");
+        assert_eq!(data["termination"]["kind"], "unconfirmed");
     }
 }

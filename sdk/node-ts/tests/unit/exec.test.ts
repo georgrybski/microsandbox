@@ -2,6 +2,22 @@ import { describe, expect, it, vi } from "vitest";
 import { ExecHandle, Sandbox } from "../../dist/index.js";
 
 describe("ExecHandle", () => {
+  it("preserves interruption and unconfirmed termination without a fake exit", async () => {
+    const recv = vi.fn().mockResolvedValue({ eventType: "interrupted", data: Buffer.from(JSON.stringify({
+      reason: { kind: "timeout", value: { secs: 3, nanos: 0 } },
+      termination: { kind: "unconfirmed" },
+    })) });
+    const handle = new ExecHandle({ recv } as never);
+    const event = await handle.recv();
+    expect(event).toEqual({ kind: "interrupted", reason: { kind: "timeout", value: { secs: 3, nanos: 0 } }, termination: { kind: "unconfirmed" } });
+    expect(event).not.toHaveProperty("code");
+  });
+
+  it("refuses a missing termination observation", async () => {
+    const recv = vi.fn().mockResolvedValue({ eventType: "interrupted", data: Buffer.from('{"reason":{"kind":"cancelled"}}') });
+    const handle = new ExecHandle({ recv } as never);
+    await expect(handle.recv()).rejects.toThrow("termination observation");
+  });
   it("forwards TTY resize dimensions to the native handle", async () => {
     const resize = vi.fn().mockResolvedValue(undefined);
     const handle = new ExecHandle({ resize } as never);

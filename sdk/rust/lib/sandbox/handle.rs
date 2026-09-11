@@ -16,6 +16,7 @@ use crate::{
     },
     db::entity::sandbox as sandbox_entity,
     error::Operation,
+    runtime::SpawnMode,
 };
 
 use super::{
@@ -101,7 +102,8 @@ impl SandboxHandle {
     pub(crate) fn from_local_model(
         backend: Arc<dyn Backend>,
         model: sandbox_entity::Model,
-        pid: Option<i32>,
+        launch: Option<super::LocalLaunch>,
+        observation: super::LocalObservation,
     ) -> Self {
         let name = model.name.clone();
         Self {
@@ -113,7 +115,9 @@ impl SandboxHandle {
                 active_config_json: model.active_config,
                 created_at: model.created_at.map(|dt| dt.and_utc()),
                 updated_at: model.updated_at.map(|dt| dt.and_utc()),
-                pid,
+                pid: launch.map(|run| run.pid),
+                launch,
+                observation,
             }),
             name,
         }
@@ -312,6 +316,19 @@ impl SandboxHandle {
         Ok(current)
     }
 
+    /// Refresh metadata without changing the operation's selected local run.
+    pub(crate) async fn refresh_selected(&self) -> MicrosandboxResult<SandboxHandle> {
+        if let Some(local) = self.local() {
+            return self
+                .backend
+                .as_local()
+                .ok_or(MicrosandboxError::LaunchBindingUnsupported)?
+                .refresh_bound(self.backend.clone(), &self.name, &local.observation)
+                .await;
+        }
+        self.refresh().await
+    }
+
     fn ensure_same_identity(&self, current: &SandboxHandle) -> MicrosandboxResult<()> {
         if self.identity() == current.identity() {
             return Ok(());
@@ -419,6 +436,19 @@ impl SandboxHandle {
     /// for local; routes through `POST /v1/sandboxes/by-name/:name/start` for
     /// cloud. The handle remains usable if start fails.
     pub async fn start(&self) -> MicrosandboxResult<Sandbox> {
+        if let Some(local) = self.local() {
+            return self
+                .backend
+                .as_local()
+                .ok_or(MicrosandboxError::LaunchBindingUnsupported)?
+                .start_bound(
+                    self.backend.clone(),
+                    &self.name,
+                    &local.observation,
+                    SpawnMode::Attached,
+                )
+                .await;
+        }
         self.backend
             .sandboxes()
             .start_identified(self.backend.clone(), &self.name, self.identity())
@@ -429,6 +459,19 @@ impl SandboxHandle {
     ///
     /// The handle remains usable if start fails.
     pub async fn start_detached(&self) -> MicrosandboxResult<Sandbox> {
+        if let Some(local) = self.local() {
+            return self
+                .backend
+                .as_local()
+                .ok_or(MicrosandboxError::LaunchBindingUnsupported)?
+                .start_bound(
+                    self.backend.clone(),
+                    &self.name,
+                    &local.observation,
+                    SpawnMode::Detached,
+                )
+                .await;
+        }
         self.backend
             .sandboxes()
             .start_detached_identified(self.backend.clone(), &self.name, self.identity())
@@ -454,7 +497,7 @@ impl SandboxHandle {
         detached: bool,
     ) -> MicrosandboxResult<Sandbox> {
         loop {
-            let current = self.refresh().await?;
+            let current = self.refresh_selected().await?;
             match connect_or_start_action(current.status_snapshot()) {
                 ConnectOrStartAction::Connect => {
                     return current.connect_with_timeout(DEFAULT_CONNECT_TIMEOUT).await;
@@ -502,6 +545,30 @@ impl SandboxHandle {
         self.connect_with_timeout(DEFAULT_CONNECT_TIMEOUT).await
     }
 
+    /// Host-owned runtime incarnation captured by this handle.
+    ///
+    /// This is not a liveness probe or an authorization token. Reconnect checks
+    /// the snapshot before and after dialing. A fresh handle is required after
+    /// stop/start; unsupported backends or missing run evidence refuse.
+    pub fn launch_identity(&self) -> MicrosandboxResult<super::SandboxLaunchId> {
+        self.captured_launch()?
+            .identity
+            .ok_or(MicrosandboxError::LaunchBindingUnsupported)
+    }
+
+    fn captured_launch(&self) -> MicrosandboxResult<super::LocalLaunch> {
+        match &self.inner {
+            SandboxHandleInner::Local(local) => {
+                local
+                    .launch
+                    .ok_or_else(|| MicrosandboxError::SandboxLaunchChanged {
+                        name: self.name.clone(),
+                    })
+            }
+            SandboxHandleInner::Cloud(_) => Err(MicrosandboxError::LaunchBindingUnsupported),
+        }
+    }
+
     /// Connect to a running sandbox with an explicit local agent handshake
     /// timeout.
     ///
@@ -516,7 +583,9 @@ impl SandboxHandle {
             // reconnecting cannot follow a reused name and needs no lookup.
             SandboxHandleInner::Cloud(_) => self.connect_current_with_timeout(timeout).await,
             SandboxHandleInner::Local(_) => {
-                let current = self.refresh().await?;
+                let expected = self.captured_launch()?;
+                let current = self.refresh_selected().await?;
+                expected.ensure_current(&self.name, current.captured_launch().ok())?;
                 current.connect_current_with_timeout(timeout).await
             }
         }
@@ -539,6 +608,7 @@ impl SandboxHandle {
 
         match &self.inner {
             SandboxHandleInner::Local(local) => {
+                let expected = self.captured_launch()?;
                 let local_backend = self.backend.as_local().ok_or_else(|| {
                     MicrosandboxError::local_only(Operation::SandboxHandleConnect)
                 })?;
@@ -551,13 +621,19 @@ impl SandboxHandle {
                 // The local transport is name-addressed. Recheck after the
                 // handshake so concurrent name reuse cannot silently rebind
                 // this receiver to the replacement.
-                self.refresh().await?;
+                let current = self.refresh_selected().await?;
+                expected.ensure_current(&self.name, current.captured_launch().ok())?;
+                if client.peer_pid() != Some(expected.pid as u32) {
+                    return Err(MicrosandboxError::LaunchBindingUnsupported);
+                }
                 let config: SandboxConfig = serde_json::from_str(&local.config_json)?;
 
                 Ok(Sandbox::from_local(
                     self.backend.clone(),
                     crate::backend::SandboxLocalState {
                         db_id: local.db_id,
+                        launch: expected,
+                        observation: local.observation.clone(),
                         handle: None,
                         client: Arc::new(client),
                     },
@@ -639,14 +715,17 @@ impl SandboxHandle {
     /// Returns only once the sandbox is observed stopped **and** the recorded
     /// local runtime process has actually exited, so a follow-up
     /// [`remove`](Self::remove) cannot trip its still-alive-process guard.
+    /// A validated local Created selection without any run is already inactive;
+    /// stopping it is a no-op and preserves Created rather than inventing an exit.
     pub async fn stop(&self) -> MicrosandboxResult<()> {
         self.stop_with_timeout(DEFAULT_STOP_TIMEOUT).await
     }
 
     /// Stop the sandbox gracefully with an explicit timeout before escalation.
     pub async fn stop_with_timeout(&self, timeout: std::time::Duration) -> MicrosandboxResult<()> {
-        let current = self.refresh().await?;
-        if sandbox_status_is_terminal(current.status_snapshot()) {
+        let current = self.refresh_selected().await?;
+        if sandbox_status_is_terminal(current.status_snapshot()) || current.is_local_never_started()
+        {
             current.await_local_runtime_exit().await?;
             return Ok(());
         }
@@ -696,7 +775,21 @@ impl SandboxHandle {
 
     /// Request graceful shutdown without waiting for observed stopped state.
     pub async fn request_stop(&self) -> MicrosandboxResult<()> {
-        let current = self.refresh().await?;
+        if let Some(local) = self.local() {
+            let backend = self
+                .backend
+                .as_local()
+                .ok_or(MicrosandboxError::LaunchBindingUnsupported)?;
+            return backend
+                .request_bound_action(
+                    &self.name,
+                    &local.observation,
+                    super::BoundAction::Stop,
+                    None,
+                )
+                .await;
+        }
+        let current = self.refresh_selected().await?;
         if sandbox_status_is_terminal(current.status_snapshot()) {
             return Ok(());
         }
@@ -715,7 +808,21 @@ impl SandboxHandle {
 
     /// Request force termination without waiting for observed stopped state.
     pub async fn request_kill(&self) -> MicrosandboxResult<()> {
-        let current = self.refresh().await?;
+        if let Some(local) = self.local() {
+            let backend = self
+                .backend
+                .as_local()
+                .ok_or(MicrosandboxError::LaunchBindingUnsupported)?;
+            return backend
+                .request_bound_action(
+                    &self.name,
+                    &local.observation,
+                    super::BoundAction::Kill,
+                    None,
+                )
+                .await;
+        }
+        let current = self.refresh_selected().await?;
         if sandbox_status_is_terminal(current.status_snapshot()) {
             return Ok(());
         }
@@ -733,8 +840,9 @@ impl SandboxHandle {
     /// [`stop`](Self::stop)): the runtime's own exit observer can mark the row
     /// terminal while the process is still exiting.
     pub async fn kill_with_timeout(&self, timeout: std::time::Duration) -> MicrosandboxResult<()> {
-        let current = self.refresh().await?;
-        if sandbox_status_is_terminal(current.status_snapshot()) {
+        let current = self.refresh_selected().await?;
+        if sandbox_status_is_terminal(current.status_snapshot()) || current.is_local_never_started()
+        {
             current.await_local_runtime_exit().await?;
             return Ok(());
         }
@@ -755,7 +863,21 @@ impl SandboxHandle {
 
     /// Request drain without waiting for observed stopped state.
     pub async fn request_drain(&self) -> MicrosandboxResult<()> {
-        let current = self.refresh().await?;
+        if let Some(local) = self.local() {
+            let backend = self
+                .backend
+                .as_local()
+                .ok_or(MicrosandboxError::LaunchBindingUnsupported)?;
+            return backend
+                .request_bound_action(
+                    &self.name,
+                    &local.observation,
+                    super::BoundAction::Drain,
+                    None,
+                )
+                .await;
+        }
+        let current = self.refresh_selected().await?;
         if sandbox_status_is_terminal(current.status_snapshot()) {
             return Ok(());
         }
@@ -776,7 +898,7 @@ impl SandboxHandle {
         status: SandboxStatus,
     ) -> MicrosandboxResult<SandboxHandle> {
         loop {
-            let current = self.refresh().await?;
+            let current = self.refresh_selected().await?;
             if current.status_snapshot() == status {
                 return Ok(current);
             }
@@ -792,7 +914,7 @@ impl SandboxHandle {
     /// Stop and start this exact sandbox with explicit lifecycle options.
     pub async fn restart_with(&self, options: RestartOptions) -> MicrosandboxResult<Sandbox> {
         let current = loop {
-            let current = self.refresh().await?;
+            let current = self.refresh_selected().await?;
             match restart_action(current.status_snapshot()) {
                 RestartAction::Start => break current,
                 RestartAction::Wait => {
@@ -825,7 +947,7 @@ impl SandboxHandle {
 
     /// Stop and remove this exact sandbox with explicit lifecycle options.
     pub async fn destroy_with(&self, options: DestroyOptions) -> MicrosandboxResult<()> {
-        let current = self.refresh().await?;
+        let current = self.refresh_selected().await?;
         if destroy_requires_stop(current.status_snapshot()) {
             stop_for_convergence(&current, options.force, options.timeout).await?;
         }
@@ -835,24 +957,39 @@ impl SandboxHandle {
                 if current.is_local_ephemeral()
                     && super::sandbox_not_found_for_name(&error, &current.name) =>
             {
-                // Local ephemeral cleanup removes persisted state as part of
-                // shutdown, so there is nothing left for destroy to delete.
-                Ok(())
+                // Row removal does not establish process exit. Require the
+                // original database domain and retained process observation.
+                if current.removed_runtime_has_exited().await? {
+                    Ok(())
+                } else {
+                    Err(MicrosandboxError::SandboxStillRunning(format!(
+                        "cannot destroy sandbox {:?}: selected runtime has not exited",
+                        current.name
+                    )))
+                }
             }
             Err(error) => Err(error),
         }
     }
 
-    /// Wait until this sandbox is observed in a terminal non-running state.
+    /// Wait until this selected sandbox run has a terminal backend state.
+    ///
+    /// A terminal row is not a process exit status. If local ephemeral cleanup
+    /// removed the row, completion additionally requires retained process-exit
+    /// evidence in the original database domain; this method does not signal it.
     pub async fn wait_until_stopped(&self) -> MicrosandboxResult<SandboxStopResult> {
         loop {
-            let current = match self.refresh().await {
+            let current = match self.refresh_selected().await {
                 Ok(current) => current,
                 Err(error)
                     if self.is_local_ephemeral()
                         && super::sandbox_not_found_for_name(&error, &self.name) =>
                 {
-                    return Ok(super::ephemeral_cleanup_stop_result(&self.name));
+                    if self.removed_runtime_has_exited().await? {
+                        return Ok(super::ephemeral_cleanup_stop_result(&self.name));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
                 }
                 Err(error) => return Err(error),
             };
@@ -880,7 +1017,7 @@ impl SandboxHandle {
     pub async fn remove(&self) -> MicrosandboxResult<()> {
         match &self.inner {
             SandboxHandleInner::Local(_) => {
-                let refreshed = self.refresh().await?;
+                let refreshed = self.refresh_selected().await?;
                 let local = refreshed
                     .local()
                     .ok_or_else(|| MicrosandboxError::local_only(Operation::SandboxHandleRemove))?;
@@ -902,7 +1039,13 @@ impl SandboxHandle {
                     .as_local()
                     .ok_or_else(|| MicrosandboxError::local_only(Operation::SandboxHandleRemove))?;
 
-                super::remove_local_persisted_sandbox(local_backend, &self.name, local.db_id).await
+                super::remove_local_persisted_observed(
+                    local_backend,
+                    &self.name,
+                    local.db_id,
+                    Some(&local.observation),
+                )
+                .await
             }
             SandboxHandleInner::Cloud(_) => {
                 self.backend
@@ -924,13 +1067,20 @@ impl SandboxHandle {
         let Some(local_backend) = self.backend.as_local() else {
             return Ok(());
         };
-        super::reap::await_recorded_runtime_exit(
-            local_backend,
-            local.db_id,
-            &self.name,
-            super::reap::RUNTIME_EXIT_GRACE,
-        )
-        .await
+        local_backend
+            .await_bound_runtime_exit(&self.name, &local.observation, self.is_local_ephemeral())
+            .await
+    }
+
+    async fn removed_runtime_has_exited(&self) -> MicrosandboxResult<bool> {
+        let local = self
+            .local()
+            .ok_or(MicrosandboxError::LaunchBindingUnsupported)?;
+        self.backend
+            .as_local()
+            .ok_or(MicrosandboxError::LaunchBindingUnsupported)?
+            .removed_runtime_has_exited(&self.name, &local.observation)
+            .await
     }
 
     /// Kill any leftover VM process still backing this local sandbox after
@@ -950,6 +1100,16 @@ impl SandboxHandle {
 
     fn is_local_ephemeral(&self) -> bool {
         is_local_ephemeral_handle(&self.inner)
+    }
+
+    /// Used only after selected-generation refresh; exit validation still
+    /// rechecks the original database domain and absence of a selected run.
+    fn is_local_never_started(&self) -> bool {
+        self.local().is_some_and(|local| {
+            local.status == SandboxStatus::Created
+                && local.observation.run_id.is_none()
+                && local.observation.process.is_none()
+        })
     }
 }
 

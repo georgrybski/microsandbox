@@ -128,11 +128,20 @@ pub struct SandboxConfig {
     ///
     /// Set via the sandbox builder. Host-side only: never serialized
     /// into the spec or the database; applied to the resolved network
-    /// config at spawn time alongside the leased-slot transport
-    /// identifier. Follows the `insecure`/`ca_certs` local-state pattern.
+    /// config at spawn time alongside the host-reserved guest CID.
+    /// Follows the `insecure`/`ca_certs` local-state pattern.
     #[cfg(feature = "net")]
     #[serde(skip)]
     pub(crate) ssh_broker_endpoint: Option<microsandbox_network::ssh::BrokerEndpoint>,
+
+    /// Host-reserved CID for this launch, excluded from durable task specs.
+    /// The supervisor must reserve it across runtime processes before launch.
+    #[serde(skip)]
+    pub(crate) guest_cid: Option<u32>,
+
+    /// Per-launch host-to-guest Unix listeners owned by libkrun, never persisted.
+    #[serde(skip)]
+    pub(crate) host_vsock_listeners: Vec<microsandbox_runtime::launch::HostVsockListener>,
 
     /// Sealed SSH key material for the broker VM.
     ///
@@ -681,6 +690,8 @@ impl Default for SandboxConfig {
             ca_certs: Vec::new(),
             #[cfg(feature = "net")]
             ssh_broker_endpoint: None,
+            guest_cid: None,
+            host_vsock_listeners: Vec::new(),
             broker_key: None,
             broker_upstream: None,
             broker_patterns: None,

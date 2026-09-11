@@ -17,6 +17,13 @@
     treefmt-nix.follows = "tooling/treefmt-nix";
     git-hooks.follows = "tooling/git-hooks";
 
+    libkrunfw = {
+      url = "github:rybskiworks/libkrunfw/3017d504988971bd84dcc5935c96aa4a81227d1e";
+      inputs.tooling.follows = "tooling";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.flake-parts.follows = "flake-parts";
+    };
+
     # Inputs for devenv's default container outputs. Not used directly by the
     # packages; these can be removed if the unused container outputs are disabled.
     nix2container = {
@@ -114,14 +121,30 @@
           # Evaluation reads metadata from the already-fetched flake input;
           # the filtered compilation source need not exist in the store yet.
           cargoLock = import ./nix/cargo-lock.nix { lockFile = ./Cargo.lock; };
+          version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
-          agentd = pkgs.callPackage ./nix/packages/agentd.nix { inherit src cargoLock; };
+          agentd = pkgs.callPackage ./nix/packages/agentd.nix { inherit src cargoLock version; };
+          brokerd = pkgs.callPackage ./nix/packages/brokerd.nix {
+            inherit
+              rustPlatform
+              src
+              cargoLock
+              version
+              ;
+          };
+          libkrunfw = inputs.libkrunfw.packages.${system}.default;
+          vsockProbe = pkgs.callPackage ./nix/packages/guest-vsock-probe.nix {
+            inherit src cargoLock version;
+          };
+          runtimeSmokeImage = pkgs.callPackage ./nix/packages/runtime-smoke-image.nix { inherit vsockProbe; };
           msb = pkgs.callPackage ./nix/packages/microsandbox.nix {
             inherit
               src
               rustToolchain
               agentd
               cargoLock
+              version
+              libkrunfw
               ;
           };
 
@@ -160,18 +183,54 @@
           _module.args.pkgs = pkgs;
 
           packages = {
-            inherit agentd msb;
+            inherit agentd brokerd msb;
+            runtime-smoke-image = runtimeSmokeImage;
             # workestrate consumes `packages.${system}.microsandbox`.
             microsandbox = msb;
             default = msb;
           };
 
-          # TODO(apps): test-kvm / test-nested-virt runner apps are deferred —
-          # they need /dev/kvm and a nested-virt-capable host, so they are not
-          # meaningfully wrappable as flake apps in this container. Revisit
-          # with workestrate's scripts/kvm-tests.sh as the reference.
+          # KVM acceptance runs outside the Nix build sandbox, with its own
+          # disposable state. It never becomes an implicitly skipped check.
+          apps.test-runtime = {
+            type = "app";
+            program = "${
+              pkgs.writeShellApplication {
+                name = "msb-test-runtime";
+                runtimeInputs = [ pkgs.python3 ];
+                text = ''
+                  exec python3 ${./scripts/smoke/cli/runtime-firmware.py} \
+                    --msb ${msb}/bin/msb --image ${runtimeSmokeImage} \
+                    --kernel-release ${libkrunfw}/share/libkrunfw/kernel.release "$@"
+                '';
+              }
+            }/bin/msb-test-runtime";
+          };
 
           checks = {
+            # Protocol-level custody acceptance uses real OpenSSH, synthetic
+            # keys and loopback only; it does not depend on KVM or guest images.
+            ssh-termination = rustPlatform.buildRustPackage {
+              pname = "microsandbox-ssh-termination-tests";
+              inherit version src cargoLock;
+              MSB_TEST_SSH = "${pkgs.openssh}/bin/ssh";
+              MSB_TEST_GIT = "${pkgs.git}/bin/git";
+              MSB_TEST_SHELL = "${pkgs.bash}/bin/bash";
+              buildPhase = ''
+                runHook preBuild
+                cargo test --jobs "$NIX_BUILD_CORES" --locked --offline \
+                  -p microsandbox-brokerd --lib --test divert_e2e
+                cargo test --jobs "$NIX_BUILD_CORES" --locked --offline \
+                  -p microsandbox-brokerd --test ssh_openssh --test managed_openssh \
+                  --test managed_git -- --include-ignored --test-threads=1
+                runHook postBuild
+              '';
+              installPhase = ''
+                mkdir -p $out
+              '';
+              doCheck = false;
+            };
+
             build-runtime =
               pkgs.runCommand "microsandbox-build-runtime-check"
                 {
@@ -230,7 +289,7 @@
             # at bans.wildcards in deny.toml.
             deny = rustPlatform.buildRustPackage {
               pname = "microsandbox-deny";
-              version = "0.6.16";
+              inherit version;
               inherit src cargoLock;
               nativeBuildInputs = [ pkgs.cargo-deny ];
               buildPhase = ''
@@ -251,7 +310,7 @@
             #     --target x86_64-unknown-linux-musl -- -D warnings
             clippy = rustPlatform.buildRustPackage {
               pname = "microsandbox-clippy";
-              version = "0.6.16";
+              inherit version;
               inherit src;
               inherit cargoLock;
               cargo = clippyToolchain;
@@ -284,7 +343,7 @@
             # an isolated host test environment when that builder policy applies.
             unit = rustPlatform.buildRustPackage {
               pname = "microsandbox-unit-tests";
-              version = "0.6.16";
+              inherit version;
               inherit src;
               inherit cargoLock;
               # TLS client construction needs explicit trust roots in the sandbox.

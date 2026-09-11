@@ -73,6 +73,17 @@ pub enum MicrosandboxError {
         actual: String,
     },
 
+    /// A live handle's host-owned run changed or is no longer available.
+    #[error("sandbox {name:?} has no matching live launch; obtain a new handle explicitly")]
+    SandboxLaunchChanged {
+        /// Sandbox whose captured run is stale.
+        name: String,
+    },
+
+    /// The backend cannot establish authoritative per-launch execution binding.
+    #[error("this backend does not support launch-bound guest execution")]
+    LaunchBindingUnsupported,
+
     /// The sandbox is still running and cannot be removed.
     #[error("sandbox still running: {0}")]
     SandboxStillRunning(String),
@@ -122,6 +133,11 @@ pub enum MicrosandboxError {
     /// Command execution timed out.
     #[error("exec timed out after {0:?}")]
     ExecTimeout(std::time::Duration),
+
+    /// An exec operation was interrupted, with termination evidence reported
+    /// separately from its timeout, cancellation, or delivery failure.
+    #[error("exec interrupted: {0}")]
+    ExecInterrupted(crate::sandbox::exec::ExecInterruption),
 
     /// A command failed to spawn (binary not found, permission
     /// denied, etc.). Distinct from a non-zero exit status: the
