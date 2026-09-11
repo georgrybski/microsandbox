@@ -445,6 +445,9 @@ The helper gets at most two seconds within the existing five-second handoff
 grace. Successful submission only means systemd accepted the job; it does not
 prove completed poweroff or database flush. The host retains its separate
 eight-second default handoff fallback, which may force the VM to exit.
+The host selects this grace from the typed handoff configuration; a separate
+kernel init override also retains the longer grace. With neither configured,
+the ordinary agentd-as-PID-1 fallback remains two seconds.
 Shutdown validation must distinguish guest completion from that host fallback.
 
 Agentd-as-PID-1 shutdown is unchanged. Non-systemd handoffs retain their legacy
