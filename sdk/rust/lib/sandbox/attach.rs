@@ -283,9 +283,17 @@ pub(crate) mod agent {
         cmd: String,
         opts_builder: AttachOptionsBuilder,
     ) -> MicrosandboxResult<i32> {
-        let opts = opts_builder.build()?;
-
         let client = Arc::new(super::super::fs::agent::connect_agent(backend, name).await?);
+        attach_connected(client, config, cmd, opts_builder).await
+    }
+
+    pub(crate) async fn attach_connected(
+        client: Arc<crate::agent::AgentClient>,
+        config: &SandboxConfig,
+        cmd: String,
+        opts_builder: AttachOptionsBuilder,
+    ) -> MicrosandboxResult<i32> {
+        let opts = opts_builder.build()?;
 
         let detach_keys = match &opts.detach_keys {
             Some(spec) => DetachKeys::parse(spec)?,
@@ -474,9 +482,17 @@ pub(crate) mod agent {
         cmd: String,
         opts_builder: AttachOptionsBuilder,
     ) -> MicrosandboxResult<i32> {
-        let opts = opts_builder.build()?;
-
         let client = Arc::new(super::super::fs::agent::connect_agent(backend, name).await?);
+        attach_connected(client, config, cmd, opts_builder).await
+    }
+
+    pub(crate) async fn attach_connected(
+        client: Arc<crate::agent::AgentClient>,
+        config: &SandboxConfig,
+        cmd: String,
+        opts_builder: AttachOptionsBuilder,
+    ) -> MicrosandboxResult<i32> {
+        let opts = opts_builder.build()?;
 
         let detach_keys = match &opts.detach_keys {
             Some(spec) => DetachKeys::parse(spec)?,

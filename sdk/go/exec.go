@@ -122,10 +122,16 @@ const (
 	ExecEventStdinError ExecEventKind = ffi.ExecEventStdinError
 	// ExecEventDone signals that all events have been consumed.
 	ExecEventDone ExecEventKind = ffi.ExecEventDone
+	// ExecEventInterrupted reports an operation failure with separate termination
+	// evidence. ExitCode is not valid, including when termination is unconfirmed.
+	ExecEventInterrupted ExecEventKind = ffi.ExecEventInterrupted
 )
 
 // ExecFailure carries structured detail about a failed-to-start exec.
 type ExecFailure = ffi.ExecFailure
+
+type ExecInterruption = ffi.ExecInterruption
+type ExecInterruptionDetail = ffi.ExecInterruptionDetail
 
 // ExecEvent is one event from a streaming exec session.
 type ExecEvent struct {
@@ -145,6 +151,8 @@ type ExecEvent struct {
 	// Failure carries the failure detail. Populated on ExecEventFailed and
 	// ExecEventStdinError.
 	Failure *ExecFailure
+	// Interruption is populated only on ExecEventInterrupted.
+	Interruption *ExecInterruption
 }
 
 // ExecSink is a write-only pipe to a running process's stdin. Obtain via
@@ -199,11 +207,12 @@ func (h *ExecHandle) Recv(ctx context.Context) (*ExecEvent, error) {
 		return nil, wrapFFI(err)
 	}
 	return &ExecEvent{
-		Kind:     ev.Kind,
-		PID:      ev.PID,
-		Data:     ev.Data,
-		ExitCode: ev.ExitCode,
-		Failure:  ev.Failure,
+		Kind:         ev.Kind,
+		PID:          ev.PID,
+		Data:         ev.Data,
+		ExitCode:     ev.ExitCode,
+		Failure:      ev.Failure,
+		Interruption: ev.Interruption,
 	}, nil
 }
 
@@ -245,9 +254,8 @@ func (h *ExecHandle) Resize(ctx context.Context, rows, cols uint16) error {
 	return wrapFFI(h.inner.Resize(ctx, rows, cols))
 }
 
-// Close releases the Rust-side exec handle. Does not kill the running process;
-// call Signal(ctx, 9) first if you need to terminate it. Safe to call after
-// ExecEventDone has been received.
+// Close releases the Rust-side event owner. Closing before completion requests
+// bounded cleanup but is not proof of guest process termination. Safe after Done.
 func (h *ExecHandle) Close() error {
 	return wrapFFI(h.inner.Close())
 }

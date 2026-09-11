@@ -72,6 +72,7 @@ func TestExecEventKindConstants(t *testing.T) {
 		ExecEventFailed,
 		ExecEventStdinError,
 		ExecEventDone,
+		ExecEventInterrupted,
 	}
 	seen := make(map[ExecEventKind]bool, len(kinds))
 	for _, k := range kinds {
@@ -83,6 +84,13 @@ func TestExecEventKindConstants(t *testing.T) {
 }
 
 func TestExecEventFields(t *testing.T) {
+	interrupted := ExecEvent{Kind: ExecEventInterrupted, Interruption: &ExecInterruption{
+		Reason:      ExecInterruptionDetail{Kind: "cancelled"},
+		Termination: ExecInterruptionDetail{Kind: "unconfirmed"},
+	}}
+	if interrupted.Kind == ExecEventExited || interrupted.Interruption.Termination.Kind != "unconfirmed" {
+		t.Fatal("interruption cannot become a successful exit")
+	}
 	started := ExecEvent{Kind: ExecEventStarted, PID: 42}
 	if started.PID != 42 {
 		t.Errorf("PID: got %d, want 42", started.PID)

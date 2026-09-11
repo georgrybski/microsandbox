@@ -1,16 +1,16 @@
 //! Execution types for running commands inside sandboxes.
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use bytes::Bytes;
-use microsandbox_protocol::{
-    exec::{ExecResize, ExecSignal, ExecStdin},
-    message::MessageType,
-};
 use tokio::sync::mpsc;
 
-use crate::{MicrosandboxResult, agent::AgentClient};
+use crate::MicrosandboxResult;
 use microsandbox_types::EnvVar;
+
+mod session;
+use session::{ExecEvents, SessionControl};
+pub use session::{ExecInterruption, ExecInterruptionReason, ExecTermination};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -31,7 +31,9 @@ pub struct ExecOptions {
     /// Environment variables (merged with sandbox env).
     pub env: Vec<EnvVar>,
 
-    /// Execution timeout. On expiry, SIGKILL is sent.
+    /// Execution deadline, including request delivery. On expiry a bounded
+    /// SIGKILL request and termination observation run on the original session.
+    /// An interruption is not a successful exit, even if termination is observed.
     pub timeout: Option<Duration>,
 
     /// Stdin mode.
@@ -93,27 +95,22 @@ pub struct ExecHandle {
     id: u32,
 
     /// Event receiver.
-    events: mpsc::UnboundedReceiver<ExecEvent>,
+    events: ExecEvents,
 
     /// Stdin sink (only if `StdinMode::Pipe` was used).
     stdin: Option<ExecSink>,
 
-    /// Bridge reference for sending signals/stdin.
-    client: Arc<AgentClient>,
+    control: ExecControl,
 }
 
 /// Cloneable control handle for a streaming exec session.
 #[derive(Clone)]
 pub struct ExecControl {
-    /// Correlation ID for this session.
-    id: u32,
-
-    /// Bridge reference for sending control messages.
-    client: Arc<AgentClient>,
+    inner: SessionControl,
 }
 
 /// Events emitted by a streaming exec session.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ExecEvent {
     /// Process started.
     Started {
@@ -142,12 +139,15 @@ pub enum ExecEvent {
     /// the session keeps running and may still emit further output and
     /// an `Exited` event.
     StdinError(microsandbox_protocol::exec::ExecStdinError),
+
+    /// The operation was interrupted. The reason and any observed process
+    /// termination are separate; transport loss never implies successful exit.
+    Interrupted(ExecInterruption),
 }
 
 /// Sink for writing to a running process's stdin.
 pub struct ExecSink {
-    id: u32,
-    client: Arc<AgentClient>,
+    session: microsandbox_agent_client::AgentSession,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -204,7 +204,8 @@ impl ExecOptionsBuilder {
         self
     }
 
-    /// Kill the process with SIGKILL if it hasn't exited within this duration.
+    /// Interrupt the operation after this duration, then request SIGKILL and
+    /// observe termination for a bounded interval. Applies to streaming too.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.options.timeout = Some(timeout);
         self
@@ -308,17 +309,12 @@ impl ExecOutput {
 
 impl ExecHandle {
     /// Create a new exec handle.
-    pub(crate) fn new(
-        id: u32,
-        events: mpsc::UnboundedReceiver<ExecEvent>,
-        stdin: Option<ExecSink>,
-        client: Arc<AgentClient>,
-    ) -> Self {
+    pub(crate) fn new(control: ExecControl, events: ExecEvents, stdin: Option<ExecSink>) -> Self {
         Self {
-            id,
+            id: control.inner.session.id(),
             events,
             stdin,
-            client,
+            control,
         }
     }
 
@@ -329,29 +325,13 @@ impl ExecHandle {
 
     /// Get a cloneable control handle for this session.
     pub fn control(&self) -> ExecControl {
-        ExecControl {
-            id: self.id,
-            client: Arc::clone(&self.client),
-        }
+        self.control.clone()
     }
 
     /// Consume this handle into separately owned control, stdin, and event parts.
     #[cfg(feature = "ssh")]
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        ExecControl,
-        Option<ExecSink>,
-        mpsc::UnboundedReceiver<ExecEvent>,
-    ) {
-        (
-            ExecControl {
-                id: self.id,
-                client: Arc::clone(&self.client),
-            },
-            self.stdin,
-            self.events,
-        )
+    pub(crate) fn into_parts(self) -> (ExecControl, Option<ExecSink>, ExecEvents) {
+        (self.control, self.stdin, self.events)
     }
 
     /// Receive the next exec event.
@@ -359,6 +339,12 @@ impl ExecHandle {
     /// Returns `None` when the session has ended.
     pub async fn recv(&mut self) -> Option<ExecEvent> {
         self.events.recv().await
+    }
+
+    /// Receive one queued event without waiting or transport I/O. Empty is
+    /// distinct from disconnected; neither is evidence of process termination.
+    pub fn try_recv(&mut self) -> Result<ExecEvent, mpsc::error::TryRecvError> {
+        self.events.try_recv()
     }
 
     /// Take the stdin sink (if `StdinMode::Pipe` was used).
@@ -381,6 +367,9 @@ impl ExecHandle {
                 ExecEvent::Failed(payload) => {
                     return Err(crate::MicrosandboxError::ExecFailed(payload));
                 }
+                ExecEvent::Interrupted(interruption) => {
+                    return Err(crate::MicrosandboxError::ExecInterrupted(interruption));
+                }
                 _ => {}
             }
         }
@@ -390,7 +379,8 @@ impl ExecHandle {
         ))
     }
 
-    /// Wait for completion and collect all stdout/stderr.
+    /// Wait for completion and collect at most 8 MiB of combined stdout/stderr.
+    /// Exceeding the bound interrupts the operation rather than truncating it.
     pub async fn collect(&mut self) -> MicrosandboxResult<ExecOutput> {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -400,9 +390,25 @@ impl ExecHandle {
             match event {
                 ExecEvent::Started { pid: _ } => {}
                 ExecEvent::Stdout(data) => {
+                    if data.len() > session::COLLECT_BYTES - stdout.len() - stderr.len() {
+                        let outcome = self
+                            .control
+                            .inner
+                            .cancel(ExecInterruptionReason::OutputLimit)
+                            .await;
+                        return Err(crate::MicrosandboxError::ExecInterrupted(outcome));
+                    }
                     stdout.extend_from_slice(&data);
                 }
                 ExecEvent::Stderr(data) => {
+                    if data.len() > session::COLLECT_BYTES - stdout.len() - stderr.len() {
+                        let outcome = self
+                            .control
+                            .inner
+                            .cancel(ExecInterruptionReason::OutputLimit)
+                            .await;
+                        return Err(crate::MicrosandboxError::ExecInterrupted(outcome));
+                    }
                     stderr.extend_from_slice(&data);
                 }
                 ExecEvent::Exited { code } => {
@@ -413,6 +419,9 @@ impl ExecHandle {
                     return Err(crate::MicrosandboxError::ExecFailed(payload));
                 }
                 ExecEvent::StdinError(_) => {}
+                ExecEvent::Interrupted(interruption) => {
+                    return Err(crate::MicrosandboxError::ExecInterrupted(interruption));
+                }
             }
         }
 
@@ -445,22 +454,23 @@ impl ExecHandle {
     pub async fn resize(&self, rows: u16, cols: u16) -> MicrosandboxResult<()> {
         self.control().resize(rows, cols).await
     }
+
+    /// Request cancellation and wait a bounded interval for termination evidence.
+    pub async fn cancel(&self) -> ExecInterruption {
+        self.control.cancel().await
+    }
 }
 
 impl ExecControl {
     /// Get the execution session ID.
     pub fn id(&self) -> String {
-        self.id.to_string()
+        self.inner.session.id().to_string()
     }
 
     /// Send a Unix signal (e.g., `libc::SIGTERM`, `libc::SIGINT`) to the
     /// running process inside the guest.
     pub async fn signal(&self, signal: i32) -> MicrosandboxResult<()> {
-        let payload = ExecSignal { signal };
-        self.client
-            .send(self.id, MessageType::ExecSignal, &payload)
-            .await?;
-        Ok(())
+        self.inner.signal(signal).await
     }
 
     /// Send SIGKILL to the running process.
@@ -470,38 +480,31 @@ impl ExecControl {
 
     /// Resize the PTY for this session.
     pub async fn resize(&self, rows: u16, cols: u16) -> MicrosandboxResult<()> {
-        let payload = ExecResize { rows, cols };
-        self.client
-            .send(self.id, MessageType::ExecResize, &payload)
-            .await?;
-        Ok(())
+        self.inner.resize(rows, cols).await
+    }
+
+    /// Request SIGKILL on this original session and observe termination for a
+    /// bounded interval. This is process-group cleanup, not containment of
+    /// descendants that escaped the group. Unconfirmed is never an exit code.
+    pub async fn cancel(&self) -> ExecInterruption {
+        self.inner.cancel(ExecInterruptionReason::Cancelled).await
     }
 }
 
 impl ExecSink {
     /// Create a new stdin sink.
-    pub(crate) fn new(id: u32, client: Arc<AgentClient>) -> Self {
-        Self { id, client }
+    pub(crate) fn new(session: microsandbox_agent_client::AgentSession) -> Self {
+        Self { session }
     }
 
     /// Write data to the process's stdin.
     pub async fn write(&self, data: impl AsRef<[u8]>) -> MicrosandboxResult<()> {
-        let payload = ExecStdin {
-            data: data.as_ref().to_vec(),
-        };
-        self.client
-            .send(self.id, MessageType::ExecStdin, &payload)
-            .await?;
-        Ok(())
+        session::write_stdin(&self.session, data.as_ref(), false).await
     }
 
-    /// Close stdin (sends EOF to the process).
+    /// Close pipe stdin. PTY EOF remains a no-op in agentd so output can drain.
     pub async fn close(&self) -> MicrosandboxResult<()> {
-        let payload = ExecStdin { data: Vec::new() };
-        self.client
-            .send(self.id, MessageType::ExecStdin, &payload)
-            .await?;
-        Ok(())
+        session::write_stdin(&self.session, &[], true).await
     }
 }
 
@@ -510,25 +513,15 @@ impl ExecSink {
 //--------------------------------------------------------------------------------------------------
 
 pub(crate) mod agent {
-    //! Local exec dispatch keyed by `(sandbox_name, cmd, opts)`.
-    //!
-    //! Opens a fresh agent UDS each call (option A in the parity plan).
+    //! Native exec dispatch over an existing connection. Name-addressed helpers
+    //! remain for backends without a host-owned launch binding.
 
-    use std::sync::Arc;
-
-    use bytes::Bytes;
-    use microsandbox_protocol::{
-        exec::{ExecExited, ExecStarted, ExecStderr, ExecStdin, ExecStdout},
-        message::{Message, MessageType},
-    };
-    use tokio::sync::mpsc;
-
+    use super::{ExecHandle, ExecOptions, ExecOutput};
     use crate::{
-        MicrosandboxError, MicrosandboxResult,
+        MicrosandboxResult,
         sandbox::{SandboxConfig, build_exec_request},
     };
-
-    use super::{ExecEvent, ExecHandle, ExecOptions, ExecOutput, ExecSink, ExitStatus, StdinMode};
+    use std::sync::Arc;
 
     pub(crate) async fn exec_stream(
         backend: &dyn crate::backend::Backend,
@@ -550,6 +543,18 @@ pub(crate) mod agent {
         cols: u16,
     ) -> MicrosandboxResult<ExecHandle> {
         let client = Arc::new(super::super::fs::agent::connect_agent(backend, name).await?);
+        exec_stream_connected(client, config, cmd, opts, rows, cols).await
+    }
+
+    pub(crate) async fn exec_stream_connected(
+        client: Arc<crate::agent::AgentClient>,
+        config: &SandboxConfig,
+        cmd: String,
+        opts: ExecOptions,
+        rows: u16,
+        cols: u16,
+    ) -> MicrosandboxResult<ExecHandle> {
+        super::validate_rlimits(&opts.rlimits)?;
         let ExecOptions {
             args,
             cwd,
@@ -557,44 +562,13 @@ pub(crate) mod agent {
             env,
             rlimits,
             tty,
-            stdin: stdin_mode,
-            timeout: _,
+            stdin,
+            timeout,
         } = opts;
-
-        tracing::debug!(
-            sandbox = %name,
-            cmd = %cmd,
-            args = ?args,
-            cwd = ?cwd,
-            tty,
-            "exec_stream"
-        );
-
-        let req = build_exec_request(
+        let request = build_exec_request(
             config, cmd, args, cwd, user, &env, &rlimits, tty, rows, cols,
         );
-        let (id, rx) = client.stream(MessageType::ExecRequest, &req).await?;
-
-        let stdin = match &stdin_mode {
-            StdinMode::Pipe => Some(ExecSink::new(id, Arc::clone(&client))),
-            _ => None,
-        };
-
-        if let StdinMode::Bytes(ref data) = stdin_mode {
-            let data = data.clone();
-            let bridge = Arc::clone(&client);
-            tokio::spawn(async move {
-                let payload = ExecStdin { data };
-                let _ = bridge.send(id, MessageType::ExecStdin, &payload).await;
-                let close = ExecStdin { data: Vec::new() };
-                let _ = bridge.send(id, MessageType::ExecStdin, &close).await;
-            });
-        }
-
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        tokio::spawn(event_mapper_task(rx, event_tx));
-
-        Ok(ExecHandle::new(id, event_rx, stdin, client))
+        super::session::open(client, request, stdin, timeout).await
     }
 
     pub(crate) async fn exec(
@@ -604,79 +578,24 @@ pub(crate) mod agent {
         cmd: String,
         opts: ExecOptions,
     ) -> MicrosandboxResult<ExecOutput> {
-        let timeout_duration = opts.timeout;
-        let mut handle = exec_stream(backend, name, config, cmd, opts).await?;
-
-        match timeout_duration {
-            Some(duration) => match tokio::time::timeout(duration, handle.collect()).await {
-                Ok(result) => result,
-                Err(_) => {
-                    let _ = handle.kill().await;
-                    let _ =
-                        tokio::time::timeout(std::time::Duration::from_secs(5), handle.collect())
-                            .await;
-                    Err(MicrosandboxError::ExecTimeout(duration))
-                }
-            },
-            None => handle.collect().await,
-        }
+        let client = Arc::new(super::super::fs::agent::connect_agent(backend, name).await?);
+        exec_connected(client, config, cmd, opts).await
     }
 
-    /// Background task that converts raw protocol messages into [`ExecEvent`]s.
-    async fn event_mapper_task(
-        mut rx: mpsc::Receiver<Message>,
-        tx: mpsc::UnboundedSender<ExecEvent>,
-    ) {
-        while let Some(msg) = rx.recv().await {
-            let event = match msg.t {
-                MessageType::ExecStarted => match msg.payload::<ExecStarted>() {
-                    Ok(started) => ExecEvent::Started { pid: started.pid },
-                    Err(_) => continue,
-                },
-                MessageType::ExecStdout => match msg.payload::<ExecStdout>() {
-                    Ok(out) => ExecEvent::Stdout(Bytes::from(out.data)),
-                    Err(_) => continue,
-                },
-                MessageType::ExecStderr => match msg.payload::<ExecStderr>() {
-                    Ok(err) => ExecEvent::Stderr(Bytes::from(err.data)),
-                    Err(_) => continue,
-                },
-                MessageType::ExecExited => {
-                    if let Ok(exited) = msg.payload::<ExecExited>() {
-                        let _ = tx.send(ExecEvent::Exited { code: exited.code });
-                    }
-                    break;
-                }
-                MessageType::ExecFailed => {
-                    if let Ok(failed) = msg.payload::<microsandbox_protocol::exec::ExecFailed>() {
-                        let _ = tx.send(ExecEvent::Failed(failed));
-                    }
-                    break;
-                }
-                MessageType::ExecStdinError => {
-                    match msg.payload::<microsandbox_protocol::exec::ExecStdinError>() {
-                        Ok(payload) => ExecEvent::StdinError(payload),
-                        Err(_) => continue,
-                    }
-                }
-                _ => continue,
-            };
-            if tx.send(event).is_err() {
-                break;
-            }
-        }
-    }
-
-    // Re-export so backend trait impl can also use ExitStatus for typing.
-    #[allow(dead_code)]
-    pub(crate) fn _exit_status(code: i32) -> ExitStatus {
-        ExitStatus {
-            code,
-            success: code == 0,
-        }
+    pub(crate) async fn exec_connected(
+        client: Arc<crate::agent::AgentClient>,
+        config: &SandboxConfig,
+        cmd: String,
+        opts: ExecOptions,
+    ) -> MicrosandboxResult<ExecOutput> {
+        exec_stream_connected(client, config, cmd, opts, 24, 80)
+            .await?
+            .collect()
+            .await
     }
 }
 
+//--------------------------------------------------------------------------------------------------
 //--------------------------------------------------------------------------------------------------
 // Re-Exports
 //--------------------------------------------------------------------------------------------------

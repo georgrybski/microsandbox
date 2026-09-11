@@ -49,7 +49,9 @@ pub use microsandbox_image::{ImageArchiveFormat, RegistryAuth};
 pub use microsandbox_protocol as protocol;
 pub use microsandbox_runtime::logging::LogLevel;
 pub use microsandbox_utils::size;
-pub use sandbox::exec::{ExecControl, ExecEvent, ExecHandle};
+pub use sandbox::exec::{
+    ExecControl, ExecEvent, ExecHandle, ExecInterruption, ExecInterruptionReason, ExecTermination,
+};
 #[cfg(feature = "ssh")]
 pub use sandbox::ssh::{
     DEFAULT_SSH_HOST, DEFAULT_SSH_PORT, SandboxSshOps, SftpClient, SshAttachOptionsBuilder,
@@ -60,8 +62,8 @@ pub use sandbox::{
     ChangeKind, ConfigPlannedChange, ExecOutput, MAX_HOSTNAME_BYTES, MAX_SANDBOX_NAME_BYTES,
     ModificationConflict, ModificationDisposition, ModificationPolicy, ModificationWarning,
     NetworkSpecPatch, PlannedChange, ResourceConvergenceState, ResourceKind, ResourceResizeStatus,
-    Sandbox, SandboxConfig, SandboxConfigPatch, SandboxListBuilder, SandboxMetrics,
-    SandboxMetricsReport, SandboxMetricsState, SandboxModificationBuilder,
+    Sandbox, SandboxConfig, SandboxConfigPatch, SandboxLaunchId, SandboxListBuilder,
+    SandboxMetrics, SandboxMetricsReport, SandboxMetricsState, SandboxModificationBuilder,
     SandboxModificationPatch, SandboxModificationPlan, SandboxPage, SandboxPingResult,
     SandboxPolicyPatch, SandboxResourcesPatch, SandboxRuntimeOptionsPatch, SandboxTouchResult,
     SecretChangeKind, SecretModificationPatch, SecretPatchBuilder, SecretPlannedChange,

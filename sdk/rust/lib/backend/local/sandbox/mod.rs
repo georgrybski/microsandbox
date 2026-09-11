@@ -6,6 +6,9 @@
 //! methods; [`LocalBackend::create_sandbox`] is its entry point.
 
 mod create;
+#[cfg(all(test, target_os = "linux"))]
+mod launch_tests;
+mod lifecycle;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -40,9 +43,9 @@ use crate::logs::{BootError, LogEntry, LogOptions, LogStreamOptions};
 use crate::runtime::SpawnMode;
 use crate::sandbox::metrics::SandboxMetrics;
 use crate::sandbox::{
-    RootfsSource, Sandbox, SandboxConfig, SandboxHandle, SandboxListBuilder, SandboxPage,
-    SandboxStatus, load_sandbox_record, validate_env, validate_hostname, validate_labels,
-    validate_volume_mounts,
+    LocalLaunch, LocalObservation, RootfsSource, Sandbox, SandboxConfig, SandboxHandle,
+    SandboxListBuilder, SandboxPage, SandboxStatus, load_sandbox_record, validate_env,
+    validate_hostname, validate_labels, validate_volume_mounts,
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -70,12 +73,27 @@ impl LocalBackend {
         expected_id: Option<i32>,
         mode: SpawnMode,
     ) -> MicrosandboxResult<Sandbox> {
+        self.start_sandbox_observed(backend, name, expected_id, None, mode)
+            .await
+    }
+
+    async fn start_sandbox_observed(
+        &self,
+        backend: Arc<dyn Backend>,
+        name: &str,
+        expected_id: Option<i32>,
+        expected: Option<&LocalObservation>,
+        mode: SpawnMode,
+    ) -> MicrosandboxResult<Sandbox> {
         tracing::debug!(sandbox = name, ?mode, "start_local: loading record");
         // Serialize the state decision and launcher-to-runtime handoff by name. The database CAS
         // below remains the authoritative start claim; this guard also protects deterministic
         // host resources that are outside SQLite.
         let _transition_guard =
             Self::acquire_sandbox_transition_guard(&self.config().run_dir(), name).await?;
+        if let Some(expected) = expected {
+            self.validate_observation(name, expected).await?;
+        }
         let pools = self.db().await?;
         let write_db = pools.write();
         let model = self.load_sandbox_record_reconciled(pools, name).await?;
@@ -138,6 +156,10 @@ impl LocalBackend {
             )));
         }
         let model = current;
+
+        if let Some(expected) = expected {
+            self.validate_observation(name, expected).await?;
+        }
 
         // Older runtimes did not hold the lifecycle lock and published their
         // terminal DB state just before process exit. Preserve upgrade safety
@@ -256,7 +278,8 @@ impl LocalBackend {
     ///
     /// No-op when the sandbox isn't Starting, Running, or Draining.
     async fn stop_sandbox(&self, name: &str, expected_id: Option<i32>) -> MicrosandboxResult<()> {
-        let (model, pid) = self.sandbox_handle_state(name, expected_id).await?;
+        let (model, run, _) = self.sandbox_handle_state(name, expected_id).await?;
+        let pid = run.map(|run| run.pid);
         if !matches!(
             model.status,
             SandboxStatus::Starting | SandboxStatus::Running | SandboxStatus::Draining
@@ -296,7 +319,8 @@ impl LocalBackend {
     /// libkrun PID, waits briefly for the process to exit, then marks the DB
     /// row Stopped if all signalled PIDs are confirmed dead.
     async fn kill_sandbox(&self, name: &str, expected_id: Option<i32>) -> MicrosandboxResult<()> {
-        let (model, pid) = self.sandbox_handle_state(name, expected_id).await?;
+        let (model, run, _) = self.sandbox_handle_state(name, expected_id).await?;
+        let pid = run.map(|run| run.pid);
         if !matches!(
             model.status,
             SandboxStatus::Starting | SandboxStatus::Running | SandboxStatus::Draining
@@ -340,7 +364,8 @@ impl LocalBackend {
     /// `core.shutdown` agent message so the guest can sync and power off
     /// without pretending a direct process termination is graceful.
     async fn drain_sandbox(&self, name: &str, expected_id: Option<i32>) -> MicrosandboxResult<()> {
-        let (model, pid) = self.sandbox_handle_state(name, expected_id).await?;
+        let (model, run, _) = self.sandbox_handle_state(name, expected_id).await?;
+        let pid = run.map(|run| run.pid);
         if model.status != SandboxStatus::Running && model.status != SandboxStatus::Draining {
             return Ok(());
         }
@@ -378,19 +403,16 @@ impl LocalBackend {
 
     /// Local lifecycle: remove a stopped sandbox by name.
     ///
-    /// `backend` must be the `Arc<dyn Backend>` wrapping `self`. Removal
-    /// deliberately delegates through [`SandboxHandle::remove`] instead of
-    /// inlining it, so explicit removes and handle-driven removes share one
-    /// implementation.
+    /// Explicit name selection retains the administrative removal contract.
+    /// Bound receivers share its storage cleanup with stricter run evidence.
     async fn remove_sandbox(
         &self,
-        backend: Arc<dyn Backend>,
+        _backend: Arc<dyn Backend>,
         name: &str,
         expected_id: Option<i32>,
     ) -> MicrosandboxResult<()> {
-        let (model, pid) = self.sandbox_handle_state(name, expected_id).await?;
-        let handle = SandboxHandle::from_local_model(backend, model, pid);
-        handle.remove().await
+        let (model, _, _) = self.sandbox_handle_state(name, expected_id).await?;
+        crate::sandbox::remove_local_persisted_sandbox(self, name, model.id).await
     }
 
     /// Load the local DB row + active PID for a sandbox handle.
@@ -398,7 +420,7 @@ impl LocalBackend {
         &self,
         name: &str,
         expected_id: Option<i32>,
-    ) -> MicrosandboxResult<(sandbox_entity::Model, Option<i32>)> {
+    ) -> MicrosandboxResult<(sandbox_entity::Model, Option<LocalLaunch>, LocalObservation)> {
         let pools = self.db().await?;
         let model = sandbox_entity::Entity::find()
             .filter(sandbox_entity::Column::Name.eq(name))
@@ -407,16 +429,52 @@ impl LocalBackend {
             .ok_or_else(|| crate::MicrosandboxError::SandboxNotFound(name.into()))?;
         ensure_local_identity(name, expected_id, model.id)?;
         let model = self.reconcile_sandbox_runtime_state(pools, model).await?;
-        let run = Self::load_active_run(pools.read(), model.id).await?;
-        let pid = Self::pid_from_run(run.as_ref());
-        Ok((model, pid))
+        let run = Self::load_latest_run(pools.read(), model.id).await?;
+        let launch = self.launch_from_run(
+            run.as_ref()
+                .filter(|r| r.status == run_entity::RunStatus::Running),
+        );
+        let observation =
+            LocalObservation::capture(self, model.id, run.as_ref().map(|r| r.id), launch);
+        Ok((model, launch, observation))
+    }
+
+    /// Validate a captured host-owned run without resolving a new agent connection.
+    pub(crate) async fn validate_launch(
+        &self,
+        name: &str,
+        expected: LocalLaunch,
+    ) -> MicrosandboxResult<()> {
+        // Receiver validation must not reconcile or mutate a later run before
+        // rejecting it. Reconciliation belongs to explicitly selected lifecycle
+        // operations, never to a retained exec connection's authority check.
+        let pools = self.db().await?;
+        let model = load_sandbox_record(pools.read(), name).await?;
+        ensure_local_identity(name, Some(expected.sandbox_id), model.id)?;
+        let run = Self::load_latest_run(pools.read(), model.id).await?;
+        let current = self.launch_from_run(
+            run.as_ref()
+                .filter(|run| run.status == run_entity::RunStatus::Running),
+        );
+        if !matches!(
+            model.status,
+            SandboxStatus::Running | SandboxStatus::Draining
+        ) {
+            return Err(crate::MicrosandboxError::SandboxLaunchChanged {
+                name: name.to_owned(),
+            });
+        }
+        expected.ensure_current(name, current)
     }
 
     /// Load one filtered page of local DB rows + their active PIDs.
     async fn list_sandbox_handle_state(
         &self,
         query: &SandboxListBuilder,
-    ) -> MicrosandboxResult<(Vec<(sandbox_entity::Model, Option<i32>)>, Option<String>)> {
+    ) -> MicrosandboxResult<(
+        Vec<(sandbox_entity::Model, Option<LocalLaunch>)>,
+        Option<String>,
+    )> {
         let pools = self.db().await?;
         let mut select = sandbox_entity::Entity::find();
 
@@ -457,7 +515,7 @@ impl LocalBackend {
         }
 
         let sandbox_ids: Vec<i32> = reconciled.iter().map(|sandbox| sandbox.id).collect();
-        let active_pids = Self::load_active_pids(pools.read(), &sandbox_ids).await?;
+        let active_pids = self.load_active_pids(pools.read(), &sandbox_ids).await?;
         let mut out = Vec::with_capacity(reconciled.len());
         for sandbox in reconciled {
             let pid = active_pids.get(&sandbox.id).copied();
@@ -694,9 +752,10 @@ impl LocalBackend {
 
     /// Load the live PIDs of the most recent active runs for `sandbox_ids`.
     async fn load_active_pids(
+        &self,
         db: &DbReadConnection,
         sandbox_ids: &[i32],
-    ) -> MicrosandboxResult<HashMap<i32, i32>> {
+    ) -> MicrosandboxResult<HashMap<i32, LocalLaunch>> {
         if sandbox_ids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -713,8 +772,8 @@ impl LocalBackend {
             if pids.contains_key(&run.sandbox_id) {
                 continue;
             }
-            if let Some(pid) = Self::pid_from_run(Some(&run)) {
-                pids.insert(run.sandbox_id, pid);
+            if let Some(launch) = self.launch_from_run(Some(&run)) {
+                pids.insert(run.sandbox_id, launch);
             }
         }
 
@@ -725,6 +784,12 @@ impl LocalBackend {
     fn pid_from_run(run: Option<&run_entity::Model>) -> Option<i32> {
         run.and_then(|model| model.pid)
             .filter(|pid| Self::pid_is_alive(*pid))
+    }
+
+    pub(crate) fn launch_from_run(&self, run: Option<&run_entity::Model>) -> Option<LocalLaunch> {
+        let run = run?;
+        let pid = Self::pid_from_run(Some(run))?;
+        Some(LocalLaunch::capture(self, run.sandbox_id, run.id, pid))
     }
 
     /// Terminal status + termination reason for a stale Running/Draining row.
@@ -1060,8 +1125,13 @@ impl SandboxBackend for LocalBackend {
         name: &'a str,
     ) -> BoxFuture<'a, MicrosandboxResult<SandboxHandle>> {
         Box::pin(async move {
-            let (model, pid) = self.sandbox_handle_state(name, None).await?;
-            Ok(SandboxHandle::from_local_model(backend, model, pid))
+            let (model, pid, observation) = self.sandbox_handle_state(name, None).await?;
+            Ok(SandboxHandle::from_local_model(
+                backend,
+                model,
+                pid,
+                observation,
+            ))
         })
     }
 
@@ -1072,10 +1142,24 @@ impl SandboxBackend for LocalBackend {
     ) -> BoxFuture<'a, MicrosandboxResult<SandboxPage>> {
         Box::pin(async move {
             let (rows, next_cursor) = self.list_sandbox_handle_state(&query).await?;
-            let sandboxes = rows
-                .into_iter()
-                .map(|(model, pid)| SandboxHandle::from_local_model(backend.clone(), model, pid))
-                .collect();
+            let mut sandboxes = Vec::with_capacity(rows.len());
+            for (model, pid) in rows {
+                let run = Self::load_latest_run(self.db().await?.read(), model.id).await?;
+                let observation = LocalObservation::capture(self, model.id, run.map(|r| r.id), pid);
+                // A list entry may race a transition; never combine a live
+                // process from one run with a different persisted observation.
+                if pid.is_some_and(|p| observation.run_id != Some(p.run_id)) {
+                    return Err(crate::MicrosandboxError::SandboxLaunchChanged {
+                        name: model.name,
+                    });
+                }
+                sandboxes.push(SandboxHandle::from_local_model(
+                    backend.clone(),
+                    model,
+                    pid,
+                    observation,
+                ));
+            }
             Ok(SandboxPage {
                 sandboxes,
                 next_cursor,

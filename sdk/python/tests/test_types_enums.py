@@ -117,6 +117,7 @@ def test_new_enum_domains_have_canonical_values() -> None:
     assert NamedVolumeMode.ENSURE_EXISTS.value == "ensure-exists"
     assert Stdin.pipe()._mode is StdinMode.PIPE
     assert ExecEventType.STDIN_ERROR.value == "stdin_error"
+    assert ExecEventType.INTERRUPTED.value == "interrupted"
     assert PullEventType.LAYER_DOWNLOAD_VERIFYING.value == "layer_download_verifying"
     assert PlannedChangeKind.SECRET.value == "secret"
     assert ChangeKind.UPDATED.value == "updated"

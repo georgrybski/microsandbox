@@ -144,6 +144,7 @@ class ExecEventType(StrEnum):
     EXITED = "exited"
     FAILED = "failed"
     STDIN_ERROR = "stdin_error"
+    INTERRUPTED = "interrupted"
 
 
 class PullEventType(StrEnum):
