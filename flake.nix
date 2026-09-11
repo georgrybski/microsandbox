@@ -137,15 +137,17 @@
             inherit src cargoLock version;
           };
           runtimeSmokeImage = pkgs.callPackage ./nix/packages/runtime-smoke-image.nix { inherit vsockProbe; };
-          msb = pkgs.callPackage ./nix/packages/microsandbox.nix {
+          cli = pkgs.callPackage ./nix/packages/cli.nix {
             inherit
               src
               rustToolchain
               agentd
               cargoLock
               version
-              libkrunfw
               ;
+          };
+          msb = pkgs.callPackage ./nix/packages/microsandbox.nix {
+            inherit cli agentd libkrunfw;
           };
 
           # Toolchain with the musl std for the agentd musl clippy gate
@@ -246,6 +248,9 @@
                 '';
 
             package =
+              assert pkgs.lib.assertMsg (
+                toString msb.src == toString cli.src && toString msb.src == toString src
+              ) "runtime must preserve the canonical filtered SDK source";
               pkgs.runCommand "microsandbox-package-check"
                 {
                   nativeBuildInputs = [ pkgs.python3 ];
@@ -253,13 +258,30 @@
                 ''
                   export MSB_HOME="$TMPDIR/.microsandbox"
                   ${msb}/bin/msb --version | grep -Fx 'msb ${msb.version}'
+                  test ! -L ${msb}/bin/msb
+                  cmp ${msb}/bin/msb ${cli}/bin/msb
                   cmp ${msb}/libexec/agentd ${agentd}/libexec/agentd
                   test -e ${msb}/lib/libkrunfw.so
+                  cmp ${msb}/lib/libkrunfw.so.5.6.1 ${libkrunfw}/lib/libkrunfw.so.5.6.1
+                  for name in kernel.config kernel.release kernel-source.sha256 kernel-patches.sha256; do
+                    cmp ${msb}/share/libkrunfw/$name ${libkrunfw}/share/libkrunfw/$name
+                  done
+                  grep -Fx 'CONFIG_POWER_RESET_LIBKRUN=y' ${msb}/share/libkrunfw/kernel.config
                   python - <<'PY'
                   import ctypes
 
                   firmware = ctypes.CDLL("${msb}/lib/libkrunfw.so.5.6.1")
-                  getattr(firmware, "krunfw_get_kernel")
+                  version = firmware.krunfw_get_version
+                  version.argtypes = []
+                  version.restype = ctypes.c_uint32
+                  assert version() == 5
+                  kernel = firmware.krunfw_get_kernel
+                  kernel.argtypes = [ctypes.POINTER(ctypes.c_size_t)] * 3
+                  kernel.restype = ctypes.c_void_p
+                  load, entry, size = ctypes.c_size_t(), ctypes.c_size_t(), ctypes.c_size_t()
+                  address = kernel(ctypes.byref(load), ctypes.byref(entry), ctypes.byref(size))
+                  assert address and address % 65536 == 0
+                  assert load.value and entry.value and size.value and size.value % 65536 == 0
                   PY
                   mkdir -p $out
                 '';

@@ -27,11 +27,35 @@ fixed-output hashes in the package definitions:
 | `libkrunfw` | The fork's source-built `libkrunfw` flake input; its tooling, nixpkgs and flake-parts follow this flake's shared inputs | immutable revision in `flake.lock` |
 | toolchain | fenix `stable` via the shared nix-tooling pin (`flake.nix:9-18,75`) | `flake.lock` |
 
-The runtime package links its firmware filenames to the source-built output,
-keeping the kernel in one store path. `packages.x86_64-linux.microsandbox.libkrunfw`
-exposes that exact firmware derivation to consumers. There is no release-archive
-fallback. Package checks verify the firmware's exported kernel entry point;
-boot, restart and shutdown require separate runtime tests on a KVM-capable host.
+`nix/packages/cli.nix` compiles the CLI with the matching static agent embedded,
+without a firmware dependency. `nix/packages/microsandbox.nix` assembles that
+CLI, the same guest agent and the pinned firmware into the existing runtime
+layout. A firmware-only change therefore does not enter the CLI derivation's
+inputs. No upstream prebuilt runtime or release firmware archive is selected.
+The runtime's existing `src` attribute remains the same filtered workspace as
+the CLI source, so consumers can build the matching SDK without a separate tree.
+This is a dependency boundary, not a measured cache-hit guarantee on a cold
+builder.
+
+The assembled `bin/msb` is a regular copy of the source-built CLI, not a
+symlink to its CLI-only output. The CLI derives `MSB_PATH` from its actual
+executable and resolves firmware from the sibling `lib/` directory; the full
+runtime must remain the executable's prefix. Cargo's non-prebuilt build keeps
+the source-matched guest agent embedded. Its RPATH contains only the pinned
+host dynamic libraries, not either package's own output path.
+
+The runtime copies the pinned firmware and its configuration, release, source
+and patch hashes into `lib/` and `share/libkrunfw`. Its `libkrunfw` attribute
+still exposes the exact source-built derivation to consumers. The pinned
+Linux 6.12.109 kernel includes the opt-in libkrun platform power-off handler,
+which uses the existing emulated-device exit contract after normal kernel
+shutdown, not a guest reboot. Package checks verify matching bytes, ABI 5 and
+installed configuration, but do not establish completed guest shutdown.
+Runtime validation must observe guest flush and normal VMM exit before host
+fallback. Existing running VMs retain their loaded kernel; this package does
+not live-replace firmware, migrate state or restart them. Fresh Linux x86_64
+guests are the validation target; old-state or snapshot resume, downgrade,
+other platforms and nested guests require separate coverage.
 
 Cargo applies `[patch.crates-io]` only from the consuming workspace root. This
 workspace therefore pins `msb-vm-memory` to the same rust-vmm revision as
