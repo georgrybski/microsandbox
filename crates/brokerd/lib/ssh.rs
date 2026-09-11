@@ -40,10 +40,13 @@ use tokio::sync::{Mutex, Notify, OnceCell, oneshot};
 
 use microsandbox_protocol::bootstrap::BrokerUpstreamHost;
 
-use crate::audit::{AuditRecord, ChannelDirection};
+use crate::audit::{AuditIdentity, ChannelDirection};
+use crate::broker::Broker;
 use crate::error::{BrokerError, BrokerResult};
 use crate::keys::BrokerKey;
+use crate::policy::TransportAdmission;
 use crate::prelude::SessionIdentity;
+use crate::ssh_io::CancellableIo;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -54,6 +57,9 @@ const REPLY_TIMEOUT_SECS: u64 = 30;
 
 /// Time allowed for upstream dialing, handshake and authentication together.
 const UPSTREAM_AUTH_TIMEOUT_SECS: u64 = 30;
+
+/// One bounded grace period for observed completion after cancellation.
+const RETIREMENT_TIMEOUT_SECS: u64 = 5;
 
 /// Upstream-to-guest relay enforcement switch (audit-only by default).
 ///
@@ -66,6 +72,10 @@ const UPSTREAM_AUTH_TIMEOUT_SECS: u64 = 30;
 /// [`enforcement_for`], so a block closes the channel and a terminate
 /// tears down the session.
 pub const UPSTREAM_RESPONSE_ENFORCEMENT: bool = false;
+
+/// Each managed relay admits at most this many unjoined channel pumps.
+/// Legacy fixture/console mode retains its existing channel policy.
+pub(crate) const MANAGED_CHANNEL_LIMIT: usize = 16;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -84,7 +94,13 @@ pub struct UpstreamPin {
 /// Guest-facing SSH server state shared across channels of one session.
 struct RelayShared {
     /// Published only after guest authentication and pinned upstream setup.
-    upstream: OnceCell<russh::client::Handle<UpstreamVerifier>>,
+    upstream: Mutex<Option<russh::client::Handle<UpstreamVerifier>>>,
+
+    /// Authentication completed for this one exact upstream principal.
+    authenticated: OnceCell<()>,
+
+    /// A timed-out hidden library task is not an observed completed retirement.
+    retirement_incomplete: AtomicBool,
 
     /// Upstream write halves keyed by guest channel id.
     channels: Mutex<HashMap<ChannelId, Arc<UpstreamChannel>>>,
@@ -92,8 +108,12 @@ struct RelayShared {
     /// In-flight relay tasks, aborted when the guest session ends.
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 
+    /// Managed mode bounds retained channel resources, including closed pumps
+    /// until their task completion has actually been joined.
+    managed_channel_limit: Option<usize>,
+
     /// Validated session identity threaded from the divert prelude.
-    identity: SessionIdentity,
+    identity: AuditIdentity,
 
     /// Compiled DLP match library shared across sessions.
     library: Arc<PatternLibrary>,
@@ -158,10 +178,54 @@ struct GuestServer<F> {
     shared: Arc<RelayShared>,
 
     /// Lazy upstream connection and credential, unused until guest proof succeeds.
-    pending_upstream: Option<(F, Arc<PrivateKey>)>,
+    pending_upstream: Option<F>,
 
     /// Existing host-provisioned upstream identity and server pin.
-    pin: UpstreamPin,
+    authority: GuestAuthority,
+}
+
+/// One credential source, selected explicitly by the broker mode. Managed
+/// sessions never fall back to the legacy global pin or credential.
+pub(crate) enum GuestAuthority {
+    Legacy {
+        key: Arc<PrivateKey>,
+        pin: UpstreamPin,
+    },
+    Managed {
+        broker: Arc<Broker>,
+        admission: Arc<TransportAdmission>,
+    },
+}
+
+impl GuestAuthority {
+    async fn allows_user(&self, user: &str) -> bool {
+        match self {
+            Self::Legacy { pin, .. } => pin.matches_user(user),
+            Self::Managed { broker, admission } => match broker.managed_policy() {
+                Ok(store) => store.lock().await.select_transport(admission, user).is_ok(),
+                Err(_) => false,
+            },
+        }
+    }
+
+    async fn select(&self, user: &str) -> Option<(Arc<PrivateKey>, UpstreamPin)> {
+        match self {
+            Self::Legacy { key, pin } => pin
+                .matches_user(user)
+                .then(|| (Arc::clone(key), pin.clone())),
+            Self::Managed { broker, admission } => {
+                let credential = broker
+                    .managed_policy()
+                    .ok()?
+                    .lock()
+                    .await
+                    .select_transport(admission, user)
+                    .ok()?;
+                let (key, pin) = credential.material();
+                Some((Arc::new(key.private_key().clone()), pin.clone()))
+            }
+        }
+    }
 }
 
 /// Upstream client handler enforcing strict pinned host-key verification.
@@ -210,11 +274,21 @@ impl TerminationHandle {
 
     /// Wait until termination is triggered.
     pub async fn terminated(&self) {
+        self.terminated_registered(|| {}).await;
+    }
+
+    async fn terminated_registered(&self, mut registered: impl FnMut()) {
         loop {
+            // Register before observing the flag: notify_waiters does not retain
+            // a permit if termination races between the check and registration.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            registered();
             if self.is_terminated() {
                 return;
             }
-            self.notify.notified().await;
+            notified.await;
         }
     }
 }
@@ -265,13 +339,54 @@ impl<Upstream> GuestServer<Upstream> {
 }
 
 impl RelayShared {
-    /// A refused guest handshake has no upstream SSH session to disconnect.
-    async fn disconnect_upstream(&self) {
-        if let Some(upstream) = self.upstream.get() {
-            let _ = upstream
-                .disconnect(russh::Disconnect::ByApplication, "", "")
-                .await;
+    /// Reclaim only observed completed pumps before counting capacity. Channel
+    /// admission callbacks are serialized by the guest SSH handler; pumps do
+    /// not acquire this task-list lock.
+    async fn channel_capacity(&self) -> bool {
+        let Some(limit) = self.managed_channel_limit else {
+            return true;
+        };
+        let mut tasks = self.tasks.lock().await;
+        let mut index = 0;
+        while index < tasks.len() {
+            if tasks[index].is_finished() {
+                if tasks.swap_remove(index).await.is_err() {
+                    self.termination.terminate();
+                    return false;
+                }
+            } else {
+                index += 1;
+            }
         }
+        !self.termination.is_terminated() && tasks.len() < limit
+    }
+
+    /// Wait for actual native-client completion after cancellation closes I/O.
+    async fn join_upstream(&self) -> bool {
+        tokio::time::timeout(Duration::from_secs(RETIREMENT_TIMEOUT_SECS), async {
+            let upstream = self.upstream.lock().await.take();
+            if let Some(upstream) = upstream {
+                let _ = upstream.await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// Abort all owned pumps first, then await every JoinHandle. Abort alone
+    /// does not establish that a future released its stream or key references.
+    async fn join_pumps(&self) -> bool {
+        tokio::time::timeout(Duration::from_secs(RETIREMENT_TIMEOUT_SECS), async {
+            let tasks: Vec<_> = self.tasks.lock().await.drain(..).collect();
+            for task in &tasks {
+                task.abort();
+            }
+            for task in tasks {
+                let _ = task.await;
+            }
+        })
+        .await
+        .is_ok()
     }
 
     /// Count and audit one scan report, returning the relay decision.
@@ -299,16 +414,14 @@ impl RelayShared {
                     .library
                     .lookup(&hit.pattern_id)
                     .map(|meta| meta.credential_id.to_string());
-                AuditRecord::new(
-                    self.identity,
+                self.identity.emit(
                     channel.number(),
                     direction,
                     credential_id,
                     hit.pattern_id,
                     hit.digest,
                     action,
-                )
-                .emit();
+                );
             }
         }
         enforcement_for(report)
@@ -427,11 +540,13 @@ where
     ) -> Result<Auth, Self::Error> {
         // Guest keys prove this SSH exchange, not workload identity or
         // entitlement to a different upstream principal.
-        Ok(if self.pin.matches_user(user) {
-            Auth::Accept
-        } else {
-            Auth::reject()
-        })
+        Ok(
+            if !self.shared.termination.is_terminated() && self.authority.allows_user(user).await {
+                Auth::Accept
+            } else {
+                Auth::reject()
+            },
+        )
     }
 
     async fn auth_publickey(
@@ -441,28 +556,52 @@ where
     ) -> Result<Auth, Self::Error> {
         // Recheck the signed request independently of any earlier unsigned
         // offer, and before reusing or authenticating an upstream session.
-        if !self.pin.matches_user(user) {
+        if self.shared.termination.is_terminated() {
             return Ok(Auth::reject());
         }
-        if self.shared.upstream.get().is_some() {
+        let Some((key, pin)) = self.authority.select(user).await else {
+            return Ok(Auth::reject());
+        };
+        if self.shared.authenticated.get().is_some() {
             return Ok(Auth::Accept);
         }
-        let Some((upstream, key)) = self.pending_upstream.take() else {
+        let Some(upstream) = self.pending_upstream.take() else {
             return Ok(Auth::reject());
         };
         // russh calls this handler only after verifying the guest signature.
         // In particular, host-key rejection and unsigned key offers cannot
         // trigger an upstream connection or use the broker-owned credential.
-        let client = tokio::time::timeout(Duration::from_secs(UPSTREAM_AUTH_TIMEOUT_SECS), async {
+        let setup = async {
+            if self.shared.termination.is_terminated() {
+                return Err(BrokerError::Ssh("upstream authentication cancelled".into()));
+            }
             let stream = upstream.await?;
-            authenticate_upstream(stream, key, &self.pin).await
-        })
-        .await
-        .map_err(|_| BrokerError::Ssh("upstream authentication timed out".to_string()))??;
+            authenticate_upstream(stream, key, &pin, &self.shared).await
+        };
+        tokio::pin!(setup);
+        tokio::select! {
+            result = &mut setup => result?,
+            _ = self.shared.termination.terminated() => {
+                if tokio::time::timeout(Duration::from_secs(RETIREMENT_TIMEOUT_SECS), &mut setup).await.is_err() {
+                    self.shared.retirement_incomplete.store(true, Ordering::SeqCst);
+                }
+                return Err(BrokerError::Ssh("upstream authentication cancelled".into()));
+            }
+            _ = tokio::time::sleep(Duration::from_secs(UPSTREAM_AUTH_TIMEOUT_SECS)) => {
+                self.shared.termination.terminate();
+                if tokio::time::timeout(Duration::from_secs(RETIREMENT_TIMEOUT_SECS), &mut setup).await.is_err() {
+                    self.shared.retirement_incomplete.store(true, Ordering::SeqCst);
+                }
+                return Err(BrokerError::Ssh("upstream authentication timed out".into()));
+            }
+        }
+        if self.shared.termination.is_terminated() {
+            return Ok(Auth::reject());
+        }
         self.shared
-            .upstream
-            .set(client)
-            .map_err(|_| BrokerError::Ssh("upstream session already initialized".to_string()))?;
+            .authenticated
+            .set(())
+            .map_err(|_| BrokerError::Ssh("upstream session already initialized".into()))?;
         Ok(Auth::Accept)
     }
 
@@ -473,7 +612,14 @@ where
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         let guest_id = channel.id();
-        let Some(client) = self.shared.upstream.get() else {
+        if !self.shared.channel_capacity().await {
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        }
+        let client = self.shared.upstream.lock().await;
+        let Some(client) = client.as_ref() else {
             reply
                 .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
                 .await;
@@ -819,62 +965,146 @@ where
     F: Future<Output = BrokerResult<U>> + Send + 'static,
     U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let outcome = reoriginate_owned(
+        guest,
+        upstream,
+        key,
+        pin,
+        RelayOptions {
+            server_config,
+            identity: AuditIdentity::Legacy(identity),
+            library,
+            termination: TerminationHandle::new(),
+        },
+    )
+    .await;
+    outcome.result?;
+    if !outcome.retired {
+        return Err(BrokerError::Ssh("SSH relay retirement incomplete".into()));
+    }
+    Ok(())
+}
+
+/// Explicit runtime inputs for one owned SSH relay.
+pub(crate) struct RelayOptions {
+    pub(crate) server_config: Arc<russh::server::Config>,
+    pub(crate) identity: AuditIdentity,
+    pub(crate) library: Arc<PatternLibrary>,
+    pub(crate) termination: TerminationHandle,
+}
+
+/// Protocol result and independently observed native task retirement.
+pub(crate) struct RelayCompletion {
+    pub(crate) result: BrokerResult<()>,
+    pub(crate) retired: bool,
+}
+
+/// Never replace observed native-task completion with a cancellation flag.
+pub(crate) async fn reoriginate_owned<G, F, U>(
+    guest: G,
+    upstream: F,
+    key: &BrokerKey,
+    pin: &UpstreamPin,
+    options: RelayOptions,
+) -> RelayCompletion
+where
+    G: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    F: Future<Output = BrokerResult<U>> + Send + 'static,
+    U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    reoriginate_authorized(
+        guest,
+        upstream,
+        GuestAuthority::Legacy {
+            key: Arc::new(key.private_key().clone()),
+            pin: pin.clone(),
+        },
+        options,
+    )
+    .await
+}
+
+/// Share the existing SSH/channel implementation with managed admission.
+pub(crate) async fn reoriginate_authorized<G, F, U>(
+    guest: G,
+    upstream: F,
+    authority: GuestAuthority,
+    options: RelayOptions,
+) -> RelayCompletion
+where
+    G: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    F: Future<Output = BrokerResult<U>> + Send + 'static,
+    U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let RelayOptions {
+        server_config,
+        identity,
+        library,
+        termination,
+    } = options;
+    let managed_channel_limit =
+        matches!(&authority, GuestAuthority::Managed { .. }).then_some(MANAGED_CHANNEL_LIMIT);
     let shared = Arc::new(RelayShared {
-        upstream: OnceCell::new(),
+        upstream: Mutex::new(None),
+        authenticated: OnceCell::new(),
+        retirement_incomplete: AtomicBool::new(false),
         channels: Mutex::new(HashMap::new()),
         tasks: Mutex::new(Vec::new()),
+        managed_channel_limit,
         identity,
         scan_request: Mutex::new(ScanState::new(&library)),
         scan_response: Mutex::new(ScanState::new(&library)),
         library,
-        termination: TerminationHandle::new(),
+        termination: termination.clone(),
         request_hits: AtomicU64::new(0),
         response_hits: AtomicU64::new(0),
     });
-    let session = russh::server::run_stream(
+    // run_stream spawns only after reading the guest identification and has no
+    // await after spawn. A failed/timed-out identification owns no hidden task.
+    let setup = russh::server::run_stream(
         server_config,
-        guest,
+        CancellableIo::new(guest, termination.clone()),
         GuestServer {
             shared: Arc::clone(&shared),
-            pending_upstream: Some((upstream, Arc::new(key.private_key().clone()))),
-            pin: pin.clone(),
+            pending_upstream: Some(upstream),
+            authority,
         },
-    )
-    .await
-    .map_err(|e| BrokerError::Ssh(format!("guest handshake: {e}")))?;
+    );
+    let mut session =
+        match tokio::time::timeout(Duration::from_secs(UPSTREAM_AUTH_TIMEOUT_SECS), setup).await {
+            Ok(Ok(session)) => session,
+            result => {
+                let message = match result {
+                    Ok(Err(error)) => format!("guest handshake: {error}"),
+                    _ => "guest identification timed out".to_string(),
+                };
+                return RelayCompletion {
+                    result: Err(BrokerError::Ssh(message)),
+                    retired: true,
+                };
+            }
+        };
 
     // The guest session and per-session termination race: whichever wins
     // tears down this session's relay tasks and upstream leg. Other
     // sessions and the global vsock accept loop are unaffected.
-    let guest_handle = session.handle();
-    let termination = shared.termination.clone();
-    tokio::select! {
-        result = session => {
-            for task in shared.tasks.lock().await.drain(..) {
-                task.abort();
-            }
-            shared.disconnect_upstream().await;
-            result.map_err(|e| BrokerError::Ssh(format!("guest session failed: {e}")))?;
-        }
+    let (result, guest_joined) = tokio::select! {
+        result = &mut session => (result.map_err(|e| BrokerError::Ssh(format!("guest session failed: {e}"))), true),
         _ = termination.terminated() => {
-            eprintln!(
-                "brokerd: dlp terminated session (cid {} epoch {})",
-                shared.identity.cid, shared.identity.epoch
-            );
-            for task in shared.tasks.lock().await.drain(..) {
-                task.abort();
-            }
-            let _ = guest_handle
-                .disconnect(
-                    russh::Disconnect::ByApplication,
-                    "dlp terminate".to_string(),
-                    String::new(),
-                )
-                .await;
-            shared.disconnect_upstream().await;
+            let joined = tokio::time::timeout(Duration::from_secs(RETIREMENT_TIMEOUT_SECS), &mut session).await.is_ok();
+            (Err(BrokerError::Ssh("SSH relay cancelled".into())), joined)
         }
+    };
+    termination.terminate();
+    let pumps_joined = shared.join_pumps().await;
+    let upstream_joined = shared.join_upstream().await;
+    RelayCompletion {
+        result,
+        retired: guest_joined
+            && pumps_joined
+            && upstream_joined
+            && !shared.retirement_incomplete.load(Ordering::SeqCst),
     }
-    Ok(())
 }
 
 /// Establish the independent upstream SSH session after guest proof succeeds.
@@ -882,20 +1112,28 @@ async fn authenticate_upstream<U>(
     upstream: U,
     key: Arc<PrivateKey>,
     pin: &UpstreamPin,
-) -> BrokerResult<russh::client::Handle<UpstreamVerifier>>
+    shared: &RelayShared,
+) -> BrokerResult<()>
 where
     U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let verifier = UpstreamVerifier {
         expected: pin.expected.clone(),
     };
-    let mut client = russh::client::connect_stream(
+    let client = russh::client::connect_stream(
         Arc::new(russh::client::Config::default()),
-        upstream,
+        CancellableIo::new(upstream, shared.termination.clone()),
         verifier,
     )
     .await
     .map_err(|e| BrokerError::Ssh(format!("upstream handshake: {e}")))?;
+    // Publish the native task owner before any subsequent fallible auth step.
+    // Even auth refusal/error must join this handle during relay cleanup.
+    let mut owner = shared.upstream.lock().await;
+    *owner = Some(client);
+    let client = owner
+        .as_mut()
+        .expect("native upstream handle was just installed");
     let hash = client
         .best_supported_rsa_hash()
         .await
@@ -906,14 +1144,11 @@ where
         .await
         .map_err(|e| BrokerError::Ssh(format!("upstream public-key authentication: {e}")))?;
     if !auth.success() {
-        let _ = client
-            .disconnect(russh::Disconnect::ByApplication, "", "")
-            .await;
         return Err(BrokerError::Ssh(
             "upstream public-key authentication failed".to_string(),
         ));
     }
-    Ok(client)
+    Ok(())
 }
 
 /// Build the guest-facing SSH server configuration.
@@ -1314,5 +1549,63 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), handle.terminated())
             .await
             .expect("late termination wait must resolve immediately");
+    }
+
+    #[tokio::test]
+    async fn termination_wakes_every_registered_waiter_and_racing_first_poll() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+        for _ in 0..64 {
+            let handle = TerminationHandle::new();
+            let mut first = Box::pin(handle.terminated());
+            let mut second = Box::pin(handle.terminated());
+            poll_fn(|cx| {
+                assert!(first.as_mut().poll(cx).is_pending());
+                assert!(second.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            handle.terminate();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::join!(first, second);
+            })
+            .await
+            .unwrap();
+            // Cancellation before registration must resolve on its first poll.
+            let mut late = Box::pin(handle.terminated());
+            poll_fn(|cx| {
+                assert!(late.as_mut().poll(cx).is_ready());
+                Poll::Ready(())
+            })
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn termination_between_registration_and_flag_check_cannot_be_lost() {
+        let handle = TerminationHandle::new();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            handle.terminated_registered(|| handle.terminate()),
+        )
+        .await
+        .expect("notification in the former check/register window must complete");
+
+        // Model the old ordering with an actual Notify: its prior false flag
+        // observation followed by notify_waiters loses the notification when
+        // the waiter has not yet registered. This negative fixes the schedule.
+        let old = TerminationHandle::new();
+        let stale_flag = old.is_terminated();
+        old.terminate();
+        let old_order = async {
+            if !stale_flag {
+                old.notify.notified().await;
+            }
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), old_order)
+                .await
+                .is_err()
+        );
     }
 }

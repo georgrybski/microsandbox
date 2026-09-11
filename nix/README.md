@@ -22,7 +22,8 @@ fixed-output hashes in the package definitions:
 | Input | Derivation | Pin |
 |-------|------------|-----|
 | `agentd` | `nix/packages/agentd.nix` — musl static via `pkgsStatic`, built from the filtered Rust workspace source | flake rev |
-| Cargo dependencies | `nix/cargo-lock.nix` — shared by both packages and Cargo checks; fixed-output hashes cover the locked libkrun and rust-vmm checkouts, including their pinned submodules | `Cargo.lock` and `outputHashes` |
+| `brokerd` | `nix/packages/brokerd.nix` — ordinary service binary using the same Fenix Rust toolchain as the host CLI; its Nix runtime closure belongs in the guest image | flake rev |
+| Cargo dependencies | `nix/cargo-lock.nix` — shared by packages and Cargo checks; fixed-output hashes cover the locked libkrun and rust-vmm checkouts, including their pinned submodules | `Cargo.lock` and `outputHashes` |
 | `libkrunfw` | The fork's source-built `libkrunfw` flake input; its tooling, nixpkgs and flake-parts follow this flake's shared inputs | immutable revision in `flake.lock` |
 | toolchain | fenix `stable` via the shared nix-tooling pin (`flake.nix:9-18,75`) | `flake.lock` |
 
@@ -108,7 +109,7 @@ construction does not depend on host trust-store discovery.
 Build the public outputs without entering the development shell:
 
 ```sh
-nix build .#microsandbox .#agentd --no-link --no-write-lock-file
+nix build .#microsandbox .#agentd .#brokerd --no-link --no-write-lock-file
 nix build .#checks.x86_64-linux.package --no-link --no-write-lock-file
 nix build .#checks.x86_64-linux.fmt .#checks.x86_64-linux.deny --no-link --no-write-lock-file
 ```
@@ -116,10 +117,29 @@ nix build .#checks.x86_64-linux.fmt .#checks.x86_64-linux.deny --no-link --no-wr
 The guest package verifies that its installed ELF has neither an interpreter
 nor shared-library dependencies. The package check verifies the CLI version,
 the shipped guest daemon, and dynamic loading of the firmware's required kernel
-export. The public package names remain `agentd`,
+export. The public package names are `agentd`, `brokerd`,
 `microsandbox`, `msb`, and `default` (`msb` and `default` alias `microsandbox`).
 Consumers should obtain SDK paths from the same flake input that supplies
 these packages.
+
+`brokerd` is independently consumable: its package does not build or embed the
+host CLI, guest agent, or firmware. Include its complete Nix closure in the
+shared guest image; copying only the dynamically linked binary is insufficient.
+The service does not own the image's init system or Nix daemon. The package's
+install check executes only `brokerd service --help`, which returns before
+credentials, listeners or legacy init are touched. Broker policy
+uses its direct management transport, not the guest agent console. Packaging
+alone does not establish a running service, provision credentials, or validate
+the host-to-guest SSH route. Those require separate runtime acceptance.
+
+`checks.x86_64-linux.ssh-termination` supplies pinned OpenSSH, Git and Bash and
+explicitly runs legacy and managed SSH/Git tests, including the normally
+ignored stock-client fixtures. The managed fixture uses separate synthetic
+upstream keys for concurrent launches and checks that retiring one launch does
+not terminate the others. The Git fixture checks clone, fetch and push against
+two disposable repositories, exact object identities, and denied cross-repository
+operations without upstream effects. This check uses local transports, not a
+guest VM.
 
 Package and check versions are read from `[workspace.package]` in `Cargo.toml`.
 The host runtime and guest daemon must stay on that same release when upstream
