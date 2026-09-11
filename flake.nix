@@ -6,7 +6,7 @@
     # For local iteration, override tooling with a Git-filtered checkout:
     # `--override-input tooling git+file:///absolute/path/to/nix-tooling`.
     # Keep its owned pins intact; consumers follow the shared input graph.
-    tooling.url = "github:rybskiworks/nix-tooling/eae927a0da5fd04d2dfd2e7876042c6243adba65";
+    tooling.url = "github:rybskiworks/nix-tooling/1120aa22cddf4a9a3424f38aadbebadd8a963c4b";
 
     # ONE pin universe: every shared input follows tooling. Do NOT declare
     # own revs for any of these — bumps happen in nix-tooling only.
@@ -18,7 +18,7 @@
     git-hooks.follows = "tooling/git-hooks";
 
     libkrunfw = {
-      url = "github:rybskiworks/libkrunfw/3017d504988971bd84dcc5935c96aa4a81227d1e";
+      url = "github:rybskiworks/libkrunfw/d575b13e79368b23246be3d93d7935899dec5a3b";
       inputs.tooling.follows = "tooling";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.flake-parts.follows = "flake-parts";
@@ -67,7 +67,7 @@
       systems = [ "x86_64-linux" ];
 
       perSystem =
-        { system, ... }:
+        { config, system, ... }:
         let
           pkgs = import inputs.nixpkgs {
             inherit system;
@@ -137,15 +137,24 @@
             inherit src cargoLock version;
           };
           runtimeSmokeImage = pkgs.callPackage ./nix/packages/runtime-smoke-image.nix { inherit vsockProbe; };
-          msb = pkgs.callPackage ./nix/packages/microsandbox.nix {
+          cli = pkgs.callPackage ./nix/packages/cli.nix {
             inherit
               src
               rustToolchain
               agentd
               cargoLock
               version
-              libkrunfw
               ;
+          };
+          msb = pkgs.callPackage ./nix/packages/microsandbox.nix {
+            inherit cli agentd libkrunfw;
+          };
+          handoffSource = pkgs.lib.fileset.toSource {
+            root = ./scripts/smoke/cli;
+            fileset = pkgs.lib.fileset.unions [
+              ./scripts/smoke/cli/runtime-handoff.py
+              ./scripts/smoke/cli/test_runtime_handoff.py
+            ];
           };
 
           # Toolchain with the musl std for the agentd musl clippy gate
@@ -185,6 +194,7 @@
           packages = {
             inherit agentd brokerd msb;
             runtime-smoke-image = runtimeSmokeImage;
+            runtime-handoff-image = inputs.tooling.packages.${system}.guest-determinate-base;
             # workestrate consumes `packages.${system}.microsandbox`.
             microsandbox = msb;
             default = msb;
@@ -207,7 +217,48 @@
             }/bin/msb-test-runtime";
           };
 
+          apps.test-runtime-handoff = {
+            type = "app";
+            program = "${
+              pkgs.writeShellApplication {
+                name = "msb-test-runtime-handoff";
+                runtimeInputs = [ pkgs.python3 ];
+                text = ''
+                  exec python3 -I -B ${handoffSource}/runtime-handoff.py "$@" \
+                    --support ${inputs.tooling}/tests/nixos-image \
+                    --spec ${inputs.tooling.legacyPackages.${system}.nixosImages.smokeSpec} \
+                    --msb ${msb}/bin/msb --expected-version ${version} \
+                    --runtime-revision ${
+                      inputs.self.rev or (throw "test-runtime-handoff requires a committed Git flake")
+                    }
+                '';
+              }
+            }/bin/msb-test-runtime-handoff";
+          };
+
           checks = {
+            runtime-handoff-contract =
+              pkgs.runCommand "microsandbox-runtime-handoff-contract"
+                {
+                  nativeBuildInputs = [ pkgs.python3 ];
+                  MSB_HANDOFF_SUPPORT = "${inputs.tooling}/tests/nixos-image";
+                }
+                ''
+                  python3 -I -B ${handoffSource}/test_runtime_handoff.py -v
+                  mkdir -p "$out"
+                  touch "$out/ok"
+                '';
+
+            runtime-shutdown = config.checks.unit.overrideAttrs {
+              pname = "microsandbox-runtime-shutdown-tests";
+              buildPhase = ''
+                runHook preBuild
+                cargo test --jobs "$NIX_BUILD_CORES" --locked --offline \
+                  -p microsandbox-runtime --lib guest_shutdown_flush_timeout -- --test-threads=1
+                runHook postBuild
+              '';
+            };
+
             # Protocol-level custody acceptance uses real OpenSSH, synthetic
             # keys and loopback only; it does not depend on KVM or guest images.
             ssh-termination = rustPlatform.buildRustPackage {
@@ -246,6 +297,9 @@
                 '';
 
             package =
+              assert pkgs.lib.assertMsg (
+                toString msb.src == toString cli.src && toString msb.src == toString src
+              ) "runtime must preserve the canonical filtered SDK source";
               pkgs.runCommand "microsandbox-package-check"
                 {
                   nativeBuildInputs = [ pkgs.python3 ];
@@ -253,13 +307,30 @@
                 ''
                   export MSB_HOME="$TMPDIR/.microsandbox"
                   ${msb}/bin/msb --version | grep -Fx 'msb ${msb.version}'
+                  test ! -L ${msb}/bin/msb
+                  cmp ${msb}/bin/msb ${cli}/bin/msb
                   cmp ${msb}/libexec/agentd ${agentd}/libexec/agentd
                   test -e ${msb}/lib/libkrunfw.so
+                  cmp ${msb}/lib/libkrunfw.so.5.6.1 ${libkrunfw}/lib/libkrunfw.so.5.6.1
+                  for name in kernel.config kernel.release kernel-source.sha256 kernel-patches.sha256; do
+                    cmp ${msb}/share/libkrunfw/$name ${libkrunfw}/share/libkrunfw/$name
+                  done
+                  grep -Fx 'CONFIG_POWER_RESET_LIBKRUN=y' ${msb}/share/libkrunfw/kernel.config
                   python - <<'PY'
                   import ctypes
 
                   firmware = ctypes.CDLL("${msb}/lib/libkrunfw.so.5.6.1")
-                  getattr(firmware, "krunfw_get_kernel")
+                  version = firmware.krunfw_get_version
+                  version.argtypes = []
+                  version.restype = ctypes.c_uint32
+                  assert version() == 5
+                  kernel = firmware.krunfw_get_kernel
+                  kernel.argtypes = [ctypes.POINTER(ctypes.c_size_t)] * 3
+                  kernel.restype = ctypes.c_void_p
+                  load, entry, size = ctypes.c_size_t(), ctypes.c_size_t(), ctypes.c_size_t()
+                  address = kernel(ctypes.byref(load), ctypes.byref(entry), ctypes.byref(size))
+                  assert address and address % 65536 == 0
+                  assert load.value and entry.value and size.value and size.value % 65536 == 0
                   PY
                   mkdir -p $out
                 '';

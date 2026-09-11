@@ -27,11 +27,35 @@ fixed-output hashes in the package definitions:
 | `libkrunfw` | The fork's source-built `libkrunfw` flake input; its tooling, nixpkgs and flake-parts follow this flake's shared inputs | immutable revision in `flake.lock` |
 | toolchain | fenix `stable` via the shared nix-tooling pin (`flake.nix:9-18,75`) | `flake.lock` |
 
-The runtime package links its firmware filenames to the source-built output,
-keeping the kernel in one store path. `packages.x86_64-linux.microsandbox.libkrunfw`
-exposes that exact firmware derivation to consumers. There is no release-archive
-fallback. Package checks verify the firmware's exported kernel entry point;
-boot, restart and shutdown require separate runtime tests on a KVM-capable host.
+`nix/packages/cli.nix` compiles the CLI with the matching static agent embedded,
+without a firmware dependency. `nix/packages/microsandbox.nix` assembles that
+CLI, the same guest agent and the pinned firmware into the existing runtime
+layout. A firmware-only change therefore does not enter the CLI derivation's
+inputs. No upstream prebuilt runtime or release firmware archive is selected.
+The runtime's existing `src` attribute remains the same filtered workspace as
+the CLI source, so consumers can build the matching SDK without a separate tree.
+This is a dependency boundary, not a measured cache-hit guarantee on a cold
+builder.
+
+The assembled `bin/msb` is a regular copy of the source-built CLI, not a
+symlink to its CLI-only output. The CLI derives `MSB_PATH` from its actual
+executable and resolves firmware from the sibling `lib/` directory; the full
+runtime must remain the executable's prefix. Cargo's non-prebuilt build keeps
+the source-matched guest agent embedded. Its RPATH contains only the pinned
+host dynamic libraries, not either package's own output path.
+
+The runtime copies the pinned firmware and its configuration, release, source
+and patch hashes into `lib/` and `share/libkrunfw`. Its `libkrunfw` attribute
+still exposes the exact source-built derivation to consumers. The pinned
+Linux 6.12.109 kernel includes the opt-in libkrun platform power-off handler,
+which uses the existing emulated-device exit contract after normal kernel
+shutdown, not a guest reboot. Package checks verify matching bytes, ABI 5 and
+installed configuration, but do not establish completed guest shutdown.
+Runtime validation must observe guest flush and normal VMM exit before host
+fallback. Existing running VMs retain their loaded kernel; this package does
+not live-replace firmware, migrate state or restart them. Fresh Linux x86_64
+guests are the validation target; old-state or snapshot resume, downgrade,
+other platforms and nested guests require separate coverage.
 
 Cargo applies `[patch.crates-io]` only from the consuming workspace root. This
 workspace therefore pins `msb-vm-memory` to the same rust-vmm revision as
@@ -164,6 +188,34 @@ the runtime's strict behavior or automatically disabling the syscall filter
 is not part of the package build.
 
 ### Runtime acceptance on Linux
+
+The typed systemd handoff has a separate regression gate:
+
+```sh
+nix build .#checks.x86_64-linux.runtime-shutdown .#checks.x86_64-linux.runtime-handoff-contract --no-link
+nix build .#runtime-handoff-image --no-link
+nix run .#test-runtime-handoff -- --execute
+```
+
+`test-runtime-handoff` requires a committed Git flake and an already realized
+shared NixOS image. It uses the pinned nix-tooling image specification, command
+runner and retained-child supervisor without changing the common fixture. It
+boots one fresh network-disabled guest with typed `/init`, waits for the actual
+systemd/store-ready target, and arms a transient service whose stop action sleeps
+three seconds before syncing its marker and writing it to the guest console.
+Success requires that marker, the original VMM's normal exit status, a shutdown
+elapsed time of at least three and less than eight seconds, and no host fallback
+or forced child termination. An ordinary fast shutdown cannot satisfy this gate.
+
+The test admits 22 GiB free host disk and 8 GiB available memory, retains a 17 GiB
+disk/8 GiB memory floor, and bounds owned scratch and global disk growth to 4 GiB
+each. Preparation is charged to the 300-second work budget; normal cleanup has
+at most 90 additional seconds and a result past 390 seconds fails. A supervising
+caller should use an outer 405-second deadline with a final five-second kill
+grace. Import tar, logs and JSON receipt remain in the printed disposable root;
+only that root's sandbox is stopped and removed. This gate does not certify the
+full Nix daemon trust suite, workload readiness policy, SSH custody, old state or
+saved-memory restore. The portable contract check does not launch a VM.
 
 `nix run .#test-runtime` requires readable/writable `/dev/kvm` and a host
 filesystem supporting the runtime's extended attributes. Unlike pure package
