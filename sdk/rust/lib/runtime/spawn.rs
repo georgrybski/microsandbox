@@ -57,7 +57,9 @@ use windows_sys::Win32::System::Threading::{
 use microsandbox_image::{Digest, GlobalCache};
 use microsandbox_metrics::{MetricsRegistry, ReserveSlot, SlotReservation};
 #[cfg(feature = "net")]
-use microsandbox_network::{ResolvedNetworkConfig, config::EnvNetworkSecretResolver};
+use microsandbox_network::{
+    ResolvedNetworkConfig, config::EnvNetworkSecretResolver, ssh::SshBrokerBinding,
+};
 use microsandbox_protocol::{
     bootstrap::{
         BootstrapBlockRoot, BootstrapBlockRootUpper, BootstrapDirMount, BootstrapDiskMount,
@@ -279,6 +281,17 @@ pub async fn spawn_sandbox(
     mode: SpawnMode,
     lifecycle_guard: Option<microsandbox_runtime::ipc::SandboxLifecycleGuard>,
 ) -> MicrosandboxResult<(ProcessHandle, PathBuf)> {
+    microsandbox_runtime::launch::validate_host_vsock_listeners(
+        &config.host_vsock_listeners,
+        &config.spec.vsock.routes,
+    )
+    .map_err(MicrosandboxError::InvalidConfig)?;
+    #[cfg(feature = "net")]
+    if config.ssh_broker_endpoint.is_some() && config.guest_cid.is_none() {
+        return Err(MicrosandboxError::InvalidConfig(
+            "SSH custody requires a host-reserved guest CID".into(),
+        ));
+    }
     // Durable configuration stores only host-side source references. Resolve
     // them into the private runtime configuration before the sandbox process
     // is spawned.
@@ -2198,6 +2211,7 @@ fn push_dir_mount_arg(
     host_permissions: HostPermissions,
     follow_root_symlinks: bool,
     quota_mib: Option<u32>,
+    mount_policy: Option<&Path>,
 ) {
     let tag = guest_mount_tag(guest);
     let mut arg = format!("{tag}:{host_display}");
@@ -2212,6 +2226,9 @@ fn push_dir_mount_arg(
     );
     if let Some(mib) = quota_mib {
         opts.push(format!("quota={mib}"));
+    }
+    if let Some(path) = mount_policy {
+        opts.push(format!("policy={}", path.display()));
     }
     append_option_block(&mut arg, opts);
     mounts.push(arg);
@@ -2228,6 +2245,7 @@ fn push_file_mount_arg(
     stat_virtualization: StatVirtualization,
     host_permissions: HostPermissions,
     quota_mib: u32,
+    mount_policy: Option<&Path>,
 ) {
     let mut arg = format!("{tag}:{}", host_file.display());
     let mut opts = mount_option_tokens(options);
@@ -2242,6 +2260,9 @@ fn push_file_mount_arg(
         options.override_gid,
     );
     opts.push(format!("quota={quota_mib}"));
+    if let Some(path) = mount_policy {
+        opts.push(format!("policy={}", path.display()));
+    }
     append_option_block(&mut arg, opts);
     mounts.push(FileMountConfig {
         mount: arg,
@@ -2380,7 +2401,7 @@ fn sandbox_cli_args(
     config: &SandboxConfig,
     sandbox_id: i32,
     #[cfg(feature = "net")] network_slot: NetworkSlot,
-    #[cfg(feature = "net")] resolved_network: ResolvedNetworkConfig,
+    #[cfg(feature = "net")] mut resolved_network: ResolvedNetworkConfig,
     db_path: &Path,
     db_connect_timeout_secs: u64,
     log_dir: &Path,
@@ -2435,11 +2456,29 @@ fn sandbox_cli_args(
         ));
     }
 
+    if config.guest_cid.is_some() {
+        visible.push(OsString::from("--require-launch-capability"));
+        visible.push(OsString::from(
+            microsandbox_runtime::launch::GUEST_CID_CAPABILITY,
+        ));
+    }
+
+    if !config.host_vsock_listeners.is_empty() {
+        visible.push(OsString::from("--require-launch-capability"));
+        visible.push(OsString::from(
+            microsandbox_runtime::launch::HOST_VSOCK_LISTEN_CAPABILITY,
+        ));
+    }
+
     let mut launch = LaunchConfig {
         db_path: db_path.to_path_buf(),
         db_connect_timeout_secs,
         log_dir: log_dir.to_path_buf(),
         runtime_dir: runtime_dir.to_path_buf(),
+        mount_policy_dir: local
+            .config()
+            .home()
+            .join(microsandbox_utils::MOUNT_POLICY_DIR_NAME),
         sandboxes_dir: local.sandboxes_dir(),
         run_dir: local.config().run_dir(),
         cpu_lease_dir: local.config().run_dir().join("cpu-leases"),
@@ -2456,12 +2495,15 @@ fn sandbox_cli_args(
         agent_sock: agent_sock_path.to_path_buf(),
         libkrunfw_path: libkrunfw_path.to_path_buf(),
         thp: config.spec.resources.thp,
+        nested_virt: config.spec.resources.nested_virt,
         startup: startup_command(config),
         lifecycle: Lifecycle {
             max_duration_secs: config.spec.lifecycle.max_duration_secs,
             idle_timeout_secs: config.spec.lifecycle.idle_timeout_secs,
         },
         vsock: config.spec.vsock.routes.clone(),
+        guest_cid: config.guest_cid,
+        host_vsock_listeners: config.host_vsock_listeners.clone(),
         #[cfg(feature = "net")]
         deployment_profile: config.spec.deployment_profile,
         bootstrap: GuestBootstrap {
@@ -2508,6 +2550,9 @@ fn sandbox_cli_args(
                     })
                     .collect(),
             }),
+            broker_key: config.broker_key.clone(),
+            broker_upstream: config.broker_upstream.clone(),
+            broker_patterns: config.broker_patterns.clone(),
             ..GuestBootstrap::default()
         },
         ..Default::default()
@@ -2625,6 +2670,7 @@ fn sandbox_cli_args(
                 host_permissions,
                 follow_root_symlinks,
                 quota_mib,
+                mount_policy,
             } => {
                 if let Some((filename, tag)) = file_mounts.get(guest) {
                     // File binds receive the same default-on host disk
@@ -2639,6 +2685,7 @@ fn sandbox_cli_args(
                         *stat_virtualization,
                         *host_permissions,
                         quota,
+                        mount_policy.as_deref(),
                     );
                     launch.bootstrap.file_mounts.push(BootstrapFileMount {
                         tag: tag.clone(),
@@ -2659,6 +2706,7 @@ fn sandbox_cli_args(
                         *host_permissions,
                         *follow_root_symlinks,
                         Some(quota),
+                        mount_policy.as_deref(),
                     );
                     launch.bootstrap.dir_mounts.push(BootstrapDirMount {
                         tag: guest_mount_tag(guest),
@@ -2717,6 +2765,7 @@ fn sandbox_cli_args(
                             *host_permissions,
                             *follow_root_symlinks,
                             *quota_mib,
+                            None,
                         );
                         launch.bootstrap.dir_mounts.push(BootstrapDirMount {
                             tag: guest_mount_tag(guest),
@@ -2760,6 +2809,13 @@ fn sandbox_cli_args(
     // Network configuration travels as a typed value inside the JSON payload.
     #[cfg(feature = "net")]
     {
+        // Builder/spawn validation requires the supervisor's reservation.
+        // The runtime assigns this same CID to libkrun and checks the getter
+        // before guest execution; network slots only select IP/MAC addresses.
+        if let (Some(endpoint), Some(cid)) = (config.ssh_broker_endpoint.clone(), config.guest_cid)
+        {
+            resolved_network.set_ssh_broker(Some(SshBrokerBinding::new(endpoint, u64::from(cid))));
+        }
         launch.network = Some(resolved_network);
         launch.sandbox_slot = network_slot.get();
     }
@@ -2939,7 +2995,7 @@ mod tests {
     /// Return the typed launch payload generated for a sandbox configuration.
     fn render_launch(config: &SandboxConfig) -> LaunchConfig {
         let local = test_local_backend();
-        let (_, launch) = sandbox_cli_args(
+        let (visible, launch) = sandbox_cli_args(
             &local,
             config,
             42,
@@ -2960,6 +3016,12 @@ mod tests {
             None,
             None,
         );
+        let required: Vec<String> = visible
+            .windows(2)
+            .filter(|pair| pair[0] == "--require-launch-capability")
+            .map(|pair| pair[1].to_str().unwrap().to_string())
+            .collect();
+        launch.validate_capabilities(&required).unwrap();
         launch
     }
 
@@ -3289,6 +3351,171 @@ mod tests {
             .unwrap();
 
         assert_eq!(render_launch(&config).sandbox_slot, 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sandbox_cli_args_carry_host_listener_with_must_understand_flag() {
+        let config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .vsock_host_listen("/run/launch/service.sock", 5000)
+            .build()
+            .await
+            .unwrap();
+        // render_launch independently validates every capability found on argv.
+        let launch = render_launch(&config);
+        assert!(launch.vsock.is_empty());
+        assert_eq!(launch.host_vsock_listeners.len(), 1);
+        assert_eq!(launch.host_vsock_listeners[0].guest_port, 5000);
+        assert_eq!(
+            launch.host_vsock_listeners[0].host_socket,
+            Path::new("/run/launch/service.sock")
+        );
+        assert!(launch.validate_capabilities(&[]).is_err());
+    }
+
+    /// Builder broker input reaches the launch payload as a binding keyed
+    /// by the actual reserved CID, while the guest-visible spec stays clean.
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn sandbox_cli_args_threads_ssh_broker_binding() {
+        let config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .guest_cid(65_536)
+            .ssh_broker_endpoint("/run/msb/ssh-broker.sock")
+            .build()
+            .await
+            .unwrap();
+
+        let launch = render_launch(&config);
+        let network = launch.network.as_ref().expect("network launch config");
+        let binding = network.ssh_broker().expect("broker binding threaded");
+        assert_eq!(binding.transport_cid, 65_536);
+        assert_eq!(launch.guest_cid, Some(65_536));
+        assert_eq!(
+            binding.endpoint.path(),
+            Path::new("/run/msb/ssh-broker.sock")
+        );
+        assert_eq!(launch.sandbox_slot, test_network_slot().get());
+
+        let spec_json = serde_json::to_value(&config.spec).unwrap().to_string();
+        assert!(
+            !spec_json.contains("ssh-broker.sock"),
+            "guest-visible spec must not name the host broker socket"
+        );
+    }
+
+    /// Without builder input the launch payload carries no binding and
+    /// the gateway keeps denying divert-intended flows fail-closed.
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn sandbox_cli_args_omits_ssh_broker_binding_by_default() {
+        let config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .build()
+            .await
+            .unwrap();
+
+        let launch = render_launch(&config);
+        assert!(
+            launch
+                .network
+                .as_ref()
+                .expect("network launch config")
+                .ssh_broker()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_cli_args_threads_broker_bootstrap_fields() {
+        use microsandbox_protocol::bootstrap::{
+            BROKER_KEY_TYPE_ED25519, BrokerPattern, BrokerPatterns, BrokerSshKey, BrokerUpstream,
+            BrokerUpstreamHost,
+        };
+        use microsandbox_scan::{ActionSet, Decoder};
+
+        let config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .broker_key(BrokerSshKey {
+                key_type: BROKER_KEY_TYPE_ED25519.to_string(),
+                key_bytes: vec![0x42; 32],
+            })
+            .broker_upstream(BrokerUpstream {
+                hosts: vec![BrokerUpstreamHost {
+                    host: "example.com".to_string(),
+                    port: 22,
+                    user: "deploy".to_string(),
+                    public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBrokerTestPin".to_string(),
+                }],
+            })
+            .broker_patterns(BrokerPatterns {
+                patterns: vec![BrokerPattern {
+                    credential_id: "api-key".to_string(),
+                    decoder: Decoder::Raw,
+                    bytes: b"test-only-pattern-bytes".to_vec(),
+                    action: ActionSet::passthrough(),
+                }],
+            })
+            .build()
+            .await
+            .unwrap();
+
+        let launch = render_launch(&config);
+        let key = launch
+            .bootstrap
+            .broker_key
+            .as_ref()
+            .expect("broker key threaded");
+        assert_eq!(key.key_type, BROKER_KEY_TYPE_ED25519);
+        assert_eq!(key.key_bytes, vec![0x42; 32]);
+        let upstream = launch
+            .bootstrap
+            .broker_upstream
+            .as_ref()
+            .expect("broker upstream threaded");
+        assert_eq!(upstream.hosts.len(), 1);
+        assert_eq!(upstream.hosts[0].host, "example.com");
+        let patterns = launch
+            .bootstrap
+            .broker_patterns
+            .as_ref()
+            .expect("broker patterns threaded");
+        assert_eq!(patterns.patterns.len(), 1);
+        assert_eq!(patterns.patterns[0].credential_id, "api-key");
+    }
+
+    #[tokio::test]
+    async fn sandbox_cli_args_omits_broker_bootstrap_fields_by_default() {
+        let config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .build()
+            .await
+            .unwrap();
+
+        let launch = render_launch(&config);
+        assert!(launch.bootstrap.broker_key.is_none());
+        assert!(launch.bootstrap.broker_upstream.is_none());
+        assert!(launch.bootstrap.broker_patterns.is_none());
+    }
+
+    #[tokio::test]
+    async fn launch_config_carries_nested_virt_from_spec() {
+        let mut config = SandboxBuilder::new("test")
+            .image("/tmp/rootfs")
+            .build()
+            .await
+            .unwrap();
+
+        // Default off: the spec default reaches the launch payload as false.
+        assert!(!render_launch(&config).nested_virt);
+
+        // Opt-in carries through the launch payload.
+        config.spec.resources.nested_virt = true;
+        assert!(render_launch(&config).nested_virt);
+
+        config.spec.resources.nested_virt = false;
+        assert!(!render_launch(&config).nested_virt);
     }
 
     /// Render only the `visible` argv (what shows up in `ps`).

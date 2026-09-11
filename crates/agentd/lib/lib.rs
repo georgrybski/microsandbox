@@ -9,6 +9,8 @@
 mod config;
 mod error;
 mod rlimit;
+mod runtime_dir;
+mod shutdown;
 
 //--------------------------------------------------------------------------------------------------
 // Exports

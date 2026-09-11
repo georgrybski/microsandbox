@@ -9,7 +9,7 @@ use crate::error::ProtocolResult;
 //--------------------------------------------------------------------------------------------------
 
 /// Current protocol version.
-pub const PROTOCOL_VERSION: u8 = 7;
+pub const PROTOCOL_VERSION: u8 = 8;
 
 /// Frame flag: this is the last message for the given correlation ID.
 ///
@@ -226,6 +226,14 @@ pub enum MessageType {
     /// Host supplies one-shot guest bootstrap configuration.
     #[strum(serialize = "core.bootstrap")]
     Bootstrap,
+
+    /// Host provisions the current SSH epoch for a sandbox instance.
+    #[strum(serialize = "core.ssh_epoch.provision")]
+    SshEpochProvision,
+
+    /// Guest acknowledges an SSH epoch provision.
+    #[strum(serialize = "core.ssh_epoch.ack")]
+    SshEpochAck,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -301,7 +309,9 @@ impl MessageType {
     /// (generation 1), so the `Fs*` types require generation 2 or newer.
     /// TCP forwarding was introduced in generation 4. `core.error` was
     /// introduced in generation 5. Reachability checks and explicit idle
-    /// refreshes were introduced in generation 6.
+    /// refreshes were introduced in generation 6. One-shot guest bootstrap
+    /// was introduced in generation 7. SSH epoch provisioning was
+    /// introduced in generation 8.
     ///
     /// There is deliberately no wildcard arm: adding a new `MessageType` must
     /// force a conscious choice of the generation that introduced it (and a
@@ -329,6 +339,7 @@ impl MessageType {
             Self::CoreError => 5,
             Self::Ping | Self::Pong | Self::Touch | Self::Touched => 6,
             Self::Bootstrap => 7,
+            Self::SshEpochProvision | Self::SshEpochAck => 8,
             Self::TcpConnect
             | Self::TcpConnected
             | Self::TcpData
@@ -402,6 +413,8 @@ mod tests {
     fn test_message_type_roundtrip() {
         let types = [
             (MessageType::Bootstrap, "core.bootstrap"),
+            (MessageType::SshEpochProvision, "core.ssh_epoch.provision"),
+            (MessageType::SshEpochAck, "core.ssh_epoch.ack"),
             (MessageType::Ready, "core.ready"),
             (MessageType::InitResolved, "core.init.resolved"),
             (MessageType::InitAck, "core.init.ack"),
@@ -448,6 +461,8 @@ mod tests {
     fn test_message_type_serde_roundtrip() {
         let types = [
             MessageType::Bootstrap,
+            MessageType::SshEpochProvision,
+            MessageType::SshEpochAck,
             MessageType::Ready,
             MessageType::InitResolved,
             MessageType::InitAck,
@@ -523,6 +538,8 @@ mod tests {
         assert_eq!(MessageType::TcpConnect.flags(), FLAG_SESSION_START);
         assert_eq!(MessageType::Ready.flags(), 0);
         assert_eq!(MessageType::Bootstrap.flags(), 0);
+        assert_eq!(MessageType::SshEpochProvision.flags(), 0);
+        assert_eq!(MessageType::SshEpochAck.flags(), 0);
         assert_eq!(MessageType::InitResolved.flags(), 0);
         assert_eq!(MessageType::InitAck.flags(), 0);
         assert_eq!(MessageType::Shutdown.flags(), FLAG_SHUTDOWN);
@@ -594,6 +611,11 @@ mod tests {
         // Bootstrap is internal to generation-7 host/agent boot.
         assert!(!MessageType::Bootstrap.is_available_at(6));
         assert!(MessageType::Bootstrap.is_available_at(PROTOCOL_VERSION));
+        // SSH epoch provisioning requires generation 8.
+        assert!(!MessageType::SshEpochProvision.is_available_at(7));
+        assert!(!MessageType::SshEpochAck.is_available_at(7));
+        assert!(MessageType::SshEpochProvision.is_available_at(PROTOCOL_VERSION));
+        assert!(MessageType::SshEpochAck.is_available_at(PROTOCOL_VERSION));
     }
 
     #[test]
@@ -642,6 +664,10 @@ mod tests {
         }
 
         assert_eq!(MessageType::Bootstrap.min_protocol_version(), 7);
+
+        for mt in [MessageType::SshEpochProvision, MessageType::SshEpochAck] {
+            assert_eq!(mt.min_protocol_version(), 8, "{mt:?} should require gen 8");
+        }
 
         // Every current type must be sendable to a current peer.
         assert!(MessageType::FsRequest.min_protocol_version() <= PROTOCOL_VERSION);

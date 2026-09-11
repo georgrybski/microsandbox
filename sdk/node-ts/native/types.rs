@@ -249,11 +249,12 @@ pub struct SandboxMetrics {
 /// Execution event emitted by `ExecHandle.recv()`.
 #[napi(object)]
 pub struct ExecEvent {
-    /// "started", "stdout", "stderr", or "exited".
+    /// "started", "stdout", "stderr", "exited", "failed", "stdin_error", or "interrupted".
     pub event_type: String,
     /// Process ID (only for "started" events).
     pub pid: Option<u32>,
-    /// Output data (only for "stdout" and "stderr" events).
+    /// Output bytes, failure text, or tagged reason/termination JSON for
+    /// "interrupted". Interruption is terminal but not an exit status.
     pub data: Option<napi::bindgen_prelude::Buffer>,
     /// Exit code (only for "exited" events).
     pub code: Option<i32>,

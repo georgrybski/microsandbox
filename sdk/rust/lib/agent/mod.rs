@@ -8,6 +8,7 @@ mod bridge;
 
 use std::ops::Deref;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -19,7 +20,7 @@ use tokio::{
 //--------------------------------------------------------------------------------------------------
 
 /// Client for communicating with `agentd` through a running sandbox's relay.
-pub struct AgentClient(microsandbox_agent_client::AgentClient);
+pub struct AgentClient(Arc<microsandbox_agent_client::AgentClient>);
 
 //--------------------------------------------------------------------------------------------------
 // Functions
@@ -82,7 +83,7 @@ impl AgentClient {
     pub async fn connect(sock_path: impl AsRef<Path>) -> AgentClientResult<Self> {
         microsandbox_agent_client::AgentClient::connect(sock_path)
             .await
-            .map(Self)
+            .map(|client| Self(Arc::new(client)))
     }
 
     /// Connect over an arbitrary byte-stream transport with an explicit
@@ -99,7 +100,7 @@ impl AgentClient {
     {
         microsandbox_agent_client::AgentClient::connect_stream_with_timeout(stream, timeout)
             .await
-            .map(Self)
+            .map(|client| Self(Arc::new(client)))
     }
 
     /// Connect to an arbitrary agent relay socket path with an explicit
@@ -110,7 +111,7 @@ impl AgentClient {
     ) -> AgentClientResult<Self> {
         microsandbox_agent_client::AgentClient::connect_with_timeout(sock_path, timeout)
             .await
-            .map(Self)
+            .map(|client| Self(Arc::new(client)))
     }
 
     /// Connect to an arbitrary agent relay socket path with an explicit
@@ -121,7 +122,7 @@ impl AgentClient {
     ) -> AgentClientResult<Self> {
         microsandbox_agent_client::AgentClient::connect_with_deadline(sock_path, deadline)
             .await
-            .map(Self)
+            .map(|client| Self(Arc::new(client)))
     }
 
     /// Resolve a sandbox name to its agent socket path and connect.
@@ -161,7 +162,17 @@ impl AgentClient {
 
     /// Close the connection.
     pub async fn close(self) {
-        self.0.close().await;
+        self.0.disconnect().await;
+    }
+
+    /// Reserve a bounded session on this exact connection, without a request.
+    pub async fn owned_session(
+        &self,
+    ) -> AgentClientResult<(
+        microsandbox_agent_client::AgentSession,
+        microsandbox_agent_client::AgentSessionEvents,
+    )> {
+        self.0.owned_session().await
     }
 }
 

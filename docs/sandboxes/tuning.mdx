@@ -429,6 +429,10 @@ _, err = sb.Modify(ctx, m.ModifyOptions{
 
 Root disk resizing remains conservative: managed and flat OCI disks grow only, tmpfs can grow or shrink at the next boot, and user-supplied disk images are never resized by microsandbox. Named volume and mount capacity is managed where that storage is defined. See [Volumes](/sandboxes/volumes) and [Images](/images/overview) for the storage model.
 
+## Nested virtualization
+
+Nested virtualization is a creation-time option, outside `modify`. It defaults off: guests receive no nested CPU capability unless you opt in with `--nested-virt` (or `nested_virt` in the sandbox spec / Rust SDK builder). The option presents the host's nested CPU virtualization capability to the guest and is available on Linux x86_64 hosts only. CPU capability alone does not create guest `/dev/kvm`; that additionally requires KVM support in the bundled firmware (libkrunfw `CONFIG_KVM`).
+
 ## Reference
 
 For every CLI flag and result state, see [`msb modify`](/cli/sandbox-commands#msb-modify). The SDK sandbox references expose the same planner and policies for [TypeScript](/sdk/typescript/sandbox), [Rust](/sdk/rust/sandbox), [Python](/sdk/python/sandbox), and [Go](/sdk/go/sandbox).

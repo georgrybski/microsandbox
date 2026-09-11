@@ -11,8 +11,13 @@ mod file_ops;
 mod host_mode;
 pub(crate) mod inode;
 mod metadata;
+pub mod mount_policy;
+#[cfg(target_os = "linux")]
+mod read_policy;
 mod remove_ops;
 mod special;
+#[cfg(target_os = "linux")]
+pub(crate) mod tag_store;
 mod xattr_ops;
 
 use std::{
@@ -172,6 +177,11 @@ pub struct PassthroughConfig {
     /// many bytes is rejected with `ENOSPC`.
     pub quota_bytes: Option<u64>,
 
+    /// Optional compiled mount path-policy program enforced for this mount's
+    /// lifetime (spec 22). `None` means no masking: behavior is byte-identical
+    /// to the policy-absent path. Immutable after `PassthroughFs::new`.
+    pub mask_policy: Option<Arc<mount_policy::MountPolicyProgram>>,
+
     /// Optional quota accounting root when it differs from `root_dir`.
     ///
     /// Single-file mounts anchor pathname resolution at the parent directory,
@@ -224,6 +234,10 @@ pub struct PassthroughFs {
 
     /// Optional guest-write byte budget for this mount's subtree.
     pub(crate) quota: Option<super::quota::DirQuota>,
+
+    /// Alias-scoped pins for policy-created or policy-written masked entries.
+    #[cfg(target_os = "linux")]
+    pub(crate) tags: Option<tag_store::TagStore>,
 }
 
 /// Open directory handle with a lazy point-in-time snapshot.
@@ -337,6 +351,8 @@ impl PassthroughFs {
                 limit,
             )
         });
+        #[cfg(target_os = "linux")]
+        let tags = cfg.new_tag_store();
 
         Ok(Self {
             cfg,
@@ -353,6 +369,8 @@ impl PassthroughFs {
             #[cfg(target_os = "linux")]
             proc_self_fd,
             quota,
+            #[cfg(target_os = "linux")]
+            tags,
         })
     }
 }
@@ -470,6 +488,87 @@ impl PassthroughFs {
             quota.ensure_baseline();
         }
     }
+
+    /// Return the immutable compiled mount path-policy program, if configured.
+    pub(crate) fn mask_policy(&self) -> Option<&Arc<mount_policy::MountPolicyProgram>> {
+        self.cfg.mask_policy.as_ref()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn tags(&self) -> Option<&tag_store::TagStore> {
+        self.tags.as_ref()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn tagged_visible(&self, parent: u64, name: &[u8]) -> bool {
+        self.tags().is_some_and(|tags| tags.contains(parent, name))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn tagged_visible_for_inode(&self, inode: u64) -> bool {
+        inode::current_anchor_alias_for_policy(self, inode)
+            .is_some_and(|alias| self.tagged_visible(alias.parent, &alias.name))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn tag_inode(&self, inode: u64) {
+        let Some(tags) = self.tags() else { return };
+        let Some(alias) = inode::current_anchor_alias_for_policy(self, inode) else {
+            return;
+        };
+        // O_NOFOLLOW is intentionally omitted: open_inode_fd reopens via
+        // /proc/self/fd/N (which would ELOOP with O_NOFOLLOW) and rejects real
+        // host symlinks itself via fstat. See inode::open_inode_fd.
+        let Ok(fd) = inode::open_inode_fd(self, inode, libc::O_PATH) else {
+            return;
+        };
+        let Ok(key) = inode::linux_alt_key_from_fd(fd) else {
+            // SAFETY: `fd` is a valid O_PATH fd from open_inode_fd whose identity
+            // could not be resolved, so tagging is skipped. It is not owned by any
+            // Rust object and is not used again after close (no double-close).
+            unsafe { libc::close(fd) };
+            return;
+        };
+        let _ = tags.tag(alias.parent, &alias.name, fd, key);
+        // SAFETY: `fd` is a valid O_PATH fd from open_inode_fd. tags.tag()
+        // duplicates it via F_DUPFD_CLOEXEC (owning the duplicate), so the
+        // original `fd` is no longer needed and is closed here. It is not used
+        // again after close (no double-close).
+        unsafe { libc::close(fd) };
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn tag_child(&self, parent: u64, name: &[u8]) {
+        let Some(tags) = self.tags() else { return };
+        let Ok(parent_fd) = inode::get_inode_fd(self, parent) else {
+            return;
+        };
+        let Ok(name) = std::ffi::CString::new(name) else {
+            return;
+        };
+        // SAFETY: `parent_fd.raw()` is a valid open directory fd for the parent
+        // inode, and `name` is a valid CString built from a validated guest
+        // name. O_NOFOLLOW rejects symlinks so the child entry itself is pinned
+        // rather than its target. The returned fd is checked (< 0) before use.
+        let fd = unsafe {
+            libc::openat(
+                parent_fd.raw(),
+                name.as_ptr(),
+                libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return;
+        }
+        if let Ok(key) = inode::linux_alt_key_from_fd(fd) {
+            let _ = tags.tag(parent, name.as_bytes(), fd, key);
+        }
+        // SAFETY: `fd` is a valid O_PATH fd from the openat above. tags.tag()
+        // (when the key resolved) duplicates it, so the original is closed
+        // here; on key-resolution failure the fd is also closed. It is not used
+        // again after close (no double-close).
+        unsafe { libc::close(fd) };
+    }
 }
 
 impl PassthroughConfig {
@@ -479,6 +578,14 @@ impl PassthroughConfig {
     /// False for [`StatVirtualization::Off`].
     pub(crate) fn xattr_enabled(&self) -> bool {
         !matches!(self.stat_virtualization, StatVirtualization::Off)
+    }
+
+    /// Build a [`tag_store::TagStore`] when a mask policy is configured, else `None`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn new_tag_store(&self) -> Option<tag_store::TagStore> {
+        self.mask_policy
+            .as_ref()
+            .map(|_| tag_store::TagStore::new())
     }
 
     /// Whether xattr support is required at mount time (eager probe + hard errors).
@@ -515,6 +622,7 @@ impl Default for PassthroughConfig {
             inject_init: true,
             bind_identity_map: None,
             quota_bytes: None,
+            mask_policy: None,
             quota_root: None,
         }
     }
@@ -578,6 +686,10 @@ impl DynFileSystem for PassthroughFs {
         self.handles.write().unwrap().clear();
         self.dir_handles.write().unwrap().clear();
         self.inodes.write().unwrap().clear();
+        #[cfg(target_os = "linux")]
+        if let Some(tags) = &self.tags {
+            tags.clear();
+        }
     }
 
     fn lookup(&self, _ctx: Context, parent: u64, name: &CStr) -> io::Result<Entry> {
@@ -606,7 +718,7 @@ impl DynFileSystem for PassthroughFs {
             if self.is_virtual_init_inode(ino) {
                 continue;
             }
-            inode::forget_one_locked(&mut inodes, ino, count);
+            inode::forget_one_locked(self, &mut inodes, ino, count);
         }
     }
 

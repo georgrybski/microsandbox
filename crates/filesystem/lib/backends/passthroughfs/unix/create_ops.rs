@@ -63,6 +63,8 @@ pub(crate) fn do_create(
     if fs.is_reserved_init_name(parent, name.to_bytes()) {
         return Err(platform::eacces());
     }
+    #[cfg(target_os = "linux")]
+    let masked = admit_child(fs, parent, name)?;
 
     // Snapshot the quota baseline before creating the file, so the new file's
     // bytes are charged as guest growth rather than absorbed into the baseline.
@@ -120,6 +122,11 @@ pub(crate) fn do_create(
     // Close the fd we used for xattr, then do a proper lookup.
     unsafe { libc::close(fd) };
 
+    #[cfg(target_os = "linux")]
+    if masked {
+        fs.tag_child(parent, name.to_bytes());
+    }
+
     let entry = inode::do_lookup(fs, parent, name)?;
 
     // Reopen for the handle — strip O_CREAT since the file already exists.
@@ -172,6 +179,8 @@ pub(crate) fn do_mkdir(
     if fs.is_reserved_init_name(parent, name.to_bytes()) {
         return Err(platform::eacces());
     }
+    #[cfg(target_os = "linux")]
+    let masked = admit_child(fs, parent, name)?;
 
     let parent_fd = inode::get_inode_fd(fs, parent)?;
     let dir_mode = mode & !umask & 0o7777;
@@ -207,6 +216,10 @@ pub(crate) fn do_mkdir(
         }
     }
 
+    #[cfg(target_os = "linux")]
+    if masked {
+        fs.tag_child(parent, name.to_bytes());
+    }
     inode::do_lookup(fs, parent, name)
 }
 
@@ -233,6 +246,8 @@ pub(crate) fn do_mknod(
     if fs.is_reserved_init_name(parent, name.to_bytes()) {
         return Err(platform::eacces());
     }
+    #[cfg(target_os = "linux")]
+    let masked = admit_child(fs, parent, name)?;
 
     let parent_fd = inode::get_inode_fd(fs, parent)?;
     let perm_mode = mode & !umask & 0o7777;
@@ -286,6 +301,10 @@ pub(crate) fn do_mknod(
     }
     unsafe { libc::close(fd) };
 
+    #[cfg(target_os = "linux")]
+    if masked {
+        fs.tag_child(parent, name.to_bytes());
+    }
     inode::do_lookup(fs, parent, name)
 }
 
@@ -326,6 +345,8 @@ pub(crate) fn do_symlink(
     if fs.is_reserved_init_name(parent, name.to_bytes()) {
         return Err(platform::eacces());
     }
+    #[cfg(target_os = "linux")]
+    let masked = admit_child(fs, parent, name)?;
 
     let parent_fd = inode::get_inode_fd(fs, parent)?;
 
@@ -419,6 +440,10 @@ pub(crate) fn do_symlink(
         }
     }
 
+    #[cfg(target_os = "linux")]
+    if masked {
+        fs.tag_child(parent, name.to_bytes());
+    }
     inode::do_lookup(fs, parent, name)
 }
 
@@ -441,6 +466,8 @@ pub(crate) fn do_link(
     if fs.is_reserved_init_name(newparent, newname.to_bytes()) {
         return Err(platform::eacces());
     }
+    #[cfg(target_os = "linux")]
+    let masked = admit_child(fs, newparent, newname)?;
 
     if fs.is_virtual_init_inode(inode) {
         return Err(platform::eacces());
@@ -487,7 +514,33 @@ pub(crate) fn do_link(
         }
     }
 
+    #[cfg(target_os = "linux")]
+    if masked {
+        fs.tag_child(newparent, newname.to_bytes());
+    }
     inode::do_lookup(fs, newparent, newname)
+}
+
+#[cfg(target_os = "linux")]
+fn admit_child(fs: &PassthroughFs, parent: u64, name: &CStr) -> io::Result<bool> {
+    let Some(policy) = fs.mask_policy() else {
+        return Ok(false);
+    };
+    let path =
+        inode::lexical_child_path(fs, parent, name.to_bytes()).ok_or_else(platform::eacces)?;
+    let path = super::mount_policy::LexicalPath::new(&path).map_err(|_| platform::eacces())?;
+    if policy.is_protected(&path)
+        || matches!(
+            policy.decide_write(&path).decision,
+            super::mount_policy::WriteDecision::Deny
+        )
+    {
+        return Err(platform::eacces());
+    }
+    Ok(matches!(
+        policy.decide(&path).decision,
+        super::mount_policy::Decision::Masked | super::mount_policy::Decision::TraversalOnly
+    ))
 }
 
 /// Read the target of a symbolic link.
@@ -507,6 +560,7 @@ pub(crate) fn do_readlink(fs: &PassthroughFs, _ctx: Context, ino: u64) -> io::Re
     #[cfg(target_os = "linux")]
     {
         let inode_fd = inode::get_inode_fd(fs, ino)?;
+        super::read_policy::check_inode_fd(fs, ino, inode_fd.raw())?;
         let st = platform::fstat(inode_fd.raw())?;
 
         // Real symlink on host — use readlinkat.

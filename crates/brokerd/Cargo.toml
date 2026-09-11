@@ -1,0 +1,43 @@
+[package]
+name = "microsandbox-brokerd"
+description = "Minimal init and SSH-divert broker for microsandbox broker VMs."
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "brokerd"
+path = "bin/main.rs"
+
+[lib]
+path = "lib/lib.rs"
+
+[[example]]
+name = "vsock-guest-probe"
+path = "tests/fixtures/vsock_guest_probe.rs"
+
+[dependencies]
+ciborium.workspace = true
+libc.workspace = true
+microsandbox-protocol.workspace = true
+microsandbox-scan.workspace = true
+nix = { workspace = true, features = ["fs", "mount"] }
+russh.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "sync",
+    "time",
+] }
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

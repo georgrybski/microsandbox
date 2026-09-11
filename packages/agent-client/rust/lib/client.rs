@@ -27,7 +27,10 @@ use std::future::Future;
 use std::path::Path;
 #[cfg(feature = "stream")]
 use std::pin::Pin;
-use std::sync::{Arc, atomic::AtomicU32};
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicBool, AtomicU32, Ordering},
+};
 #[cfg(feature = "stream")]
 use std::time::Duration;
 
@@ -47,12 +50,16 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
 #[cfg(all(feature = "named-pipe", windows))]
 use tokio::net::windows::named_pipe::ClientOptions;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 #[cfg(feature = "stream")]
 use tokio::time::Instant;
 
 use super::error::{AgentClientError, AgentClientResult};
+
+mod owned;
+pub use owned::{AgentSession, AgentSessionEvents, SessionEvent};
+use owned::{SESSION_LEASES, SessionLease};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -97,6 +104,8 @@ pub enum AgentProtocol {
 ///
 /// See the module-level docs for an overview of the two API tiers.
 pub struct AgentClient {
+    /// Kernel-observed local peer PID; absent for injected/cloud transports.
+    peer_pid: Option<u32>,
     /// Channel to the transport writer task.
     writer: mpsc::Sender<WriterCommand>,
     /// Next correlation ID to allocate (starts at `id_min`).
@@ -113,7 +122,10 @@ pub struct AgentClient {
     /// which selects the wire codec; see `VERSIONING.md`.
     negotiated_version: u8,
     /// Pending response channels keyed by correlation ID.
-    pending: Arc<Mutex<HashMap<u32, mpsc::Sender<RawFrame>>>>,
+    pending: Arc<Mutex<PendingRegistry>>,
+    /// A byte budget independent of the number of queued writer commands.
+    session_write_bytes: Arc<Semaphore>,
+    closed: Arc<AtomicBool>,
     /// Background reader task handle.
     reader_handle: JoinHandle<()>,
     /// Background writer task handle.
@@ -138,6 +150,48 @@ struct AgentHandshake {
 struct WriterCommand {
     frame: RawFrame,
     ack: oneshot::Sender<AgentClientResult<()>>,
+    lease: Option<Arc<SessionLease>>,
+    _bytes: Option<OwnedSemaphorePermit>,
+}
+
+#[derive(Clone)]
+enum Pending {
+    Legacy(mpsc::Sender<RawFrame>),
+    Owned(Arc<SessionLease>),
+}
+
+#[derive(Default)]
+struct PendingRegistry {
+    handlers: HashMap<u32, Pending>,
+    // Terminals remove handlers, but retained controls and queued writes keep
+    // their correlation IDs unavailable until every lease has been released.
+    leases: HashMap<u32, Weak<SessionLease>>,
+}
+
+impl std::ops::Deref for PendingRegistry {
+    type Target = HashMap<u32, Pending>;
+    fn deref(&self) -> &Self::Target {
+        &self.handlers
+    }
+}
+
+impl std::ops::DerefMut for PendingRegistry {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.handlers
+    }
+}
+
+impl PendingRegistry {
+    fn release_unopened(&mut self) {
+        self.handlers.retain(|_, entry| match entry {
+            Pending::Owned(lease) => {
+                Arc::strong_count(lease) != 1
+                    || lease.sent.load(std::sync::atomic::Ordering::Acquire)
+            }
+            Pending::Legacy(_) => true,
+        });
+        self.leases.retain(|_, lease| lease.strong_count() != 0);
+    }
 }
 
 #[cfg(feature = "stream")]
@@ -197,7 +251,16 @@ impl AgentClient {
     ) -> AgentClientResult<Self> {
         let sock_path = sock_path.as_ref();
         let stream = connect_local_stream(sock_path, deadline).await?;
-        Self::connect_stream_with_deadline(stream, deadline).await
+        #[cfg(all(feature = "uds", target_os = "linux"))]
+        let peer_pid = stream
+            .peer_cred()?
+            .pid()
+            .and_then(|pid| u32::try_from(pid).ok());
+        #[cfg(not(all(feature = "uds", target_os = "linux")))]
+        let peer_pid = None;
+        let mut client = Self::connect_stream_with_deadline(stream, deadline).await?;
+        client.peer_pid = peer_pid;
+        Ok(client)
     }
 
     /// Connect over an arbitrary byte-stream transport using the default 10s
@@ -263,14 +326,26 @@ impl AgentClient {
             );
         }
 
-        let pending: Arc<Mutex<HashMap<u32, mpsc::Sender<RawFrame>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending = Arc::new(Mutex::new(PendingRegistry::default()));
+        let closed = Arc::new(AtomicBool::new(false));
+        let writer_failed = Arc::new(Notify::new());
 
         let (writer_tx, writer_rx) = mpsc::channel(WRITER_QUEUE_CAPACITY);
-        let reader_handle = tokio::spawn(reader_loop(reader, Arc::clone(&pending)));
-        let writer_handle = tokio::spawn(stream_writer_loop(writer, writer_rx));
+        let reader_handle = tokio::spawn(reader_loop(
+            reader,
+            Arc::clone(&pending),
+            closed.clone(),
+            writer_failed.clone(),
+        ));
+        let writer_handle = tokio::spawn(stream_writer_loop(
+            writer,
+            writer_rx,
+            closed.clone(),
+            writer_failed,
+        ));
 
         Ok(Self {
+            peer_pid: None,
             writer: writer_tx,
             next_id: AtomicU32::new(first_request_id(handshake.id_min)),
             id_min: handshake.id_min,
@@ -278,6 +353,8 @@ impl AgentClient {
             protocol: handshake.protocol,
             negotiated_version: handshake.negotiated_version,
             pending,
+            session_write_bytes: Arc::new(Semaphore::new(4 * 1024 * 1024)),
+            closed,
             reader_handle,
             writer_handle,
             ready_body: handshake.ready_body,
@@ -288,9 +365,22 @@ impl AgentClient {
     /// Close the connection. Drops the writer and aborts the reader task;
     /// any in-flight requests resolve with [`AgentClientError::Closed`].
     pub async fn close(self) {
-        // Drop runs: reader aborts via Drop impl, writer closes when the
-        // last Arc reference dies. Senders in `pending` drop with self,
-        // resolving outstanding waiters.
+        self.disconnect().await;
+    }
+
+    /// Close this transport even while owned session leases retain the client.
+    /// Transport loss is not evidence that a guest process terminated.
+    pub async fn disconnect(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.reader_handle.abort();
+        self.writer_handle.abort();
+        let mut pending = self.pending.lock().await;
+        for handler in pending.values() {
+            if let Pending::Owned(lease) = handler {
+                lease.transport_closed();
+            }
+        }
+        pending.clear();
     }
 }
 
@@ -299,6 +389,36 @@ impl AgentClient {
 //--------------------------------------------------------------------------------------------------
 
 impl AgentClient {
+    /// Reserve a connection-bound session without sending its opening request.
+    ///
+    /// The caller must own both the request and its bounded cleanup. Unlike
+    /// raw correlation IDs, retained controls and queued sends prevent ID reuse
+    /// after a terminal. Slow receivers never block unrelated reply delivery.
+    pub async fn owned_session(
+        self: &Arc<Self>,
+    ) -> AgentClientResult<(AgentSession, AgentSessionEvents)> {
+        let mut pending = self.pending.lock().await;
+        if self.closed.load(Ordering::Acquire) || self.writer.is_closed() {
+            return Err(AgentClientError::Closed);
+        }
+        pending.release_unopened();
+        if pending.leases.len() >= SESSION_LEASES {
+            return Err(AgentClientError::IdRangeExhausted);
+        }
+        let id = self.next_available_id(&pending)?;
+        let lease = SessionLease::new(id);
+        let events = lease.receiver();
+        pending.leases.insert(id, Arc::downgrade(&lease));
+        pending.insert(id, Pending::Owned(lease.clone()));
+        Ok((
+            AgentSession {
+                client: self.clone(),
+                lease,
+            },
+            events,
+        ))
+    }
+
     /// One-shot raw request: alloc id, send a frame with `(flags, body)`,
     /// await one response frame with the matching id.
     ///
@@ -464,6 +584,14 @@ impl AgentClient {
     pub fn ready(&self) -> AgentClientResult<Ready> {
         Ok(self.ready.clone())
     }
+
+    /// Kernel-reported server PID on a Linux Unix-domain connection.
+    ///
+    /// This is local transport evidence, never information supplied by agentd.
+    /// Other transports return `None` rather than inventing a process identity.
+    pub fn peer_pid(&self) -> Option<u32> {
+        self.peer_pid
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -477,6 +605,13 @@ impl AgentClient {
     /// active pending request or stream.
     async fn reserve_id(&self, tx: mpsc::Sender<RawFrame>) -> AgentClientResult<u32> {
         let mut pending = self.pending.lock().await;
+        pending.release_unopened();
+        let id = self.next_available_id(&pending)?;
+        pending.insert(id, Pending::Legacy(tx));
+        Ok(id)
+    }
+
+    fn next_available_id(&self, pending: &PendingRegistry) -> AgentClientResult<u32> {
         let attempts = usable_id_count(self.id_min, self.id_max);
         for _ in 0..attempts {
             let id = self
@@ -488,10 +623,17 @@ impl AgentClient {
                     std::sync::atomic::Ordering::Relaxed,
                 );
             }
-            if id == 0 || id < self.id_min || id >= self.id_max || pending.contains_key(&id) {
+            if id == 0
+                || id < self.id_min
+                || id >= self.id_max
+                || pending.contains_key(&id)
+                || pending
+                    .leases
+                    .get(&id)
+                    .is_some_and(|lease| lease.strong_count() != 0)
+            {
                 continue;
             }
-            pending.insert(id, tx);
             return Ok(id);
         }
 
@@ -510,9 +652,40 @@ impl AgentClient {
             .send(WriterCommand {
                 frame: RawFrame { id, flags, body },
                 ack,
+                lease: None,
+                _bytes: None,
             })
             .await
             .map_err(|_| AgentClientError::Closed)?;
+        written.await.map_err(|_| AgentClientError::Closed)?
+    }
+
+    async fn write_session_frame(
+        &self,
+        lease: Arc<SessionLease>,
+        flags: u8,
+        body: Vec<u8>,
+        bytes: OwnedSemaphorePermit,
+    ) -> AgentClientResult<()> {
+        if !lease.active.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(AgentClientError::SessionClosed(lease.id));
+        }
+        let (ack, written) = oneshot::channel();
+        self.writer
+            .try_send(WriterCommand {
+                frame: RawFrame {
+                    id: lease.id,
+                    flags,
+                    body,
+                },
+                ack,
+                lease: Some(lease),
+                _bytes: Some(bytes),
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => AgentClientError::SessionWriteQueueFull,
+                mpsc::error::TrySendError::Closed(_) => AgentClientError::Closed,
+            })?;
         written.await.map_err(|_| AgentClientError::Closed)?
     }
 }
@@ -753,14 +926,35 @@ where
 }
 
 #[cfg(feature = "stream")]
-async fn stream_writer_loop<W>(mut writer: W, mut rx: mpsc::Receiver<WriterCommand>)
-where
+async fn stream_writer_loop<W>(
+    mut writer: W,
+    mut rx: mpsc::Receiver<WriterCommand>,
+    closed: Arc<AtomicBool>,
+    writer_failed: Arc<Notify>,
+) where
     W: tokio::io::AsyncWrite + Unpin,
 {
     while let Some(command) = rx.recv().await {
+        if closed.load(Ordering::Acquire) {
+            let _ = command.ack.send(Err(AgentClientError::Closed));
+            break;
+        }
+        if let Some(lease) = &command.lease
+            && !lease.active.load(std::sync::atomic::Ordering::Acquire)
+        {
+            let _ = command
+                .ack
+                .send(Err(AgentClientError::SessionClosed(lease.id)));
+            continue;
+        }
+        if let Some(lease) = &command.lease {
+            lease.sent.store(true, std::sync::atomic::Ordering::Release);
+        }
         if let Err(e) = codec::write_raw_frame(&mut writer, &command.frame).await {
             tracing::debug!("agent client: stream writer error: {e}");
             let _ = command.ack.send(Err(AgentClientError::Protocol(e)));
+            closed.store(true, Ordering::Release);
+            writer_failed.notify_one();
             break;
         }
         let _ = command.ack.send(Ok(()));
@@ -770,12 +964,20 @@ where
 /// Background task that reads frames from the relay and dispatches them to
 /// pending channels by correlation ID. Operates on raw frames — no CBOR.
 #[cfg(feature = "stream")]
-async fn reader_loop<R>(mut reader: R, pending: Arc<Mutex<HashMap<u32, mpsc::Sender<RawFrame>>>>)
-where
+async fn reader_loop<R>(
+    mut reader: R,
+    pending: Arc<Mutex<PendingRegistry>>,
+    closed: Arc<AtomicBool>,
+    writer_failed: Arc<Notify>,
+) where
     R: tokio::io::AsyncRead + Unpin,
 {
     loop {
-        let frame = match codec::read_raw_frame(&mut reader).await {
+        let incoming = tokio::select! {
+            _ = writer_failed.notified() => break,
+            incoming = codec::read_raw_frame(&mut reader) => incoming,
+        };
+        let frame = match incoming {
             Ok(frame) => frame,
             Err(e) => {
                 tracing::debug!("agent client: reader EOF or error: {e}");
@@ -787,15 +989,18 @@ where
     }
 
     // Reader exited — drop all senders so outstanding receivers wake up.
+    closed.store(true, Ordering::Release);
     let mut map = pending.lock().await;
+    for handler in map.values() {
+        if let Pending::Owned(lease) = handler {
+            lease.transport_closed();
+        }
+    }
     map.clear();
 }
 
 #[cfg(feature = "stream")]
-async fn dispatch_frame(
-    frame: RawFrame,
-    pending: &Arc<Mutex<HashMap<u32, mpsc::Sender<RawFrame>>>>,
-) {
+async fn dispatch_frame(frame: RawFrame, pending: &Arc<Mutex<PendingRegistry>>) {
     let id = frame.id;
     let is_terminal = (frame.flags & FLAG_TERMINAL) != 0;
 
@@ -805,13 +1010,26 @@ async fn dispatch_frame(
             tracing::trace!("agent client: no pending handler for id={id}");
             return;
         };
+        if let Pending::Owned(lease) = &tx {
+            // Set the lease inactive before making the ID reusable to any
+            // response routing path. Retained references still reserve it.
+            lease.push(frame);
+            if is_terminal {
+                map.remove(&id);
+            }
+            return;
+        }
         if is_terminal {
             map.remove(&id);
         }
         tx
     };
 
-    if tx.send(frame).await.is_err() {
+    // A slow legacy receiver must not block the shared transport reader either.
+    // Closing without a terminal is an incomplete stream, never success.
+    if let Pending::Legacy(tx) = tx
+        && tx.try_send(frame).is_err()
+    {
         pending.lock().await.remove(&id);
     }
 }

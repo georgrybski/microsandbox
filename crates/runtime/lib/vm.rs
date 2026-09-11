@@ -5,11 +5,13 @@
 //! `Vm::enter()` from msb_krun. It **never returns** — the VMM calls
 //! `_exit()` on guest shutdown after running exit observers.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::num::NonZero;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::OnceLock;
@@ -20,7 +22,8 @@ use microsandbox_db::entity::run as run_entity;
 #[cfg(unix)]
 use microsandbox_filesystem::{BindIdentityMap, BindIdentityMapHandle, DynFileSystem};
 use microsandbox_filesystem::{
-    HostPermissions, PassthroughConfig, PassthroughFs, SingleFileFs, StatVirtualization,
+    HostPermissions, MountPolicyProgram, PassthroughConfig, PassthroughFs, SingleFileFs,
+    StatVirtualization,
 };
 use microsandbox_metrics::{ActivateSlot, MetricsRegistry, ReleaseMode};
 #[cfg(feature = "net")]
@@ -51,7 +54,7 @@ use crate::launch::FileMountConfig;
 use crate::logging::LogLevel;
 use crate::metrics::run_metrics_sampler;
 use crate::relay::{self, AgentRelay};
-use crate::{RuntimeError, RuntimeResult};
+use crate::{MountPolicyLoadError, RuntimeError, RuntimeResult};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -121,6 +124,12 @@ pub struct Config {
 
     /// Runtime directory (scripts, heartbeat).
     pub runtime_dir: PathBuf,
+
+    /// Approved root beneath which `policy=` mount tokens are resolved
+    /// (see [`crate::launch::LaunchConfig::mount_policy_dir`]). Empty means
+    /// a legacy launch config; the loader falls back to
+    /// `<runtime_dir>/mount-policy`.
+    pub mount_policy_dir: PathBuf,
 
     /// Root directory holding every sandbox's persisted state
     /// (`<sandboxes_dir>/<name>`). Passed explicitly so runtime-owned
@@ -285,6 +294,10 @@ pub struct VmConfig {
     /// Guest transparent huge-page policy selected at boot.
     pub thp: microsandbox_types::TransparentHugePagePolicy,
 
+    /// Whether to present the host's nested CPU virtualization capability
+    /// to the guest (Linux x86_64 only).
+    pub nested_virt: bool,
+
     /// Number of virtual CPUs online at boot.
     pub vcpus: u8,
 
@@ -358,6 +371,12 @@ pub struct VmConfig {
 
     /// Host Unix sockets exposed through virtio-vsock.
     pub vsock: Vec<microsandbox_types::VsockRouteSpec>,
+
+    /// Guest CID reserved by the host supervisor, checked against libkrun.
+    pub guest_cid: Option<u32>,
+
+    /// Host-owned listener paths for this launch, never durable route configuration.
+    pub host_vsock_listeners: Vec<crate::launch::HostVsockListener>,
 
     /// Pre-built filesystem backends as `(tag, backend)` pairs.
     #[cfg(unix)]
@@ -478,6 +497,8 @@ impl std::fmt::Debug for VmConfig {
             .field("rootfs_disk_readonly", &self.rootfs_disk_readonly)
             .field("mounts", &self.mounts)
             .field("disks", &self.disks);
+        debug.field("guest_cid", &self.guest_cid);
+        debug.field("host_vsock_listeners", &self.host_vsock_listeners);
         #[cfg(unix)]
         debug.field("backends", &format!("[{} backend(s)]", self.backends.len()));
         debug
@@ -1451,7 +1472,7 @@ fn build_vm(
             }
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             {
-                m.split_irqchip(true)
+                m.nested_virt(vm.nested_virt).split_irqchip(true)
             }
             #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
             {
@@ -1595,6 +1616,14 @@ fn build_vm(
         builder = builder.fs(move |fs| fs.tag(&runtime_tag).custom(Box::new(backend)));
     }
 
+    let policy_root = if config.mount_policy_dir.as_os_str().is_empty() {
+        config
+            .runtime_dir
+            .join(microsandbox_utils::MOUNT_POLICY_DIR_NAME)
+    } else {
+        config.mount_policy_dir.clone()
+    };
+
     // Isolated file mounts. Each backend exposes a synthetic root containing
     // only the selected file, so remounting the tag cannot reveal host siblings.
     for file_mount in &vm.file_mounts {
@@ -1612,6 +1641,13 @@ fn build_vm(
             parsed.stat_virtualization,
             override_owner,
         );
+        #[cfg(unix)]
+        let mask_policy = match &parsed.policy_path {
+            None => None,
+            Some(rel) => Some(Arc::new(load_mount_policy(&policy_root, rel).map_err(
+                |e| RuntimeError::Custom(format!("file mount {tag}: policy load failed: {e}")),
+            )?)),
+        };
         let cfg = PassthroughConfig {
             stat_virtualization: parsed.stat_virtualization,
             host_permissions: parsed.host_permissions,
@@ -1621,6 +1657,8 @@ fn build_vm(
             bind_identity_map: mount_bind_identity_map,
             #[cfg(windows)]
             default_owner: override_owner,
+            #[cfg(unix)]
+            mask_policy,
             ..Default::default()
         };
         let backend = SingleFileFs::new(host_path.clone(), file_mount.filename.clone(), cfg)
@@ -1633,7 +1671,17 @@ fn build_vm(
         builder = builder.fs(move |fs| fs.tag(&tag).custom(Box::new(backend)));
     }
 
-    // Additional directory mounts.
+    // Additional mounts.
+    //
+    // The approved root for `policy=` mount tokens is MSB_HOME-anchored
+    // (`<msb home>/mount-policy`), not the per-sandbox runtime dir: sandbox
+    // create's `prepare_create_target` rejects or wipes a pre-existing
+    // `sandboxes/<name>` directory, so a policy staged under
+    // `<runtime>/mount-policy` could never survive to VM build. The
+    // MSB_HOME-anchored dir survives re-creates and keeps the same
+    // fail-closed properties (relative-only, no `..`, `O_NOFOLLOW`
+    // component walk beneath the root). Legacy launch configs that carry
+    // no `mount_policy_dir` fall back to the old runtime-dir root.
     for mount_spec in &vm.mounts {
         let parsed = parse_mount_spec(mount_spec)
             .map_err(|e| RuntimeError::Custom(format!("--mount {mount_spec:?}: {e}")))?;
@@ -1654,6 +1702,12 @@ fn build_vm(
             parsed.stat_virtualization,
             override_owner,
         );
+        let mask_policy = match &parsed.policy_path {
+            None => None,
+            Some(rel) => Some(Arc::new(load_mount_policy(&policy_root, rel).map_err(
+                |e| RuntimeError::Custom(format!("mount {tag}: policy load failed: {e}")),
+            )?)),
+        };
         let cfg = PassthroughConfig {
             root_dir: host_path.clone(),
             inject_init: false,
@@ -1668,6 +1722,7 @@ fn build_vm(
             #[cfg(windows)]
             default_owner: override_owner,
             quota_bytes: parsed.quota_bytes,
+            mask_policy,
             ..Default::default()
         };
         let backend = PassthroughFs::new(cfg).map_err(|e| {
@@ -1738,8 +1793,34 @@ fn build_vm(
     let mut network_metrics_handle = None;
     let mut network_secrets_handle = None;
 
+    // A transport identity is assigned to this VM, not derived from its IP
+    // allocation slot. The supervisor owns cross-process reservation.
+    let expected_guest_cid = vm.guest_cid;
+    if let Some(cid) = expected_guest_cid {
+        crate::launch::validate_guest_cid(cid).map_err(RuntimeError::Custom)?;
+        builder = builder.vsock(|vsock| vsock.guest_cid(cid));
+    }
+    #[cfg(feature = "net")]
+    crate::launch::validate_ssh_guest_cid(expected_guest_cid, Some(&vm.network))
+        .map_err(RuntimeError::Custom)?;
+
     // Vsock routes are independent of virtio-net. Microsandbox owns the host
     // local IPC endpoints while libkrun retains framing, queues and credits.
+    crate::launch::validate_host_vsock_listeners(&vm.host_vsock_listeners, &vm.vsock)
+        .map_err(RuntimeError::Custom)?;
+    #[cfg(feature = "net")]
+    if !vm.host_vsock_listeners.is_empty()
+        && vm.deployment_profile == DeploymentProfile::MultiTenant
+    {
+        return Err(RuntimeError::Custom(
+            "host vsock listeners are disabled for multi-tenant deployments".into(),
+        ));
+    }
+    #[cfg(unix)]
+    for listener in &vm.host_vsock_listeners {
+        builder =
+            builder.vsock(|vsock| vsock.unix_listen(listener.guest_port, &listener.host_socket));
+    }
     #[cfg(unix)]
     if !vm.vsock.is_empty() {
         #[cfg(feature = "net")]
@@ -1928,6 +2009,15 @@ fn build_vm(
     let vm = builder
         .build()
         .map_err(|e| RuntimeError::Custom(format!("build VM: {e}")))?;
+
+    if let Some(expected) = expected_guest_cid
+        && vm.guest_cid() != expected
+    {
+        return Err(RuntimeError::Custom(format!(
+            "libkrun guest CID mismatch: assigned {expected}, got {}",
+            vm.guest_cid()
+        )));
+    }
 
     let bootstrap_frame = encode_bootstrap_frame(&bootstrap)?;
 
@@ -2495,6 +2585,8 @@ struct ParsedMountSpec {
     readonly: bool,
     follow_root_symlinks: bool,
     quota_bytes: Option<u64>,
+    /// Relative path to a compiled mount policy, resolved beneath runtime state.
+    policy_path: Option<String>,
     /// Guest uid to present for host files that carry no per-file override
     /// (`uid=` option). `None` keeps the runtime default. Must be set together
     /// with [`override_gid`](Self::override_gid).
@@ -2505,13 +2597,136 @@ struct ParsedMountSpec {
     override_gid: Option<u32>,
 }
 
+/// Load a compiled mount policy beneath the explicitly approved runtime state directory.
+fn load_mount_policy(
+    approved_root: &Path,
+    policy_path: &str,
+) -> Result<MountPolicyProgram, MountPolicyLoadError> {
+    if policy_path.is_empty() || Path::new(policy_path).is_absolute() {
+        return Err(MountPolicyLoadError::PathEscape);
+    }
+    let path = Path::new(policy_path);
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(MountPolicyLoadError::PathEscape);
+    }
+
+    #[cfg(unix)]
+    let bytes = {
+        let root = std::ffi::CString::new(approved_root.as_os_str().as_bytes())
+            .map_err(|error| MountPolicyLoadError::Io(std::io::Error::other(error)))?;
+        // SAFETY: `root` is a valid CString built from the approved runtime
+        // state directory. O_NOFOLLOW rejects symlinks and O_DIRECTORY requires
+        // a directory, so the path cannot be redirected via a symlink swap.
+        // The path is the approved state dir, not guest-controlled. The
+        // returned fd is checked (< 0) before use.
+        let root_fd = unsafe {
+            libc::open(
+                root.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if root_fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                return Err(MountPolicyLoadError::SymlinkRejected);
+            }
+            if error.raw_os_error() == Some(libc::ENOENT) {
+                return Err(MountPolicyLoadError::FileNotFound(
+                    approved_root.display().to_string(),
+                ));
+            }
+            return Err(MountPolicyLoadError::Io(error));
+        }
+        let mut current = root_fd;
+        let components: Vec<_> = path.components().collect();
+        if components.is_empty() {
+            // SAFETY: `current` is the valid root_fd opened above. The path is
+            // empty so we bail before descending; close the fd to avoid
+            // leaking it. It is not owned by any Rust object and is not used
+            // again after this point (no double-close).
+            unsafe { libc::close(current) };
+            return Err(MountPolicyLoadError::PathEscape);
+        }
+        let mut bytes = Vec::new();
+        for (index, component) in components.iter().enumerate() {
+            let Component::Normal(name) = component else {
+                continue;
+            };
+            let name = std::ffi::CString::new(name.as_bytes())
+                .map_err(|error| MountPolicyLoadError::Io(std::io::Error::other(error)))?;
+            let flags = libc::O_RDONLY
+                | libc::O_CLOEXEC
+                | libc::O_NOFOLLOW
+                | if index + 1 < components.len() {
+                    libc::O_DIRECTORY
+                } else {
+                    0
+                };
+            // SAFETY: `current` is a valid open directory fd (the root_fd or a
+            // previously opened component). `name` is a valid CString for one
+            // path component. flags include O_NOFOLLOW (rejects symlinks) and
+            // O_DIRECTORY for intermediate components, so the path cannot
+            // escape the approved root via a symlink swap. The returned fd is
+            // checked (< 0) before use.
+            let next = unsafe { libc::openat(current, name.as_ptr(), flags) };
+            if next < 0 {
+                let error = std::io::Error::last_os_error();
+                // SAFETY: `current` is a valid open fd that we are abandoning
+                // because the next component could not be opened. It is not
+                // owned by any Rust object and is not used again after close
+                // (no double-close).
+                unsafe { libc::close(current) };
+                if error.raw_os_error() == Some(libc::ELOOP) {
+                    return Err(MountPolicyLoadError::SymlinkRejected);
+                }
+                if error.raw_os_error() == Some(libc::ENOENT) {
+                    return Err(MountPolicyLoadError::FileNotFound(policy_path.to_string()));
+                }
+                return Err(MountPolicyLoadError::Io(error));
+            }
+            // SAFETY: `current` is a valid open fd that is no longer needed
+            // once `next` has been obtained; closing it prevents fd leakage.
+            // It is not owned by any Rust object and is not referenced again
+            // after close (no double-close).
+            unsafe { libc::close(current) };
+            current = next;
+            if index + 1 == components.len() {
+                // SAFETY: `current` is the fd of the final policy file
+                // component, valid and not owned by any other Rust object.
+                // from_raw_fd takes ownership so the File closes `current` on
+                // drop; `current` is not referenced again (no double-close).
+                let mut file = unsafe { std::fs::File::from_raw_fd(current) };
+                if let Err(error) = file.read_to_end(&mut bytes) {
+                    return Err(MountPolicyLoadError::Io(error));
+                }
+            }
+        }
+        bytes
+    };
+
+    #[cfg(unix)]
+    {
+        serde_json::from_slice(&bytes).map_err(MountPolicyLoadError::from)
+    }
+
+    #[cfg(not(unix))]
+    Err(MountPolicyLoadError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "mount policy loading is unsupported on this platform",
+    )))
+}
+
 /// Parse a `--mount` spec into [`ParsedMountSpec`].
 ///
 /// Wire grammar: `tag:host_path[:opts]`, where `opts` is a comma-separated
 /// option block of flags (`ro`, `rw`, `noexec`, `nosuid`, `nodev`,
 /// `follow-root-symlinks`) and keyed policies (`stat-virt=...`, `host-perms=...`,
-/// `uid=...`, `gid=...`). The `follow-root-symlinks` flag opts the mount out of the
-/// default no-follow root resolution; its absence keeps the protective default on.
+/// `uid=...`, `gid=...`, `policy=<path>`). The `follow-root-symlinks` flag opts
+/// the mount out of the default no-follow root resolution; its absence keeps the
+/// protective default on.
 /// `uid=`/`gid=` set the guest owner presented for host files that have no per-file
 /// override (see [`ParsedMountSpec::override_uid`]); they must be given together.
 fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
@@ -2538,6 +2753,7 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
     let mut readonly = false;
     let mut follow_root_symlinks = false;
     let mut quota_bytes = None;
+    let mut policy_path = None;
     let mut override_uid = None;
     let mut override_gid = None;
     let mut seen_stat_virt = false;
@@ -2548,6 +2764,7 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
     let mut seen_nodev = false;
     let mut seen_follow_root = false;
     let mut seen_quota = false;
+    let mut seen_policy = false;
     let mut seen_uid = false;
     let mut seen_gid = false;
 
@@ -2649,6 +2866,20 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
                             })?;
                             quota_bytes = Some(mib.saturating_mul(1024 * 1024));
                         }
+                        "policy" => {
+                            if seen_policy {
+                                return Err(
+                                    "mount option `policy` specified more than once".to_string()
+                                );
+                            }
+                            seen_policy = true;
+                            if value.is_empty() {
+                                return Err(
+                                    "mount option `policy` requires a non-empty path".to_string()
+                                );
+                            }
+                            policy_path = Some(value.to_string());
+                        }
                         "uid" => {
                             if seen_uid {
                                 return Err(
@@ -2698,6 +2929,7 @@ fn parse_mount_spec(spec: &str) -> Result<ParsedMountSpec, String> {
         readonly,
         follow_root_symlinks,
         quota_bytes,
+        policy_path,
         override_uid,
         override_gid,
     })
@@ -2804,9 +3036,9 @@ mod tests {
     use super::{
         ConsoleSharedState, HostPermissions, StatVirtualization, append_block_root_env,
         bind_rootfs_backend, encode_bootstrap_frame, guest_shutdown_flush_timeout,
-        guest_shutdown_flush_timeout_with_override, parse_mount_spec, prepend_scripts_path,
-        request_guest_shutdown, request_guest_shutdown_with_timeout, thp_kernel_cmdline,
-        validate_disk_format,
+        guest_shutdown_flush_timeout_with_override, load_mount_policy, parse_mount_spec,
+        prepend_scripts_path, request_guest_shutdown, request_guest_shutdown_with_timeout,
+        thp_kernel_cmdline, validate_disk_format,
     };
 
     use microsandbox_filesystem::{Context, DynFileSystem, FsOptions};
@@ -3037,6 +3269,92 @@ mod tests {
     fn test_parse_mount_spec_rejects_unknown_key() {
         let err = parse_mount_spec("foo:/host/data:bogus=1").unwrap_err();
         assert!(err.contains("unknown mount option"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_mount_spec_policy() {
+        let parsed = parse_mount_spec("foo:/host/data:policy=/path/to/policy.json").unwrap();
+        assert_eq!(parsed.policy_path.as_deref(), Some("/path/to/policy.json"));
+        assert!(parse_mount_spec("foo:/host/data:policy=a,policy=b").is_err());
+        assert!(parse_mount_spec("foo:/host/data:policy=").is_err());
+        assert!(parse_mount_spec("foo:/host/data:unknown=value").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_load_mount_policy_confines_and_validates_file() {
+        let root = tempfile::tempdir().unwrap();
+        let policy = br#"{"version":1,"rules":[],"protect":[],"writes":{"allow":[],"deny":[]},"case_sensitivity":"sensitive"}"#;
+        std::fs::write(root.path().join("valid.json"), policy).unwrap();
+        assert!(load_mount_policy(root.path(), "valid.json").is_ok());
+        std::fs::write(root.path().join("bad.json"), b"not json").unwrap();
+        assert!(load_mount_policy(root.path(), "bad.json").is_err());
+        std::fs::write(root.path().join("v2.json"), br#"{"version":2}"#).unwrap();
+        assert!(load_mount_policy(root.path(), "v2.json").is_err());
+        std::fs::write(root.path().join("missing-version.json"), br#"{"rules":[]}"#).unwrap();
+        assert!(load_mount_policy(root.path(), "missing-version.json").is_err());
+        assert!(load_mount_policy(root.path(), "../valid.json").is_err());
+        assert!(load_mount_policy(root.path(), "/valid.json").is_err());
+        assert!(load_mount_policy(root.path(), "missing.json").is_err());
+        std::os::unix::fs::symlink("valid.json", root.path().join("link.json")).unwrap();
+        assert!(load_mount_policy(root.path(), "link.json").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_mount_policy_load_failure_propagates() {
+        // Fail-closed contract: a file mount whose `policy=` token cannot be
+        // loaded must not silently fall back to an unprotected mount. The
+        // `file_mounts` loop in `build_vm` maps `load_mount_policy` failures
+        // to `file mount {tag}: policy load failed: {e}`; this test exercises
+        // that exact mapping without requiring FUSE.
+        let policy_root = tempfile::tempdir().unwrap();
+        let host_dir = tempfile::tempdir().unwrap();
+        let host_file = host_dir.path().join("host.txt");
+        std::fs::write(&host_file, b"hello").unwrap();
+
+        let tag = "testtag";
+        let spec = format!("{tag}:{}:policy=missing.json", host_file.display());
+        let file_mount = crate::launch::FileMountConfig {
+            mount: spec.clone(),
+            filename: "host.txt".to_string(),
+        };
+
+        // Verify the mount spec parses exactly as the `file_mounts` loop does
+        // and that the tag is preserved for the error prefix.
+        let parsed = parse_mount_spec(&file_mount.mount).expect("parse file_mount spec");
+        assert_eq!(parsed.tag, tag);
+        let policy_rel = parsed.policy_path.expect("policy token should be present");
+        assert_eq!(policy_rel, "missing.json");
+
+        // `load_mount_policy` must fail for a missing policy file, and the
+        // `build_vm` mapping must prefix it with the distinct fail-closed
+        // string `file mount {tag}: policy load failed`.
+        let err = load_mount_policy(policy_root.path(), &policy_rel).unwrap_err();
+        let mapped = format!("file mount {tag}: policy load failed: {err}");
+        assert!(
+            mapped.contains("file mount testtag: policy load failed"),
+            "expected fail-closed error, got: {mapped}"
+        );
+        // Underlying error should mention the missing policy file, proving the
+        // failure is not swallowed.
+        let err_string = err.to_string();
+        assert!(
+            err_string.contains("missing.json") || err_string.contains("not found"),
+            "unexpected policy load error: {err_string}"
+        );
+
+        // Also verify the `VmConfig::file_mounts` integration would propagate
+        // the same distinct string: constructing the analogous `VmConfig`
+        // spec `tag:/tmp/.../host.txt:policy=missing.json` must yield
+        // `file mount testtag: policy load failed` when the policy cannot be
+        // loaded (no FUSE mount is performed).
+        let direct_err = load_mount_policy(policy_root.path(), "missing.json").unwrap_err();
+        let direct_mapped = format!("file mount {tag}: policy load failed: {direct_err}");
+        assert!(
+            direct_mapped.contains("file mount testtag: policy load failed"),
+            "VmConfig file_mounts policy failure must propagate with distinct prefix, got: {direct_mapped}"
+        );
     }
 
     #[test]

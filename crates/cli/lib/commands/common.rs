@@ -125,6 +125,14 @@ pub struct SandboxOpts {
     #[arg(long, value_name = "POLICY", value_parser = ["always", "madvise", "never"])]
     pub thp: Option<String>,
 
+    /// Enable nested virtualization for the guest (Linux x86_64 only).
+    ///
+    /// The guest receives the host's nested CPU virtualization capability.
+    /// Guest `/dev/kvm` additionally requires KVM support in the bundled
+    /// firmware; this flag alone yields CPU capability only.
+    #[arg(long)]
+    pub nested_virt: bool,
+
     /// Mount a host path or named volume into the sandbox (`SOURCE:DEST[:OPTIONS]`).
     /// OPTIONS may include paired `uid=<N>,gid=<N>` for directory-backed mounts.
     #[arg(short, long)]
@@ -489,6 +497,11 @@ pub struct SandboxOpts {
     #[cfg(feature = "net")]
     #[arg(long)]
     pub max_connections: Option<usize>,
+
+    /// Require hostname-based network allows to use inspectable request authority.
+    #[cfg(feature = "net")]
+    #[arg(long = "net-strict")]
+    pub net_strict: bool,
 
     /// Ship the host's trusted root CAs into the guest. Opt in to make
     /// outbound TLS work behind corporate MITM proxies (Warp Zero
@@ -964,6 +977,7 @@ impl SandboxOpts {
             || self.memory.is_some()
             || self.max_memory.is_some()
             || self.thp.is_some()
+            || self.nested_virt
             || !self.volume.is_empty()
             || !self.mount_dir.is_empty()
             || !self.mount_file.is_empty()
@@ -1016,6 +1030,7 @@ impl SandboxOpts {
             || self.net_ingress_ops.is_some()
             || self.net_ingress_ops_burst.is_some()
             || self.max_connections.is_some()
+            || self.net_strict
             || self.trust_host_cas
             || self.proxy.is_some()
             || self.socks4_user_id.is_some()
@@ -1237,6 +1252,9 @@ fn apply_sandbox_opts_inner(
             .parse::<TransparentHugePagePolicy>()
             .map_err(anyhow::Error::msg)?;
         builder = builder.thp(policy);
+    }
+    if opts.nested_virt {
+        builder = builder.nested_virt(true);
     }
     if let Some(ref workdir) = opts.workdir {
         builder = builder.workdir(workdir);
@@ -2419,6 +2437,7 @@ fn apply_network_opts(
             })
             .transpose()?;
         let trust_host_cas = opts.trust_host_cas;
+        let net_strict = opts.net_strict;
         let tls_intercept = opts.tls_intercept;
         let tls_ports = opts.tls_intercept_port.clone();
         let tls_bypass = opts.tls_bypass.clone();
@@ -2462,6 +2481,9 @@ fn apply_network_opts(
             }
             if trust_host_cas {
                 n = n.trust_host_cas(true);
+            }
+            if net_strict {
+                n = n.strict(true);
             }
             if egress_rate_limiter.is_some() || ingress_rate_limiter.is_some() {
                 n = n.rate_limiter(|mut r| {
@@ -3581,6 +3603,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(config.spec.resources.thp, TransparentHugePagePolicy::Always);
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_opts_sets_nested_virt() {
+        let opts = SandboxOpts {
+            nested_virt: true,
+            ..Default::default()
+        };
+        let config = apply_sandbox_opts(SandboxBuilder::new("test").image("alpine"), &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        assert!(config.spec.resources.nested_virt);
+
+        let config = apply_sandbox_opts(
+            SandboxBuilder::new("test").image("alpine"),
+            &SandboxOpts::default(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+        assert!(!config.spec.resources.nested_virt);
     }
 
     #[tokio::test]

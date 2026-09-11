@@ -405,6 +405,53 @@ msb run ghcr.io/superradcompany/debian-systemd:12 \
 ```
 </CodeGroup>
 
+### Volatile runtime directories
+
+Before user mounts or runtime files are written, agentd prepares `/run` in
+the final guest root, after any block-root pivot. If no mount exists at or
+below `/run`, it mounts a new tmpfs with mode0755, `nodev` and `nosuid`.
+It does not add `noexec`. Image or overlay contents previously under that
+unmounted directory are hidden, not deleted: `/run` is runtime state, not
+persistent application storage.
+
+Existing mounts at `/run` or beneath it are preserved without changing their
+filesystem, flags or permissions. Explicit user mounts are then applied in
+their existing parent-before-child order, so an explicit `/run` mount and
+its children retain their requested settings. A profile requiring tmpfs
+must independently reject any preserved or explicit non-tmpfs `/run`.
+Agentd creates `/run/microsandbox` after these user mounts for its runtime files.
+
+A symlink or non-directory `/run`, unreadable or malformed mount metadata,
+or a failed default mount causes a clear bootstrap error; agentd does not
+guess a replacement or follow an image symlink. This can refuse older images
+that used a symlink at `/run`. The new behavior applies when booting the new
+agentd, not retroactively to already-running guests. No image format or
+persisted configuration migration is performed.
+
+### Shutdown after handoff
+
+When PID 1 is systemd, agentd resolves `/proc/1/exe` and uses `bin/systemctl`
+from that same installation to submit `poweroff.target` with
+`--job-mode=replace-irreversibly --no-block --no-ask-password --system`.
+Supported layouts include `/lib/systemd/systemd`, `/usr/lib/systemd/systemd`,
+and a Nix store package's `lib/systemd/systemd`. The corresponding helper must
+be an executable regular file at its canonical path. Unexpected systemd
+layouts, missing helpers, command failures, and timeouts are reported as
+errors, without falling back to signals or tearing down systemd's filesystems.
+
+This named request avoids depending on the agent's libc real-time signal
+offset: a musl sender's `SIGRTMIN+4` is not a glibc receiver's poweroff signal.
+The helper gets at most two seconds within the existing five-second handoff
+grace. Successful submission only means systemd accepted the job; it does not
+prove completed poweroff or database flush. The host retains its separate
+eight-second default handoff fallback, which may force the VM to exit.
+Shutdown validation must distinguish guest completion from that host fallback.
+
+Agentd-as-PID-1 shutdown is unchanged. Non-systemd handoffs retain their legacy
+RT-signal/SIGTERM sequence; its effect is receiver-specific and is not a
+verified graceful-shutdown contract. Already-running guests keep the agentd
+binary they booted with; upgrading the host alone does not repair them.
+
 ### Picking an image
 
 Most slim Docker base images do not include systemd or another full init. Use an image that ships the init you want, or build a small custom image that installs it.

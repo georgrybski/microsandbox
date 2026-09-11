@@ -25,6 +25,16 @@ use crate::addr::normalize_ip_addr;
 /// Default frame queue capacity. Matches libkrun's virtio queue size.
 pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
 
+/// Evasion audits logged before sampling starts: the first few audits
+/// always emit so early diagnostics are never lost.
+pub const EVASION_AUDIT_LOG_FIRST: u64 = 3;
+
+/// Sampling stride after the first audits: log every Nth evasion audit.
+///
+/// The counter itself stays exact; only the log line is sampled so a
+/// banner-less scanner cannot flood host logs.
+pub const EVASION_AUDIT_LOG_EVERY: u64 = 100;
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -79,6 +89,12 @@ pub struct SharedState {
 
     /// Aggregate network byte counters at the guest/runtime boundary.
     metrics: NetworkMetrics,
+
+    /// Evasion-signal audits: SSH first flights still undecided when the
+    /// peek budget expires and falling through to the generic egress
+    /// verdict instead of stalling the connection. The counter is exact;
+    /// the log line is sampled via [`should_log_evasion_audit`].
+    evasion_audits: AtomicU64,
 }
 
 /// Aggregate network byte counters shared with the runtime metrics sampler.
@@ -122,6 +138,7 @@ impl SharedState {
             gateway_ipv4: OnceLock::new(),
             gateway_ipv6: OnceLock::new(),
             metrics: NetworkMetrics::default(),
+            evasion_audits: AtomicU64::new(0),
         }
     }
 
@@ -195,6 +212,25 @@ impl SharedState {
             .member_matches(&addr, Instant::now(), |key| predicate(&key.hostname))
     }
 
+    /// Best-effort representative hostname previously resolved to `addr`.
+    ///
+    /// Returns the lexicographically smallest live hostname so SSH flow
+    /// attribution is deterministic when several names share an IP (for
+    /// example a shared CDN address). `None` means no cached binding;
+    /// callers fall back to the stringified destination IP.
+    pub fn preferred_hostname_for_ip(&self, addr: IpAddr) -> Option<String> {
+        let addr = normalize_ip_addr(addr);
+        let mut names: Vec<String> = self
+            .resolved_hostnames
+            .read()
+            .keys_for_member(&addr, Instant::now())
+            .into_iter()
+            .map(|key| key.hostname)
+            .collect();
+        names.sort();
+        names.into_iter().next()
+    }
+
     /// Best-effort expiry maintenance for resolved hostnames.
     ///
     /// This runs outside the hot egress read path. If the index is currently
@@ -249,6 +285,19 @@ impl SharedState {
     pub fn rx_bytes(&self) -> u64 {
         self.metrics.rx_bytes.load(Ordering::Relaxed)
     }
+
+    /// Record one evasion-signal audit (SSH banner undecided after budget).
+    ///
+    /// Returns the previous total so the caller can sample its log line
+    /// with [`should_log_evasion_audit`] without extra synchronization.
+    pub fn record_evasion_audit(&self) -> u64 {
+        self.evasion_audits.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Total evasion-signal audits recorded.
+    pub fn evasion_audits(&self) -> u64 {
+        self.evasion_audits.load(Ordering::Relaxed)
+    }
 }
 
 impl Default for NetworkMetrics {
@@ -258,6 +307,18 @@ impl Default for NetworkMetrics {
             rx_bytes: AtomicU64::new(0),
         }
     }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+/// Whether the evasion audit recorded after `previous` prior audits
+/// should emit its log line: the first few always do, then every
+/// [`EVASION_AUDIT_LOG_EVERY`]th. Pure over the count, so the sampling
+/// boundary is unit-testable without clocks or threads.
+pub fn should_log_evasion_audit(previous: u64) -> bool {
+    previous < EVASION_AUDIT_LOG_FIRST || (previous + 1).is_multiple_of(EVASION_AUDIT_LOG_EVERY)
 }
 
 pub(crate) fn normalize_hostname(domain: &str) -> String {
@@ -346,5 +407,28 @@ mod tests {
 
         assert!(state.any_resolved_hostname(embedded, |h| h == "metadata.example"));
         assert!(state.any_resolved_hostname(mapped, |h| h == "metadata.example"));
+    }
+
+    #[test]
+    fn evasion_audit_counter_returns_previous_and_stays_exact() {
+        let state = SharedState::new(4);
+        assert_eq!(state.evasion_audits(), 0);
+        assert_eq!(state.record_evasion_audit(), 0);
+        assert_eq!(state.record_evasion_audit(), 1);
+        assert_eq!(state.evasion_audits(), 2);
+    }
+
+    #[test]
+    fn evasion_audit_log_samples_first_then_every_nth() {
+        // The first audits always log.
+        for previous in 0..EVASION_AUDIT_LOG_FIRST {
+            assert!(should_log_evasion_audit(previous), "audit {previous} logs");
+        }
+        // Then silence until the Nth audit closes the stride.
+        assert!(!should_log_evasion_audit(EVASION_AUDIT_LOG_FIRST));
+        assert!(!should_log_evasion_audit(EVASION_AUDIT_LOG_EVERY - 2));
+        assert!(should_log_evasion_audit(EVASION_AUDIT_LOG_EVERY - 1));
+        assert!(!should_log_evasion_audit(EVASION_AUDIT_LOG_EVERY));
+        assert!(should_log_evasion_audit(2 * EVASION_AUDIT_LOG_EVERY - 1));
     }
 }

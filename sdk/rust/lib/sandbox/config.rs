@@ -124,6 +124,53 @@ pub struct SandboxConfig {
     #[serde(skip)]
     pub(crate) ca_certs: Vec<Vec<u8>>,
 
+    /// Host-side SSH broker endpoint divert-intended flows dial.
+    ///
+    /// Set via the sandbox builder. Host-side only: never serialized
+    /// into the spec or the database; applied to the resolved network
+    /// config at spawn time alongside the host-reserved guest CID.
+    /// Follows the `insecure`/`ca_certs` local-state pattern.
+    #[cfg(feature = "net")]
+    #[serde(skip)]
+    pub(crate) ssh_broker_endpoint: Option<microsandbox_network::ssh::BrokerEndpoint>,
+
+    /// Host-reserved CID for this launch, excluded from durable task specs.
+    /// The supervisor must reserve it across runtime processes before launch.
+    #[serde(skip)]
+    pub(crate) guest_cid: Option<u32>,
+
+    /// Per-launch host-to-guest Unix listeners owned by libkrun, never persisted.
+    #[serde(skip)]
+    pub(crate) host_vsock_listeners: Vec<microsandbox_runtime::launch::HostVsockListener>,
+
+    /// Sealed SSH key material for the broker VM.
+    ///
+    /// Set via the sandbox builder. Host-side only: never serialized
+    /// into the spec or the database; applied to the typed bootstrap at
+    /// spawn time. Carries decrypted private key bytes for the broker to
+    /// move into sealed custody, never resolution configuration.
+    /// Follows the `insecure`/`ca_certs` local-state pattern.
+    #[serde(skip)]
+    pub(crate) broker_key: Option<microsandbox_protocol::bootstrap::BrokerSshKey>,
+
+    /// Pinned upstream SSH servers for the broker VM.
+    ///
+    /// Set via the sandbox builder. Host-side only: never serialized
+    /// into the spec or the database; applied to the typed bootstrap at
+    /// spawn time. Each entry pins one server the broker may dial, the
+    /// login user, and the expected server public key.
+    #[serde(skip)]
+    pub(crate) broker_upstream: Option<microsandbox_protocol::bootstrap::BrokerUpstream>,
+
+    /// DLP patterns enforced on the broker VM's relayed SSH sessions.
+    ///
+    /// Set via the sandbox builder. Host-side only: never serialized
+    /// into the spec or the database; applied to the typed bootstrap at
+    /// spawn time. Each entry names one credential, carries its match
+    /// bytes, and states the coalesced action contributed on a hit.
+    #[serde(skip)]
+    pub(crate) broker_patterns: Option<microsandbox_protocol::bootstrap::BrokerPatterns>,
+
     /// Replace an existing sandbox with the same name during create.
     ///
     /// If the existing sandbox is still active, microsandbox stops it and
@@ -627,6 +674,7 @@ impl Default for SandboxConfig {
                     cpu_placement: Default::default(),
                     placement_profile: None,
                     thp: TransparentHugePagePolicy::Madvise,
+                    nested_virt: false,
                 },
                 runtime: SandboxRuntimeOptions {
                     log_level: default_log_level(),
@@ -640,6 +688,13 @@ impl Default for SandboxConfig {
             registry_auth: None,
             insecure: false,
             ca_certs: Vec::new(),
+            #[cfg(feature = "net")]
+            ssh_broker_endpoint: None,
+            guest_cid: None,
+            host_vsock_listeners: Vec::new(),
+            broker_key: None,
+            broker_upstream: None,
+            broker_patterns: None,
             replace_existing: false,
             replace_with_timeout: DEFAULT_REPLACE_TIMEOUT,
             slug: None,
@@ -1346,6 +1401,7 @@ mod tests {
                 cpu_placement: Default::default(),
                 placement_profile: None,
                 thp: TransparentHugePagePolicy::Madvise,
+                nested_virt: false,
             },
             runtime: SandboxRuntimeOptions {
                 workdir: Some("/app".into()),
@@ -1595,6 +1651,7 @@ mod tests {
                     host_permissions: crate::sandbox::HostPermissions::Private,
                     follow_root_symlinks: false,
                     quota_mib: None,
+                    mount_policy: None,
                 }],
                 ..Default::default()
             },
@@ -1623,6 +1680,7 @@ mod tests {
                     host_permissions: crate::sandbox::HostPermissions::Private,
                     follow_root_symlinks: false,
                     quota_mib: None,
+                    mount_policy: None,
                 }],
                 ..Default::default()
             },

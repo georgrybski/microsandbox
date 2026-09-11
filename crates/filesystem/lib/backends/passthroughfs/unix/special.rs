@@ -13,7 +13,7 @@
 
 use std::{io, os::fd::AsRawFd};
 
-use super::PassthroughFs;
+use super::{PassthroughFs, inode};
 use crate::{Context, backends::shared::platform, statvfs64};
 
 //--------------------------------------------------------------------------------------------------
@@ -98,6 +98,29 @@ pub(crate) fn do_fallocate(
     }
     if fs.cfg.readonly() {
         return Err(platform::erofs());
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(policy) = fs.mask_policy()
+        && let Some(path) = inode::lexical_inode_path(fs, inode)
+        && let Ok(path) = super::mount_policy::LexicalPath::new(&path)
+    {
+        if policy.is_protected(&path) {
+            return Err(platform::eacces());
+        }
+        if matches!(
+            policy.decide_write(&path).decision,
+            super::mount_policy::WriteDecision::Deny
+        ) {
+            return Err(platform::eacces());
+        }
+        if matches!(
+            policy.decide(&path).decision,
+            super::mount_policy::Decision::Masked
+        ) && !fs.tagged_visible_for_inode(inode)
+        {
+            return Err(platform::enoent());
+        }
     }
 
     let handles = fs.handles.read().unwrap();
@@ -221,6 +244,29 @@ pub(crate) fn do_copyfilerange(
     }
     if fs.cfg.readonly() {
         return Err(platform::erofs());
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(policy) = fs.mask_policy()
+        && let Some(path) = inode::lexical_inode_path(fs, inode_out)
+        && let Ok(path) = super::mount_policy::LexicalPath::new(&path)
+    {
+        if policy.is_protected(&path) {
+            return Err(platform::eacces());
+        }
+        if matches!(
+            policy.decide_write(&path).decision,
+            super::mount_policy::WriteDecision::Deny
+        ) {
+            return Err(platform::eacces());
+        }
+        if matches!(
+            policy.decide(&path).decision,
+            super::mount_policy::Decision::Masked
+        ) && !fs.tagged_visible_for_inode(inode_out)
+        {
+            return Err(platform::enoent());
+        }
     }
 
     #[cfg(target_os = "linux")]

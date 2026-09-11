@@ -8,6 +8,7 @@
 //! network config and secret-bearing env out of `ps` and `/proc/<pid>/cmdline`
 //! — see issue #997.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use microsandbox_protocol::bootstrap::GuestBootstrap;
@@ -22,8 +23,31 @@ use microsandbox_network::ResolvedNetworkConfig;
 use crate::vm::{MetricsSlotHandoff, StartupCommand};
 
 //--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// Must-understand launcher capability for assigning and checking a guest CID.
+pub const GUEST_CID_CAPABILITY: &str = "guest-cid-v1";
+
+/// Must-understand launch requirement for device-owned host-to-guest listeners.
+pub const HOST_VSOCK_LISTEN_CAPABILITY: &str = "host-vsock-listen-v1";
+
+//--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
+
+/// A transient supervisor-owned Unix listener forwarding into a guest vsock port.
+///
+/// Unlike durable guest-to-host routes, this path belongs to one launch and must
+/// be provided again after replacement or restart. No application identity is
+/// derived from bytes sent through this endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostVsockListener {
+    /// Fresh absolute socket pathname inside a private supervisor-owned directory.
+    pub host_socket: PathBuf,
+    /// Guest stream port accepting connections from the vsock host CID.
+    pub guest_port: u32,
+}
 
 /// The bulk `msb sandbox` configuration delivered over the config fd.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -39,6 +63,17 @@ pub struct LaunchConfig {
 
     /// Runtime directory (scripts, heartbeat).
     pub runtime_dir: PathBuf,
+
+    /// Approved root beneath which `policy=` mount tokens are resolved.
+    ///
+    /// Host-side and user-owned (anchored at `MSB_HOME/mount-policy`, not the
+    /// per-sandbox runtime directory). The fail-closed loader
+    /// (`vm::load_mount_policy`) still rejects absolute paths and `..`
+    /// components and walks each component with `O_NOFOLLOW` beneath this
+    /// root. Empty means a legacy launch config; the loader falls back to
+    /// `<runtime_dir>/mount-policy`.
+    #[serde(default)]
+    pub mount_policy_dir: PathBuf,
 
     /// Root directory holding every sandbox's persisted state.
     pub sandboxes_dir: PathBuf,
@@ -73,6 +108,12 @@ pub struct LaunchConfig {
     /// Guest transparent huge-page policy selected at boot.
     #[serde(default)]
     pub thp: TransparentHugePagePolicy,
+
+    /// Whether the guest receives the host's nested CPU virtualization
+    /// capability (Linux x86_64 only). Defaults to off; absent in launch
+    /// payloads from older launchers means off.
+    #[serde(default)]
+    pub nested_virt: bool,
 
     /// Per-writable-raw-disk hard budget for buffered host dirty data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -132,6 +173,17 @@ pub struct LaunchConfig {
     /// Host Unix sockets exposed through virtio-vsock.
     #[serde(default)]
     pub vsock: Vec<VsockRouteSpec>,
+
+    /// CID reserved by the host supervisor for this launch, never a network slot.
+    ///
+    /// The launcher must require [`GUEST_CID_CAPABILITY`] on the runtime argv:
+    /// an older runtime must refuse, not silently discard this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_cid: Option<u32>,
+
+    /// Transient host-to-guest listeners; requires [`HOST_VSOCK_LISTEN_CAPABILITY`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_vsock_listeners: Vec<HostVsockListener>,
 }
 
 /// Lifetime bounds for the sandbox.
@@ -197,4 +249,236 @@ pub struct FileMountConfig {
 
     /// Filename presented at the root of the synthetic virtio-fs share.
     pub filename: String,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+impl LaunchConfig {
+    /// Validate must-understand requirements before creating runtime artifacts.
+    /// This is a launch compatibility guard, not guest authentication.
+    pub fn validate_capabilities(&self, required: &[String]) -> Result<(), String> {
+        for capability in required {
+            if capability != GUEST_CID_CAPABILITY && capability != HOST_VSOCK_LISTEN_CAPABILITY {
+                return Err(format!("unsupported launch capability: {capability}"));
+            }
+        }
+        let requires_cid = required.iter().any(|c| c == GUEST_CID_CAPABILITY);
+        if requires_cid != self.guest_cid.is_some() {
+            return Err(
+                "guest CID and guest-cid-v1 launch requirement must be supplied together".into(),
+            );
+        }
+        if let Some(cid) = self.guest_cid {
+            validate_guest_cid(cid)?;
+        }
+        let requires_listeners = required.iter().any(|c| c == HOST_VSOCK_LISTEN_CAPABILITY);
+        if requires_listeners == self.host_vsock_listeners.is_empty() {
+            return Err("host listeners and host-vsock-listen-v1 launch requirement must be supplied together".into());
+        }
+        validate_host_vsock_listeners(&self.host_vsock_listeners, &self.vsock)?;
+        #[cfg(feature = "net")]
+        if !self.host_vsock_listeners.is_empty()
+            && self.deployment_profile == DeploymentProfile::MultiTenant
+        {
+            return Err("host vsock listeners are disabled for multi-tenant deployments".into());
+        }
+        #[cfg(feature = "net")]
+        validate_ssh_guest_cid(self.guest_cid, self.network.as_ref())?;
+        Ok(())
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+/// Validate host-listener direction and route ownership before runtime mutations.
+pub fn validate_host_vsock_listeners(
+    listeners: &[HostVsockListener],
+    routes: &[VsockRouteSpec],
+) -> Result<(), String> {
+    if !cfg!(unix) && !listeners.is_empty() {
+        return Err("host vsock listeners require a Unix host".into());
+    }
+    let mut ports: HashSet<u32> = routes
+        .iter()
+        .filter(|route| route.socket_type == microsandbox_types::VsockSocketType::Stream)
+        .map(|route| route.port)
+        .collect();
+    let mut paths = HashSet::new();
+    for listener in listeners {
+        if !listener.host_socket.is_absolute() {
+            return Err("host vsock listener path must be absolute".into());
+        }
+        if listener.guest_port == 0 || listener.guest_port == u32::MAX {
+            return Err("host vsock listener port must be between 1 and 4294967294".into());
+        }
+        if !ports.insert(listener.guest_port) {
+            return Err(format!(
+                "duplicate vsock stream port {}",
+                listener.guest_port
+            ));
+        }
+        if !paths.insert(&listener.host_socket) {
+            return Err("duplicate host vsock listener path".into());
+        }
+    }
+    Ok(())
+}
+
+/// Refuse reserved vsock addresses, including the wildcard address.
+pub fn validate_guest_cid(cid: u32) -> Result<(), String> {
+    if cid < 3 || cid == u32::MAX {
+        return Err(format!("invalid guest CID {cid}: reserved vsock address"));
+    }
+    Ok(())
+}
+
+/// Require the SSH network context to name the exact CID assigned to libkrun.
+#[cfg(feature = "net")]
+pub fn validate_ssh_guest_cid(
+    cid: Option<u32>,
+    network: Option<&ResolvedNetworkConfig>,
+) -> Result<(), String> {
+    if let Some(binding) = network.and_then(ResolvedNetworkConfig::ssh_broker) {
+        let cid = cid.ok_or("SSH custody requires a host-reserved guest CID")?;
+        validate_guest_cid(cid)?;
+        if binding.transport_cid != u64::from(cid) {
+            return Err("SSH broker attribution does not match the assigned guest CID".into());
+        }
+    }
+    Ok(())
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn host_listeners_require_capability_without_changing_legacy_routes() {
+        let mut launch = LaunchConfig::default();
+        let required = [HOST_VSOCK_LISTEN_CAPABILITY.to_string()];
+        assert!(launch.validate_capabilities(&required).is_err());
+        launch.host_vsock_listeners.push(HostVsockListener {
+            host_socket: "/run/launch/service.sock".into(),
+            guest_port: 5000,
+        });
+        assert!(launch.validate_capabilities(&[]).is_err());
+        assert!(launch.validate_capabilities(&required).is_ok());
+        launch.guest_cid = Some(65_536);
+        assert!(launch.validate_capabilities(&required).is_err());
+        assert!(
+            launch
+                .validate_capabilities(&[
+                    HOST_VSOCK_LISTEN_CAPABILITY.into(),
+                    GUEST_CID_CAPABILITY.into()
+                ])
+                .is_ok()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_listener_validation_rejects_collisions_and_invalid_endpoints() {
+        use microsandbox_types::VsockSocketType;
+        let valid = HostVsockListener {
+            host_socket: "/run/launch/service.sock".into(),
+            guest_port: 5000,
+        };
+        for port in [0, u32::MAX] {
+            let invalid = HostVsockListener {
+                guest_port: port,
+                ..valid.clone()
+            };
+            assert!(validate_host_vsock_listeners(&[invalid], &[]).is_err());
+        }
+        let relative = HostVsockListener {
+            host_socket: "relative.sock".into(),
+            ..valid.clone()
+        };
+        assert!(validate_host_vsock_listeners(&[relative], &[]).is_err());
+        let other_port = HostVsockListener {
+            guest_port: 5001,
+            ..valid.clone()
+        };
+        assert!(validate_host_vsock_listeners(&[valid.clone(), other_port], &[]).is_err());
+        let other_path = HostVsockListener {
+            host_socket: "/run/other.sock".into(),
+            ..valid.clone()
+        };
+        assert!(validate_host_vsock_listeners(&[valid.clone(), other_path], &[]).is_err());
+        let mut route = VsockRouteSpec {
+            host_socket: "/run/outbound.sock".into(),
+            port: 5000,
+            socket_type: VsockSocketType::Stream,
+        };
+        assert!(
+            validate_host_vsock_listeners(std::slice::from_ref(&valid), &[route.clone()]).is_err()
+        );
+        route.socket_type = VsockSocketType::Dgram;
+        assert!(validate_host_vsock_listeners(&[valid], &[route]).is_ok());
+    }
+
+    #[cfg(all(unix, feature = "net"))]
+    #[test]
+    fn multi_tenant_launch_refuses_host_listener() {
+        let launch = LaunchConfig {
+            deployment_profile: DeploymentProfile::MultiTenant,
+            host_vsock_listeners: vec![HostVsockListener {
+                host_socket: "/run/launch/service.sock".into(),
+                guest_port: 5000,
+            }],
+            ..Default::default()
+        };
+        assert!(
+            launch
+                .validate_capabilities(&[HOST_VSOCK_LISTEN_CAPABILITY.into()])
+                .unwrap_err()
+                .contains("multi-tenant")
+        );
+    }
+
+    #[test]
+    fn guest_cid_requires_explicit_capability_and_valid_address() {
+        let mut launch = LaunchConfig::default();
+        let required = [GUEST_CID_CAPABILITY.to_string()];
+        assert!(launch.validate_capabilities(&[]).is_ok());
+        assert!(launch.validate_capabilities(&required).is_err());
+        assert!(
+            launch
+                .validate_capabilities(&["unknown-v2".into()])
+                .is_err()
+        );
+        for cid in [0, 1, 2, u32::MAX] {
+            launch.guest_cid = Some(cid);
+            assert!(launch.validate_capabilities(&required).is_err());
+        }
+        for cid in [3, 65_536, u32::MAX - 1] {
+            launch.guest_cid = Some(cid);
+            assert!(launch.validate_capabilities(&required).is_ok());
+            assert!(launch.validate_capabilities(&[]).is_err());
+        }
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn ssh_attribution_must_match_assigned_cid_not_a_network_slot() {
+        use microsandbox_network::ssh::{BrokerEndpoint, SshBrokerBinding};
+
+        let mut network = ResolvedNetworkConfig::default();
+        let endpoint = BrokerEndpoint::new("/run/test-broker.sock").unwrap();
+        network.set_ssh_broker(Some(SshBrokerBinding::new(endpoint, 65_536)));
+        assert!(validate_ssh_guest_cid(Some(65_536), Some(&network)).is_ok());
+        for cid in [None, Some(1), Some(3), Some(65_537), Some(u32::MAX)] {
+            assert!(validate_ssh_guest_cid(cid, Some(&network)).is_err());
+        }
+        assert!(validate_ssh_guest_cid(None, None).is_ok());
+    }
 }

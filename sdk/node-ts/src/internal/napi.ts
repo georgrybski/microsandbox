@@ -768,7 +768,7 @@ export interface NapiExecSink {
 }
 
 export interface NapiExecEvent {
-  readonly eventType: "started" | "stdout" | "stderr" | "exited";
+  readonly eventType: "started" | "stdout" | "stderr" | "exited" | "interrupted";
   readonly pid?: number;
   readonly data?: Buffer;
   readonly code?: number;
@@ -993,6 +993,7 @@ export interface NapiNetworkBuilder {
     configure: (b: NapiViolationActionBuilder) => NapiViolationActionBuilder,
   ): this;
   maxConnections(max: number): this;
+  strict(enabled: boolean): this;
   ipv4Pool(pool: string): this;
   ipv6Pool(pool: string): this;
   trustHostCAs(enabled: boolean): this;

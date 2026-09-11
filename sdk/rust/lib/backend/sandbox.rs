@@ -66,6 +66,10 @@ pub enum SandboxInner {
 pub struct SandboxLocalState {
     /// SQLite row id for this sandbox.
     pub db_id: i32,
+    /// Host-owned run bound to `client`; never changed when a clone reconnects.
+    pub launch: crate::sandbox::LocalLaunch,
+    /// Immutable lifecycle selection and retained process capability.
+    pub(crate) observation: crate::sandbox::LocalObservation,
     /// Owned libkrun process handle, when this `Sandbox` owns the lifecycle.
     pub handle: Option<Arc<tokio::sync::Mutex<ProcessHandle>>>,
     /// UDS connection to the in-VM agentd relay.
@@ -117,6 +121,10 @@ pub struct SandboxHandleLocalState {
     pub updated_at: Option<DateTime<Utc>>,
     /// Active sandbox process PID, if any.
     pub pid: Option<i32>,
+    /// Captured runtime incarnation, absent when no live run was observed.
+    pub launch: Option<crate::sandbox::LocalLaunch>,
+    /// Persisted generation selected by this receiver, also when stopped.
+    pub(crate) observation: crate::sandbox::LocalObservation,
 }
 
 /// Cloud handle state. Captures the snapshot msb-cloud returned at fetch time.
@@ -305,6 +313,33 @@ pub trait SandboxBackend: Send + Sync {
     // ============================================================
     // Exec
     // ============================================================
+
+    /// Execute on an already verified, immutable launch connection.
+    /// No sandbox-name lookup or automatic reconnect is permitted here.
+    fn exec_connected<'a>(
+        &'a self,
+        client: Arc<AgentClient>,
+        config: &'a SandboxConfig,
+        cmd: String,
+        opts: ExecOptions,
+    ) -> BoxFuture<'a, MicrosandboxResult<ExecOutput>> {
+        Box::pin(crate::sandbox::exec::agent::exec_connected(
+            client, config, cmd, opts,
+        ))
+    }
+
+    /// Open an exec session on an already verified launch connection.
+    fn exec_stream_connected<'a>(
+        &'a self,
+        client: Arc<AgentClient>,
+        config: &'a SandboxConfig,
+        cmd: String,
+        opts: ExecOptions,
+    ) -> BoxFuture<'a, MicrosandboxResult<ExecHandle>> {
+        Box::pin(crate::sandbox::exec::agent::exec_stream_connected(
+            client, config, cmd, opts, 24, 80,
+        ))
+    }
 
     /// Execute a command inside the named sandbox and wait for it to complete.
     fn exec<'a>(

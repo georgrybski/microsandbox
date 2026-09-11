@@ -56,3 +56,7 @@ __pycache__/
 env/
 venv/
 .venv/
+
+# devenv / direnv state (created by the downstream nix devshell)
+.devenv/
+.direnv/

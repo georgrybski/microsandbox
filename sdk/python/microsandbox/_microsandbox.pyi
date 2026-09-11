@@ -513,6 +513,9 @@ class ExecSink:
     async def close(self) -> None: ...
 
 class ExecEvent:
+    """Interrupted is terminal; data contains tagged reason/termination JSON,
+    and code is None. Unknown termination is never a successful exit.
+    """
     event_type: ExecEventType
     pid: int | None
     data: bytes | None

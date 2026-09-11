@@ -3,6 +3,7 @@ resolver = "3"
 exclude = ["sdk/rust/fuzz"]
 members = [
     "crates/agentd",
+    "crates/brokerd",
     "crates/cli",
     "crates/db",
     "crates/filesystem",
@@ -16,6 +17,7 @@ members = [
     "crates/migration",
     "crates/protocol",
     "crates/runtime",
+    "crates/scan",
     "crates/testing/init",
     "crates/testing/macros",
     "crates/testing/utils",
@@ -50,9 +52,14 @@ members = [
 [workspace.package]
 authors = ["Super Rad Company <development@superrad.company>"]
 repository = "https://github.com/superradcompany/microsandbox"
-version = "0.6.17"
+version = "0.6.18"
 license = "Apache-2.0"
 edition = "2024"
+
+[patch.crates-io]
+# Cargo patches belong to the consuming workspace, not its dependencies.
+# Keep the runtime and image backend on the same private-memory implementation.
+msb-vm-memory = { git = "https://github.com/superradcompany/rust-vmm", rev = "f798d4f274db22a3c458ba756900db2cd03e6fe9" }
 
 [profile.release]
 codegen-units = 1
@@ -77,22 +84,23 @@ strip = false
 # Exact (`=`) pins: these crates share private, unstable APIs across patch
 # releases, so every published version must resolve its siblings to the same
 # version. Caret would let an older release pull newer siblings and break.
-microsandbox = { version = "=0.6.17", path = "sdk/rust", default-features = false }
-microsandbox-agent-client = { version = "=0.6.17", path = "packages/agent-client/rust" }
-microsandbox-db = { version = "=0.6.17", path = "crates/db" }
-microsandbox-filesystem = { version = "=0.6.17", path = "crates/filesystem", default-features = false }
-microsandbox-image = { version = "=0.6.17", path = "crates/image" }
-microsandbox-metrics = { version = "=0.6.17", path = "crates/metrics" }
-microsandbox-types-macros = { version = "=0.6.17", path = "packages/microsandbox-types/macros" }
-microsandbox-types = { version = "=0.6.17", path = "packages/microsandbox-types/rust" }
-microsandbox-migration = { version = "=0.6.17", path = "crates/migration" }
-microsandbox-network = { version = "=0.6.17", path = "crates/network" }
-microsandbox-protocol = { version = "=0.6.17", path = "crates/protocol" }
-microsandbox-runtime = { version = "=0.6.17", path = "crates/runtime", default-features = false }
-microsandbox-utils = { version = "=0.6.17", path = "crates/utils" }
-microsandbox-vsock = { version = "=0.6.17", path = "crates/vsock" }
-msb_krun = "=0.1.32"
-msb_krun_utils = "=0.1.32"
+microsandbox = { version = "=0.6.18", path = "sdk/rust", default-features = false }
+microsandbox-agent-client = { version = "=0.6.18", path = "packages/agent-client/rust" }
+microsandbox-db = { version = "=0.6.18", path = "crates/db" }
+microsandbox-filesystem = { version = "=0.6.18", path = "crates/filesystem", default-features = false }
+microsandbox-image = { version = "=0.6.18", path = "crates/image" }
+microsandbox-metrics = { version = "=0.6.18", path = "crates/metrics" }
+microsandbox-types-macros = { version = "=0.6.18", path = "packages/microsandbox-types/macros" }
+microsandbox-types = { version = "=0.6.18", path = "packages/microsandbox-types/rust" }
+microsandbox-migration = { version = "=0.6.18", path = "crates/migration" }
+microsandbox-network = { version = "=0.6.18", path = "crates/network" }
+microsandbox-protocol = { version = "=0.6.18", path = "crates/protocol" }
+microsandbox-runtime = { version = "=0.6.18", path = "crates/runtime", default-features = false }
+microsandbox-scan = { version = "=0.6.18", path = "crates/scan" }
+microsandbox-utils = { version = "=0.6.18", path = "crates/utils" }
+microsandbox-vsock = { version = "=0.6.18", path = "crates/vsock" }
+msb_krun = { version = "=0.1.34", git = "https://github.com/rybskiworks/libkrun", rev = "5b81726df87807876e11939995df2eb6688be173" }
+msb_krun_utils = { version = "=0.1.34", git = "https://github.com/rybskiworks/libkrun", rev = "5b81726df87807876e11939995df2eb6688be173" }
 test-macros = { path = "crates/testing/macros" }
 test-utils = { path = "crates/testing/utils" }
 
@@ -115,6 +123,7 @@ crossterm = { version = "0.29.0", features = ["events"] }
 dirs = "6.0"
 etherparse = "0.19"
 flate2 = { version = "1.0", features = ["zlib-rs"] }
+globset = "0.4"
 futures = "0.3"
 futures-util = "0.3"
 hex = "0.4"

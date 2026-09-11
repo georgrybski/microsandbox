@@ -43,7 +43,11 @@ pub(crate) fn do_getattr(
 
     let st = match handle {
         Some(handle) => stat_handle(fs, handle)?,
-        None => inode::stat_inode(fs, ino)?,
+        None => {
+            #[cfg(target_os = "linux")]
+            super::read_policy::check_inode(fs, ino)?;
+            inode::stat_inode(fs, ino)?
+        }
     };
     Ok((st, fs.cfg.attr_timeout))
 }
@@ -62,6 +66,30 @@ pub(crate) fn do_setattr(
     }
     if fs.cfg.readonly() && setattr_mutates(valid) {
         return Err(platform::erofs());
+    }
+
+    #[cfg(target_os = "linux")]
+    if setattr_mutates(valid)
+        && let Some(policy) = fs.mask_policy()
+        && let Some(path) = inode::lexical_inode_path(fs, ino)
+        && let Ok(path) = super::mount_policy::LexicalPath::new(&path)
+    {
+        if policy.is_protected(&path) {
+            return Err(platform::eacces());
+        }
+        if matches!(
+            policy.decide_write(&path).decision,
+            super::mount_policy::WriteDecision::Deny
+        ) {
+            return Err(platform::eacces());
+        }
+        if matches!(
+            policy.decide(&path).decision,
+            super::mount_policy::Decision::Masked
+        ) && !fs.tagged_visible_for_inode(ino)
+        {
+            return Err(platform::enoent());
+        }
     }
 
     // With xattr-overlay disabled, the only honest answer to a uid/gid change
@@ -273,6 +301,12 @@ pub(crate) fn do_access(fs: &PassthroughFs, ctx: Context, ino: u64, mask: u32) -
     if fs.is_virtual_init_inode(ino) {
         // init.krun is always readable and executable.
         return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    if mask == platform::ACCESS_F_OK || mask & (platform::ACCESS_R_OK | platform::ACCESS_X_OK) != 0
+    {
+        super::read_policy::check_inode(fs, ino)?;
     }
 
     let st = inode::stat_inode(fs, ino)?;

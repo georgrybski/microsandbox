@@ -550,7 +550,26 @@ impl DynFileSystem for SingleFileFs {
         }
         // Plain readdir does not create a kernel lookup reference, so refresh
         // only the façade-owned current-inode pin.
-        self.refresh_file(ctx)?;
+        // Masked single file → empty synthetic mount (policy decision), so guests see
+        // dot entries rather than EIO.
+        let masked = match self.refresh_file(ctx) {
+            Ok(_) => false,
+            Err(e)
+                if e.raw_os_error() == Some(LINUX_ENOENT)
+                    || e.kind() == io::ErrorKind::NotFound =>
+            {
+                true
+            }
+            Err(e) => return Err(e),
+        };
+        if masked {
+            return Ok(self
+                .root_entries()
+                .into_iter()
+                .take(2)
+                .skip(offset as usize)
+                .collect());
+        }
         Ok(self
             .root_entries()
             .into_iter()
@@ -569,7 +588,23 @@ impl DynFileSystem for SingleFileFs {
         if inode != ROOT_INODE || handle != ROOT_HANDLE {
             return Err(linux_error(LINUX_EBADF));
         }
-        let file_entry = self.lookup_file(ctx)?;
+        // Masked single file → empty synthetic mount (policy decision), so guests see
+        // dot entries rather than EIO.
+        let file_entry = match self.lookup_file(ctx) {
+            Ok(entry) => entry,
+            Err(e)
+                if e.raw_os_error() == Some(LINUX_ENOENT)
+                    || e.kind() == io::ErrorKind::NotFound =>
+            {
+                let mut dir_entries = self.root_entries().into_iter();
+                let entries = vec![
+                    (dir_entries.next().unwrap(), root_entry()),
+                    (dir_entries.next().unwrap(), root_entry()),
+                ];
+                return Ok(entries.into_iter().skip(offset as usize).collect());
+            }
+            Err(e) => return Err(e),
+        };
         let mut dir_entries = self.root_entries().into_iter();
         let entries = vec![
             (dir_entries.next().unwrap(), root_entry()),
@@ -860,7 +895,7 @@ mod tests {
         // Linux may issue OPEN against the cached old node ID without another
         // LOOKUP. A new descriptor must still follow the selected pathname.
         let (replacement_attr, _) = fs.getattr(context(), old_entry.inode, None).unwrap();
-        assert_eq!(replacement_attr.st_size, b"new contents".len() as _);
+        assert_eq!(replacement_attr.st_size, b"new contents".len() as i64);
         let (cached_handle, _) = fs.open(context(), old_entry.inode, false, 0).unwrap();
         let cached_handle = cached_handle.unwrap();
         let mut cached_writer = CaptureWriter { bytes: Vec::new() };
@@ -972,5 +1007,689 @@ mod tests {
         )
         .unwrap();
         fs.forget(context(), new_entry.inode, 1);
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // Policy helpers (unix-only) — copied from passthroughfs/unix/tests/test_mount_policy.rs
+    //----------------------------------------------------------------------------------------------
+
+    #[cfg(unix)]
+    const LINUX_O_RDONLY: u32 = 0;
+    #[cfg(unix)]
+    const LINUX_O_RDWR: u32 = 2;
+    #[cfg(unix)]
+    const LINUX_ENOSPC: i32 = 28;
+
+    #[cfg(unix)]
+    fn policy_program(
+        mask: &[&str],
+        unmask: &[&str],
+    ) -> crate::backends::passthroughfs::mount_policy::MountPolicyProgram {
+        use crate::backends::passthroughfs::mount_policy::{
+            CaseSensitivity, CompiledRuleSet, MountPolicyProgram, PathPolicyRule, Pattern,
+            RuleEffect, RuleOrigin, ScopeKind,
+        };
+        use std::path::PathBuf;
+        let origin = RuleOrigin {
+            layer: "test".to_string(),
+            file: PathBuf::from("test.json"),
+            scope_kind: ScopeKind::Workload,
+        };
+        let rules = mask
+            .iter()
+            .map(|pattern| PathPolicyRule {
+                effect: RuleEffect::Mask,
+                pattern: Pattern::parse(pattern).unwrap(),
+                overridable: true,
+                origin: origin.clone(),
+            })
+            .chain(unmask.iter().map(|pattern| PathPolicyRule {
+                effect: RuleEffect::Unmask,
+                pattern: Pattern::parse(pattern).unwrap(),
+                overridable: true,
+                origin: origin.clone(),
+            }))
+            .collect();
+        MountPolicyProgram {
+            version: 1,
+            rules,
+            protect: Vec::new(),
+            writes: CompiledRuleSet::default(),
+            case_sensitivity: CaseSensitivity::Sensitive,
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_rule(
+        pattern: &str,
+        scope_kind: crate::backends::passthroughfs::mount_policy::ScopeKind,
+        overridable: bool,
+    ) -> crate::backends::passthroughfs::mount_policy::PathPolicyRule {
+        use crate::backends::passthroughfs::mount_policy::{
+            PathPolicyRule, Pattern, RuleEffect, RuleOrigin,
+        };
+        use std::path::PathBuf;
+        PathPolicyRule {
+            effect: RuleEffect::Mask,
+            pattern: Pattern::parse(pattern).unwrap(),
+            overridable,
+            origin: RuleOrigin {
+                layer: "test".to_string(),
+                file: PathBuf::from("test.json"),
+                scope_kind,
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_program(
+        protect: &[&str],
+        allow: &[(
+            &str,
+            crate::backends::passthroughfs::mount_policy::ScopeKind,
+            bool,
+        )],
+        deny: &[(
+            &str,
+            crate::backends::passthroughfs::mount_policy::ScopeKind,
+            bool,
+        )],
+    ) -> crate::backends::passthroughfs::mount_policy::MountPolicyProgram {
+        use crate::backends::passthroughfs::mount_policy::{
+            CaseSensitivity, CompiledRuleSet, MountPolicyProgram,
+        };
+        MountPolicyProgram {
+            version: 1,
+            rules: Vec::new(),
+            protect: protect
+                .iter()
+                .map(|pattern| {
+                    write_rule(
+                        pattern,
+                        crate::backends::passthroughfs::mount_policy::ScopeKind::Workload,
+                        true,
+                    )
+                })
+                .collect(),
+            writes: CompiledRuleSet {
+                allow: allow
+                    .iter()
+                    .map(|(pattern, scope_kind, overridable)| {
+                        write_rule(pattern, *scope_kind, *overridable)
+                    })
+                    .collect(),
+                deny: deny
+                    .iter()
+                    .map(|(pattern, scope_kind, overridable)| {
+                        write_rule(pattern, *scope_kind, *overridable)
+                    })
+                    .collect(),
+            },
+            case_sensitivity: CaseSensitivity::Sensitive,
+        }
+    }
+
+    #[cfg(unix)]
+    struct SliceReader<'a> {
+        data: &'a [u8],
+        pos: usize,
+    }
+
+    #[cfg(unix)]
+    impl<'a> SliceReader<'a> {
+        fn new(data: &'a [u8]) -> Self {
+            Self { data, pos: 0 }
+        }
+    }
+
+    #[cfg(unix)]
+    impl<'a> crate::ZeroCopyReader for SliceReader<'a> {
+        fn read_to(
+            &mut self,
+            file: &std::fs::File,
+            count: usize,
+            offset: u64,
+        ) -> io::Result<usize> {
+            use std::os::fd::AsRawFd;
+            let remaining = &self.data[self.pos..];
+            let to_write = std::cmp::min(count, remaining.len());
+            if to_write == 0 {
+                return Ok(0);
+            }
+            let n = unsafe {
+                libc::pwrite(
+                    file.as_raw_fd(),
+                    remaining.as_ptr() as *const libc::c_void,
+                    to_write,
+                    offset as i64,
+                )
+            };
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let n = n as usize;
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // T1 [P0] no-policy regression — absent mask_policy is byte-identical to default
+    //----------------------------------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn t1_no_policy_regression_lookup_read_readdir_byte_identical_to_default() {
+        // Mirrors PassthroughFs test `absent_mask_policy_is_byte_identical_to_default` (test_mount_policy.rs:78).
+        // Both an explicit `mask_policy = None` and the default `PassthroughConfig::default()` must
+        // expose the file identically: lookup succeeds, read returns bytes, readdir has 3 entries.
+        let make_fs = |explicit_none: bool| {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("visible.txt");
+            std::fs::write(&source, b"hello world").unwrap();
+            let cfg = if explicit_none {
+                let mut c = PassthroughConfig::default();
+                c.mask_policy = None;
+                c
+            } else {
+                PassthroughConfig::default()
+            };
+            let fs = SingleFileFs::new(source.clone(), "visible.txt".to_string(), cfg).unwrap();
+            fs.init(FsOptions::empty()).unwrap();
+            (temp, fs)
+        };
+
+        let (_tmp_explicit, fs_explicit) = make_fs(true);
+        let (_tmp_default, fs_default) = make_fs(false);
+
+        for fs in [&fs_explicit, &fs_default] {
+            let entry = fs.lookup(context(), ROOT_INODE, c"visible.txt").unwrap();
+            let (handle, _) = fs
+                .open(context(), entry.inode, false, LINUX_O_RDONLY)
+                .unwrap();
+            let handle = handle.unwrap();
+            let mut writer = CaptureWriter { bytes: Vec::new() };
+            fs.read(context(), entry.inode, handle, &mut writer, 64, 0, None, 0)
+                .unwrap();
+            assert_eq!(writer.bytes, b"hello world");
+            fs.release(context(), entry.inode, 0, handle, false, false, None)
+                .unwrap();
+
+            let (dir_handle, _) = fs.opendir(context(), ROOT_INODE, 0).unwrap();
+            let entries = fs
+                .readdir(context(), ROOT_INODE, dir_handle.unwrap(), 4096, 0)
+                .unwrap();
+            let names: Vec<_> = entries.iter().map(|e| e.name).collect();
+            assert_eq!(names, vec![b".".as_slice(), b"..", b"visible.txt"]);
+            assert_eq!(entries.len(), 3);
+            // getattr on ROOT must succeed even when no policy is configured.
+            fs.getattr(context(), ROOT_INODE, None).unwrap();
+            fs.forget(context(), entry.inode, 1);
+        }
+
+        // Explicit byte-identical comparison of readdir names between the two configurations.
+        let (_tmp_a, fs_a) = {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("a.txt");
+            std::fs::write(&source, b"x").unwrap();
+            let mut cfg = PassthroughConfig::default();
+            cfg.mask_policy = None;
+            let fs = SingleFileFs::new(source.clone(), "a.txt".to_string(), cfg).unwrap();
+            fs.init(FsOptions::empty()).unwrap();
+            (temp, fs)
+        };
+        let (_tmp_b, fs_b) = {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("a.txt");
+            std::fs::write(&source, b"x").unwrap();
+            let fs = SingleFileFs::new(
+                source.clone(),
+                "a.txt".to_string(),
+                PassthroughConfig::default(),
+            )
+            .unwrap();
+            fs.init(FsOptions::empty()).unwrap();
+            (temp, fs)
+        };
+        let names_a = {
+            let (h, _) = fs_a.opendir(context(), ROOT_INODE, 0).unwrap();
+            let mut v: Vec<Vec<u8>> = fs_a
+                .readdir(context(), ROOT_INODE, h.unwrap(), 4096, 0)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name.to_vec())
+                .collect();
+            v.sort();
+            v
+        };
+        let names_b = {
+            let (h, _) = fs_b.opendir(context(), ROOT_INODE, 0).unwrap();
+            let mut v: Vec<Vec<u8>> = fs_b
+                .readdir(context(), ROOT_INODE, h.unwrap(), 4096, 0)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name.to_vec())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names_a, names_b);
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // T2 [P1] masked_single_file_is_empty_dir — host-basename semantics
+    //----------------------------------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn t2_masked_single_file_is_empty_dir_host_basename() {
+        use std::sync::Arc;
+        // Host file is "secret.env", guest name is "config.env" (different) to prove that the
+        // mask policy is evaluated against the HOST basename, not the guest name. See spec note:
+        // "guest 'config.env' ≠ host 'secret.env', pattern on 'secret.env' still masks."
+        let temp = tempfile::tempdir().unwrap();
+        let host_path = temp.path().join("secret.env");
+        std::fs::write(&host_path, b"super-secret").unwrap();
+
+        let policy = Arc::new(policy_program(&["secret.env"], &[]));
+        let fs = SingleFileFs::new(
+            host_path.clone(),
+            "config.env".to_string(),
+            PassthroughConfig {
+                mask_policy: Some(policy),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+
+        // Lookup of the guest entry must be ENOENT when the host basename is masked.
+        let err = match fs.lookup(context(), ROOT_INODE, c"config.env") {
+            Ok(_) => panic!("masked lookup must be ENOENT"),
+            Err(e) => e,
+        };
+        assert_eq!(err.raw_os_error(), Some(LINUX_ENOENT));
+
+        // readdir must return ONLY [".", ".."] (empty synthetic mount), not the masked file.
+        let (dir_handle, _) = fs.opendir(context(), ROOT_INODE, 0).unwrap();
+        let entries = fs
+            .readdir(context(), ROOT_INODE, dir_handle.unwrap(), 4096, 0)
+            .unwrap();
+        let names: Vec<_> = entries.iter().map(|e| e.name).collect();
+        assert_eq!(
+            names,
+            vec![b".".as_slice(), b".."],
+            "masked file must not appear in readdir"
+        );
+        assert_eq!(entries.len(), 2);
+
+        // readdirplus must similarly return only dot entries.
+        let (dir_handle2, _) = fs.opendir(context(), ROOT_INODE, 0).unwrap();
+        let plus = fs
+            .readdirplus(context(), ROOT_INODE, dir_handle2.unwrap(), 4096, 0)
+            .unwrap();
+        assert_eq!(plus.len(), 2);
+        assert_eq!(plus[0].0.name, b".");
+        assert_eq!(plus[1].0.name, b"..");
+
+        // getattr(ROOT) must remain accessible and must not panic.
+        let (st, _) = fs.getattr(context(), ROOT_INODE, None).unwrap();
+        assert_ne!(st.st_mode & S_IFDIR as u32, 0);
+
+        // Offset handling on masked mount must still be correct (skip dots).
+        let (dir_handle3, _) = fs.opendir(context(), ROOT_INODE, 0).unwrap();
+        let tail = fs
+            .readdir(context(), ROOT_INODE, dir_handle3.unwrap(), 4096, 1)
+            .unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].name, b"..");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn t2_masked_single_file_is_empty_dir_guest_equals_host() {
+        use std::sync::Arc;
+        // Variant where guest == host basename; both must be masked.
+        let temp = tempfile::tempdir().unwrap();
+        let host_path = temp.path().join("secret.env");
+        std::fs::write(&host_path, b"super-secret").unwrap();
+
+        let policy = Arc::new(policy_program(&["secret.env"], &[]));
+        let fs = SingleFileFs::new(
+            host_path.clone(),
+            "secret.env".to_string(),
+            PassthroughConfig {
+                mask_policy: Some(policy),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+
+        let err = match fs.lookup(context(), ROOT_INODE, c"secret.env") {
+            Ok(_) => panic!("masked lookup must be ENOENT"),
+            Err(e) => e,
+        };
+        assert_eq!(err.raw_os_error(), Some(LINUX_ENOENT));
+
+        let (dir_handle, _) = fs.opendir(context(), ROOT_INODE, 0).unwrap();
+        let entries = fs
+            .readdir(context(), ROOT_INODE, dir_handle.unwrap(), 4096, 0)
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        fs.getattr(context(), ROOT_INODE, None).unwrap();
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // T3 [P1] write_deny_on_file — writes.deny on host basename blocks WRONLY/RDWR, allows RDONLY
+    //----------------------------------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn t3_write_deny_on_file_blocks_write_allows_read() {
+        use crate::backends::passthroughfs::mount_policy::ScopeKind;
+        use std::sync::Arc;
+        // Host file "data.txt" with contents "hello", guest name "data.txt".
+        // Policy denies writes on host basename "data.txt" with writes.deny.
+        let temp = tempfile::tempdir().unwrap();
+        let host_path = temp.path().join("data.txt");
+        std::fs::write(&host_path, b"hello").unwrap();
+
+        let policy = Arc::new(write_program(
+            &[],
+            &[],
+            &[("data.txt", ScopeKind::Workload, true)],
+        ));
+        let fs = SingleFileFs::new(
+            host_path.clone(),
+            "data.txt".to_string(),
+            PassthroughConfig {
+                readonly: false,
+                mask_policy: Some(policy),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+
+        let entry = fs.lookup(context(), ROOT_INODE, c"data.txt").unwrap();
+
+        // O_RDONLY must succeed and read must return bytes.
+        let (ro_handle, _) = fs
+            .open(context(), entry.inode, false, LINUX_O_RDONLY)
+            .unwrap();
+        let ro_handle = ro_handle.unwrap();
+        let mut writer = CaptureWriter { bytes: Vec::new() };
+        fs.read(
+            context(),
+            entry.inode,
+            ro_handle,
+            &mut writer,
+            64,
+            0,
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(writer.bytes, b"hello");
+        fs.release(context(), entry.inode, 0, ro_handle, false, false, None)
+            .unwrap();
+
+        // O_WRONLY must be denied with EACCES.
+        let err = fs
+            .open(context(), entry.inode, false, LINUX_O_WRONLY)
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(LINUX_EACCES));
+
+        // O_RDWR must be denied with EACCES.
+        let err = fs
+            .open(context(), entry.inode, false, LINUX_O_RDWR)
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(LINUX_EACCES));
+
+        // Regression: same without policy — write succeeds.
+        let temp2 = tempfile::tempdir().unwrap();
+        let host2 = temp2.path().join("data.txt");
+        std::fs::write(&host2, b"hello").unwrap();
+        let fs2 = SingleFileFs::new(
+            host2.clone(),
+            "data.txt".to_string(),
+            PassthroughConfig::default(),
+        )
+        .unwrap();
+        fs2.init(FsOptions::empty()).unwrap();
+        let entry2 = fs2.lookup(context(), ROOT_INODE, c"data.txt").unwrap();
+        let (whandle, _) = fs2
+            .open(context(), entry2.inode, false, LINUX_O_WRONLY)
+            .unwrap();
+        let whandle = whandle.unwrap();
+        let mut reader = SliceReader::new(b" world");
+        let n = fs2
+            .write(
+                context(),
+                entry2.inode,
+                whandle,
+                &mut reader,
+                6,
+                5,
+                None,
+                false,
+                false,
+                0,
+            )
+            .unwrap();
+        assert_eq!(n, 6);
+        fs2.release(context(), entry2.inode, 0, whandle, false, false, None)
+            .unwrap();
+        // Verify readback.
+        let (rhandle, _) = fs2
+            .open(context(), entry2.inode, false, LINUX_O_RDONLY)
+            .unwrap();
+        let rhandle = rhandle.unwrap();
+        let mut writer2 = CaptureWriter { bytes: Vec::new() };
+        fs2.read(
+            context(),
+            entry2.inode,
+            rhandle,
+            &mut writer2,
+            64,
+            0,
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(writer2.bytes, b"hello world");
+        fs2.release(context(), entry2.inode, 0, rhandle, false, false, None)
+            .unwrap();
+        fs2.forget(context(), entry2.inode, 1);
+
+        fs.forget(context(), entry.inode, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn t3_write_deny_host_basename_semantics_different_guest_name() {
+        use crate::backends::passthroughfs::mount_policy::ScopeKind;
+        use std::sync::Arc;
+        // Prove host-basename semantics for writes.deny as well: host "data.txt",
+        // guest "config.txt" — deny on "data.txt" must still block writes to "config.txt".
+        let temp = tempfile::tempdir().unwrap();
+        let host_path = temp.path().join("data.txt");
+        std::fs::write(&host_path, b"hello").unwrap();
+        let policy = Arc::new(write_program(
+            &[],
+            &[],
+            &[("data.txt", ScopeKind::Workload, true)],
+        ));
+        let fs = SingleFileFs::new(
+            host_path.clone(),
+            "config.txt".to_string(),
+            PassthroughConfig {
+                readonly: false,
+                mask_policy: Some(policy),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+        let entry = fs.lookup(context(), ROOT_INODE, c"config.txt").unwrap();
+        // read allowed
+        let (h, _) = fs
+            .open(context(), entry.inode, false, LINUX_O_RDONLY)
+            .unwrap();
+        fs.release(context(), entry.inode, 0, h.unwrap(), false, false, None)
+            .unwrap();
+        // write denied
+        let err = fs
+            .open(context(), entry.inode, false, LINUX_O_WRONLY)
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(LINUX_EACCES));
+        fs.forget(context(), entry.inode, 1);
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // T5 [P2] quota+policy coexist on file mount — quota_bytes + mask_policy no-op
+    //----------------------------------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn t5_quota_and_policy_coexist_on_file_mount_no_interference() {
+        use std::sync::Arc;
+        // quota_bytes Some (1 MiB) + mask_policy Some with unrelated pattern "other.txt"
+        // must remain no-op on the visible file: lookup succeeds, readdir 3 entries, etc.
+        let temp = tempfile::tempdir().unwrap();
+        let host_path = temp.path().join("visible.txt");
+        std::fs::write(&host_path, b"visible content").unwrap();
+
+        let policy = Arc::new(policy_program(&["other.txt"], &[]));
+        let fs = SingleFileFs::new(
+            host_path.clone(),
+            "visible.txt".to_string(),
+            PassthroughConfig {
+                quota_bytes: Some(1 * 1024 * 1024),
+                mask_policy: Some(policy),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+
+        let entry = fs.lookup(context(), ROOT_INODE, c"visible.txt").unwrap();
+
+        let (dir_handle, _) = fs.opendir(context(), ROOT_INODE, 0).unwrap();
+        let entries = fs
+            .readdir(context(), ROOT_INODE, dir_handle.unwrap(), 4096, 0)
+            .unwrap();
+        assert_eq!(entries.len(), 3);
+        let names: Vec<_> = entries.iter().map(|e| e.name).collect();
+        assert_eq!(names, vec![b".".as_slice(), b"..", b"visible.txt"]);
+
+        // getattr ROOT ok
+        fs.getattr(context(), ROOT_INODE, None).unwrap();
+        // getattr file ok
+        let (attr, _) = fs.getattr(context(), entry.inode, None).unwrap();
+        assert!(attr.st_size > 0);
+
+        // read succeeds
+        let (handle, _) = fs
+            .open(context(), entry.inode, false, LINUX_O_RDONLY)
+            .unwrap();
+        let handle = handle.unwrap();
+        let mut writer = CaptureWriter { bytes: Vec::new() };
+        fs.read(context(), entry.inode, handle, &mut writer, 64, 0, None, 0)
+            .unwrap();
+        assert_eq!(writer.bytes, b"visible content");
+        fs.release(context(), entry.inode, 0, handle, false, false, None)
+            .unwrap();
+
+        // write within quota must succeed (quota enforcement doesn't break policy no-op)
+        let (whandle, _) = fs
+            .open(context(), entry.inode, false, LINUX_O_WRONLY)
+            .unwrap();
+        let whandle = whandle.unwrap();
+        let mut reader = SliceReader::new(b" appended");
+        let n = fs
+            .write(
+                context(),
+                entry.inode,
+                whandle,
+                &mut reader,
+                9,
+                15,
+                None,
+                false,
+                false,
+                0,
+            )
+            .unwrap();
+        assert_eq!(n, 9);
+        fs.release(context(), entry.inode, 0, whandle, false, false, None)
+            .unwrap();
+
+        // readdir still 3 after write
+        let (dir_handle2, _) = fs.opendir(context(), ROOT_INODE, 0).unwrap();
+        let entries2 = fs
+            .readdir(context(), ROOT_INODE, dir_handle2.unwrap(), 4096, 0)
+            .unwrap();
+        assert_eq!(entries2.len(), 3);
+
+        // lookup of unrelated masked name must still be ENOENT (guest only exposes visible.txt)
+        // and unrelated pattern must not leak.
+        let err = match fs.lookup(context(), ROOT_INODE, c"other.txt") {
+            Ok(_) => panic!("other.txt lookup must be ENOENT"),
+            Err(e) => e,
+        };
+        assert_eq!(err.raw_os_error(), Some(LINUX_ENOENT));
+
+        fs.forget(context(), entry.inode, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn t5_quota_policy_noop_still_enforces_quota() {
+        use std::sync::Arc;
+        // Ensure quota is still enforced when policy is a no-op: write past limit -> ENOSPC.
+        let temp = tempfile::tempdir().unwrap();
+        let host_path = temp.path().join("visible.txt");
+        std::fs::write(&host_path, b"hi").unwrap();
+        let policy = Arc::new(policy_program(&["ghost.txt"], &[]));
+        let limit = 1024u64;
+        let fs = SingleFileFs::new(
+            host_path.clone(),
+            "visible.txt".to_string(),
+            PassthroughConfig {
+                quota_bytes: Some(limit),
+                mask_policy: Some(policy),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+        let entry = fs.lookup(context(), ROOT_INODE, c"visible.txt").unwrap();
+        let (handle, _) = fs
+            .open(context(), entry.inode, false, LINUX_O_WRONLY)
+            .unwrap();
+        let handle = handle.unwrap();
+        // Try to grow far beyond quota — should get ENOSPC.
+        let big = vec![0u8; (limit + 1024) as usize];
+        let mut reader = SliceReader::new(&big);
+        let err = fs
+            .write(
+                context(),
+                entry.inode,
+                handle,
+                &mut reader,
+                big.len() as u32,
+                0,
+                None,
+                false,
+                false,
+                0,
+            )
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(LINUX_ENOSPC));
+        fs.release(context(), entry.inode, 0, handle, false, false, None)
+            .unwrap();
+        fs.forget(context(), entry.inode, 1);
     }
 }

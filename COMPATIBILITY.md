@@ -140,7 +140,34 @@ Compatibility-sensitive elements include descriptor numbers, ownership and close
 
 Sources: [`crates/runtime/lib/launch.rs`](crates/runtime/lib/launch.rs), [`crates/runtime/lib/vm.rs`](crates/runtime/lib/vm.rs), [`sdk/rust/lib/runtime/spawn.rs`](sdk/rust/lib/runtime/spawn.rs), and [`crates/cli/lib/sandbox_cmd.rs`](crates/cli/lib/sandbox_cmd.rs).
 
-This protocol has no explicit version envelope. Treat additions as optional and consider adding explicit version or capability negotiation before allowing independently versioned launchers and runtimes.
+This protocol has no explicit version envelope. Security-critical additions use
+repeatable `--require-launch-capability` argv entries. Unknown requirements fail
+before runtime state is created; runtimes predating this flag refuse it during
+argument parsing. `guest-cid-v1` requires an explicit host-reserved `guest_cid` in
+the launch payload. The runtime validates its range, assigns it to libkrun and
+checks the getter before guest execution. SSH broker attribution must equal
+that CID, never a network allocation slot. A CID alone is not instance/generation
+authorization, and these checks do not change the legacy divert wire format.
+
+Older launches without a requested CID or SSH broker binding remain supported.
+An old launcher that supplies only the former slot-based broker binding is
+refused. Supervisors must reserve and pass a CID before enabling custody; there
+is no compatibility fallback to slot identity. The reservation is transient,
+not serialized into the durable sandbox spec or inherited on restart.
+
+`host-vsock-listen-v1` similarly requires a nonempty transient
+`host_vsock_listeners` payload. It selects libkrun's existing host-listen
+direction; durable `VsockRouteSpec` remains guest-to-host. The SDK must supply
+fresh host-owned paths for each launch/replacement. Old runtimes reject the
+unknown requirement before interpreting the payload. Cloud, Windows and
+multi-tenant deployments refuse this host-only setting. Unix stream ports
+cannot collide across the two directions; datagram ports remain independent.
+
+The pinned libkrun binds listeners synchronously and checks ownership on
+reactivation. Normal exit retires listeners through the existing VMM exit
+observer; forced termination may leave a stale pathname, which is never unlinked
+automatically to permit another launch. Transport binding does not replace the
+guest application readiness handshake or establish original workload identity.
 
 ## 6. Database, Configuration, and Migration History
 
@@ -237,6 +264,12 @@ Compatibility-sensitive elements include vsock port and route configuration, str
 Sources: [`crates/vsock/lib/stream.rs`](crates/vsock/lib/stream.rs), [`crates/vsock/lib/dgram.rs`](crates/vsock/lib/dgram.rs), [`crates/runtime/lib/vm.rs`](crates/runtime/lib/vm.rs), and [`sdk/rust/lib/sandbox/ssh.rs`](sdk/rust/lib/sandbox/ssh.rs).
 
 Use standards-compliant clients in tests and exercise connections against older running agentd versions when changing the adapter-to-agent mapping.
+
+The broker guest's divert listener accepts only a complete kernel-reported
+`AF_VSOCK` peer address with the host CID. Direct guest/local peers are refused
+before any prelude or SSH bytes are read. This verifies the host-to-broker hop,
+not the original workload: instance, generation and credential policy still
+require independent validation of the host-provided session context.
 
 ## 15. Metrics Shared-Memory ABI
 

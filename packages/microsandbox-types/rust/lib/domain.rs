@@ -397,6 +397,9 @@ pub enum VolumeMount {
         /// contents. `None` applies the protective default at spawn time; set a
         /// value to override it.
         quota_mib: Option<u32>,
+        /// Optional path to a compiled mount path-policy program JSON file (spec 22 §12), confined
+        /// to the approved host state directory at load time. `None` means no masking.
+        mount_policy: Option<PathBuf>,
     },
 
     /// Mount a named volume into the guest.
@@ -574,6 +577,9 @@ pub struct NetworkSpec {
     #[config_patch(nested)]
     pub tls: Option<TlsConfig>,
 
+    /// Require hostname-based policy allows to use inspectable application authority.
+    pub strict: bool,
+
     /// Secret injection subdocument.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[config_patch(nested)]
@@ -594,6 +600,14 @@ pub struct NetworkSpec {
     ///
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outbound_proxy: Option<OutboundProxy>,
+
+    /// SSH egress policy subdocument.
+    ///
+    /// Guest-visible policy only (strict mode plus grants). The broker
+    /// unix-socket path is host-side and never appears here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[config_patch(nested)]
+    pub ssh: Option<SshConfig>,
 }
 
 /// Proxy configuration for outbound sandbox connections.
@@ -635,6 +649,41 @@ pub struct Socks5Credentials {
 
     /// Host-side source for the SOCKS5 authentication password.
     pub password: SecretSource,
+}
+
+/// SSH egress policy configuration. Carried in [`NetworkSpec::ssh`](NetworkSpec).
+///
+/// Guest-visible policy only: confinement mode plus the allowance set. The
+/// broker unix-socket path is host-side and never appears here; the local
+/// network engine joins this view with its host-side broker endpoint at
+/// runtime.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigPatch)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(default)]
+pub struct SshConfig {
+    /// When true, SSH to non-granted destinations is denied even if generic
+    /// TCP egress allows it.
+    pub strict: bool,
+    /// SSH allowances consulted for divert and strict-deny.
+    pub grants: Vec<SshGrant>,
+    /// Deny strength for SSH violations.
+    pub on_violation: ViolationAction,
+}
+
+/// One SSH allowance: a host pattern plus the ports it covers.
+///
+/// An empty `ports` set matches any port, mirroring [`Rule`] port
+/// semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SshGrant {
+    /// Host pattern this grant covers.
+    pub host: HostPattern,
+    /// Port ranges this grant covers (empty means any port).
+    #[serde(default)]
+    pub ports: Vec<PortRange>,
 }
 
 /// A published port mapping between host and guest.
@@ -919,6 +968,16 @@ pub struct SandboxResources {
     /// Guest transparent huge-page policy selected at boot.
     #[serde(default, skip_serializing_if = "TransparentHugePagePolicy::is_madvise")]
     pub thp: TransparentHugePagePolicy,
+
+    /// Enable nested virtualization for the guest (Linux x86_64 only).
+    ///
+    /// Defaults to `false`: guests receive no nested CPU capability unless
+    /// the caller opts in. When `true`, the VMM presents the host's nested
+    /// virtualization capability to the guest CPU. The guest kernel still
+    /// needs KVM support in the bundled firmware (libkrunfw `CONFIG_KVM`)
+    /// to expose `/dev/kvm`; this flag alone yields CPU capability only.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub nested_virt: bool,
 }
 
 /// Controls how Microsandbox places vCPU threads on host processors.
@@ -1600,6 +1659,7 @@ impl Default for SandboxResources {
             cpu_placement: CpuPlacement::Inherit,
             placement_profile: None,
             thp: TransparentHugePagePolicy::Madvise,
+            nested_virt: false,
         }
     }
 }
@@ -1623,6 +1683,8 @@ impl<'de> Deserialize<'de> for SandboxResources {
             placement_profile: Option<String>,
             #[serde(default)]
             thp: TransparentHugePagePolicy,
+            #[serde(default)]
+            nested_virt: bool,
         }
 
         let raw = RawResources::deserialize(deserializer)?;
@@ -1637,6 +1699,7 @@ impl<'de> Deserialize<'de> for SandboxResources {
             cpu_placement: raw.cpu_placement,
             placement_profile: raw.placement_profile,
             thp: raw.thp,
+            nested_virt: raw.nested_virt,
         })
     }
 }
@@ -1701,11 +1764,13 @@ impl Default for NetworkSpec {
             policy: None,
             dns: None,
             tls: None,
+            strict: false,
             secrets: None,
             max_connections: None,
             rate_limiter: None,
             trust_host_cas: false,
             outbound_proxy: None,
+            ssh: None,
         }
     }
 }
@@ -1761,8 +1826,9 @@ impl Serialize for VolumeMount {
                 host_permissions,
                 follow_root_symlinks,
                 quota_mib,
+                mount_policy,
             } => {
-                let mut map = serializer.serialize_map(Some(8))?;
+                let mut map = serializer.serialize_map(Some(9))?;
                 map.serialize_entry("type", "Bind")?;
                 map.serialize_entry("host", host)?;
                 map.serialize_entry("guest", guest)?;
@@ -1771,6 +1837,7 @@ impl Serialize for VolumeMount {
                 map.serialize_entry("host_permissions", host_permissions)?;
                 map.serialize_entry("follow_root_symlinks", follow_root_symlinks)?;
                 map.serialize_entry("quota_mib", quota_mib)?;
+                map.serialize_entry("mount_policy", mount_policy)?;
                 map.end()
             }
             Self::Named {
@@ -1852,6 +1919,8 @@ impl<'de> Deserialize<'de> for VolumeMount {
                 follow_root_symlinks: bool,
                 #[serde(default)]
                 quota_mib: Option<u32>,
+                #[serde(default)]
+                mount_policy: Option<PathBuf>,
             },
             Named {
                 name: String,
@@ -1900,6 +1969,7 @@ impl<'de> Deserialize<'de> for VolumeMount {
                 host_permissions,
                 follow_root_symlinks,
                 quota_mib,
+                mount_policy,
             } => Self::Bind {
                 host,
                 guest,
@@ -1908,6 +1978,7 @@ impl<'de> Deserialize<'de> for VolumeMount {
                 host_permissions,
                 follow_root_symlinks,
                 quota_mib,
+                mount_policy,
             },
             VolumeMountHelper::Named {
                 name,
@@ -1965,6 +2036,7 @@ impl fmt::Debug for VolumeMount {
                 host_permissions,
                 follow_root_symlinks,
                 quota_mib,
+                mount_policy,
             } => f
                 .debug_struct("Bind")
                 .field("host", host)
@@ -1974,6 +2046,7 @@ impl fmt::Debug for VolumeMount {
                 .field("host_permissions", host_permissions)
                 .field("follow_root_symlinks", follow_root_symlinks)
                 .field("quota_mib", quota_mib)
+                .field("mount_policy", mount_policy)
                 .finish(),
             Self::Named {
                 name,
@@ -2058,6 +2131,11 @@ fn default_sandbox_cpus() -> u8 {
 
 fn default_sandbox_memory_mib() -> u32 {
     DEFAULT_SANDBOX_MEMORY_MIB
+}
+
+/// Serde skip predicate keeping default-off booleans out of serialized specs.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn decode_mount_options(options: Option<MountOptions>, readonly: bool) -> MountOptions {
@@ -3082,6 +3160,27 @@ mod tests {
     }
 
     #[test]
+    fn nested_virt_defaults_off_and_roundtrips_when_enabled() {
+        // Legacy specs predate the field: absent means off.
+        let legacy: SandboxResources =
+            serde_json::from_str(r#"{"cpus":4,"memory_mib":2048}"#).unwrap();
+        assert!(!legacy.nested_virt);
+
+        // Default-off stays out of the serialized form (byte-stable default).
+        let serialized = serde_json::to_value(SandboxResources::default()).unwrap();
+        assert!(serialized.get("nested_virt").is_none());
+
+        // Opt-in round-trips.
+        let resources = SandboxResources {
+            nested_virt: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&resources).unwrap();
+        let decoded: SandboxResources = serde_json::from_str(&json).unwrap();
+        assert!(decoded.nested_virt);
+    }
+
+    #[test]
     fn disk_image_format_display_roundtrip() {
         for format in [
             DiskImageFormat::Qcow2,
@@ -3193,5 +3292,28 @@ mod tests {
             assert_eq!(parsed, expected);
             assert_eq!(parsed.as_str(), input);
         }
+    }
+
+    #[test]
+    fn bind_mount_policy_is_optional_for_old_json() {
+        let mount: VolumeMount = serde_json::from_str(
+            r#"{"type":"Bind","host":"/host","guest":"/data","options":null}"#,
+        )
+        .unwrap();
+        match mount {
+            VolumeMount::Bind { mount_policy, .. } => assert_eq!(mount_policy, None),
+            _ => panic!("expected bind mount"),
+        }
+    }
+
+    #[test]
+    fn bind_mount_policy_roundtrips_and_is_debuggable() {
+        let mount: VolumeMount = serde_json::from_str(
+            r#"{"type":"Bind","host":"/host","guest":"/data","mount_policy":"/some/path.json"}"#,
+        )
+        .unwrap();
+        assert!(format!("{mount:?}").contains("mount_policy"));
+        let value = serde_json::to_value(&mount).unwrap();
+        assert_eq!(value["mount_policy"], "/some/path.json");
     }
 }

@@ -520,6 +520,24 @@ impl LocalBackend {
             Self::wait_for_relay(&agent_sock_path, &log_dir, &mut handle, &config.spec.name)
                 .await?;
 
+        // The runtime publishes its run before accepting relay clients. Bind
+        // the connection to the process we launched, never a later name reuse.
+        let run = Self::load_active_run(self.db().await?.read(), sandbox_id).await?;
+        let launch = self.launch_from_run(run.as_ref()).ok_or_else(|| {
+            crate::MicrosandboxError::SandboxLaunchChanged {
+                name: config.spec.name.clone(),
+            }
+        })?;
+        if launch.pid as u32 != handle.pid() || handle.try_wait()?.is_some() {
+            return Err(crate::MicrosandboxError::SandboxLaunchChanged {
+                name: config.spec.name.clone(),
+            });
+        }
+        #[cfg(target_os = "linux")]
+        if client.peer_pid() != Some(handle.pid()) || launch.identity.is_none() {
+            return Err(crate::MicrosandboxError::LaunchBindingUnsupported);
+        }
+
         if let Ok(ready) = client.ready() {
             tracing::info!(
                 boot_time_ms = ready.boot_time_ns / 1_000_000,
@@ -538,6 +556,13 @@ impl LocalBackend {
         Ok((
             crate::backend::SandboxLocalState {
                 db_id: sandbox_id,
+                launch,
+                observation: crate::sandbox::LocalObservation::capture(
+                    self,
+                    sandbox_id,
+                    Some(launch.run_id),
+                    Some(launch),
+                ),
                 handle,
                 client: Arc::new(client),
             },
@@ -1828,6 +1853,7 @@ mod tests {
             host_permissions: HostPermissions::Private,
             follow_root_symlinks: false,
             quota_mib: None,
+            mount_policy: None,
         });
 
         let sandbox_id = LocalBackend::insert_sandbox_record(pools.write(), &config)

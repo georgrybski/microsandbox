@@ -93,6 +93,10 @@ pub struct SandboxArgs {
     /// Path to a JSON [`LaunchConfig`] file (manual invocation / debugging).
     #[arg(long = "config-file", hide = true)]
     pub config_file: Option<PathBuf>,
+
+    /// Must-understand private launch features; old runtimes reject this flag.
+    #[arg(long, hide = true)]
+    pub require_launch_capability: Vec<String>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -214,6 +218,7 @@ pub fn run(args: SandboxArgs) -> ! {
     let vm_config = VmConfig {
         libkrunfw_path: launch.libkrunfw_path,
         thp: launch.thp,
+        nested_virt: launch.nested_virt,
         vcpus: args.vcpus,
         memory_mib: args.memory_mib,
         max_cpus: args.max_vcpus.unwrap_or(args.vcpus).max(args.vcpus),
@@ -245,6 +250,8 @@ pub fn run(args: SandboxArgs) -> ! {
         file_mounts: launch.file_mounts,
         disks,
         vsock: launch.vsock,
+        guest_cid: launch.guest_cid,
+        host_vsock_listeners: launch.host_vsock_listeners,
         #[cfg(unix)]
         backends: vec![],
         init_path: launch.init_path,
@@ -267,6 +274,7 @@ pub fn run(args: SandboxArgs) -> ! {
         sandbox_db_connect_timeout_secs: launch.db_connect_timeout_secs,
         log_dir: launch.log_dir,
         runtime_dir: launch.runtime_dir,
+        mount_policy_dir: launch.mount_policy_dir,
         sandboxes_dir: launch.sandboxes_dir,
         run_dir,
         lifecycle_guard,
@@ -344,7 +352,10 @@ fn load_launch_config(args: &SandboxArgs) -> Result<LaunchConfig, String> {
             .map_err(|e| format!("failed to read --config-file {}: {e}", path.display()))?,
         None => return Err("missing --config-file for `msb sandbox`".to_string()),
     };
-    serde_json::from_slice(&bytes).map_err(|e| format!("invalid launch config: {e}"))
+    let launch: LaunchConfig =
+        serde_json::from_slice(&bytes).map_err(|e| format!("invalid launch config: {e}"))?;
+    launch.validate_capabilities(&args.require_launch_capability)?;
+    Ok(launch)
 }
 
 /// Read the full contents of the inherited config fd, taking ownership so it
@@ -661,7 +672,64 @@ mod tests {
             #[cfg(unix)]
             config_fd,
             config_file,
+            require_launch_capability: Vec::new(),
         }
+    }
+
+    #[test]
+    fn test_guest_cid_capability_is_checked_when_loading_launch_config() {
+        use std::io::Write;
+
+        let launch = LaunchConfig {
+            guest_cid: Some(65_536),
+            ..Default::default()
+        };
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&serde_json::to_vec(&launch).unwrap())
+            .unwrap();
+        let mut args = args_with(None, Some(file.path().to_path_buf()));
+        assert!(
+            load_launch_config(&args)
+                .unwrap_err()
+                .contains("must be supplied together")
+        );
+        args.require_launch_capability =
+            vec![microsandbox_runtime::launch::GUEST_CID_CAPABILITY.to_string()];
+        assert_eq!(load_launch_config(&args).unwrap().guest_cid, Some(65_536));
+        args.require_launch_capability.push("unknown-v2".into());
+        assert!(
+            load_launch_config(&args)
+                .unwrap_err()
+                .contains("unsupported launch capability")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn host_listener_capability_is_checked_when_loading_launch_config() {
+        use microsandbox_runtime::launch::{HOST_VSOCK_LISTEN_CAPABILITY, HostVsockListener};
+        use std::io::Write;
+        let launch = LaunchConfig {
+            host_vsock_listeners: vec![HostVsockListener {
+                host_socket: "/run/launch/service.sock".into(),
+                guest_port: 5000,
+            }],
+            ..Default::default()
+        };
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&serde_json::to_vec(&launch).unwrap())
+            .unwrap();
+        let mut args = args_with(None, Some(file.path().to_path_buf()));
+        assert!(
+            load_launch_config(&args)
+                .unwrap_err()
+                .contains("must be supplied together")
+        );
+        args.require_launch_capability = vec![HOST_VSOCK_LISTEN_CAPABILITY.into()];
+        assert_eq!(
+            load_launch_config(&args).unwrap().host_vsock_listeners[0].guest_port,
+            5000
+        );
     }
 
     #[test]
@@ -678,6 +746,7 @@ mod tests {
                 }],
                 ..GuestBootstrap::default()
             },
+            mount_policy_dir: PathBuf::new(),
             block_writeback_limit_bytes: Some(512 * 1024 * 1024),
             block_writeback_pool_bytes: Some(4 * 1024 * 1024 * 1024),
             writeback_lease_dir: PathBuf::from("/tmp/writeback-leases"),
@@ -716,6 +785,7 @@ mod tests {
         let launch = LaunchConfig {
             sandboxes_dir: PathBuf::from("/tmp/msb/sandboxes"),
             agent_sock: PathBuf::from("/tmp/msb/run/agent/legacy.sock"),
+            mount_policy_dir: PathBuf::new(),
             ..Default::default()
         };
         let mut value = serde_json::to_value(&launch).unwrap();
@@ -736,6 +806,7 @@ mod tests {
         let launch = LaunchConfig {
             sandboxes_dir: PathBuf::from("/tmp/msb/sandboxes"),
             agent_sock: PathBuf::from("/tmp/msb/sandboxes/demo/runtime/agent.sock"),
+            mount_policy_dir: PathBuf::new(),
             ..Default::default()
         };
 
@@ -753,6 +824,7 @@ mod tests {
                 default_cwd: Some("/srv".to_string()),
                 ..Default::default()
             },
+            mount_policy_dir: PathBuf::new(),
             ..Default::default()
         };
         let mut file = tempfile::tempfile().unwrap();

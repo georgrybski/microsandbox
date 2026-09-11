@@ -27,6 +27,7 @@ use crate::netstack::{
 };
 use crate::policy::{NetworkPolicy, NetworkProfile};
 use crate::secrets::handle::SecretsHandle;
+use crate::ssh::gateway::SshGatewayConfig;
 use crate::tls::state::{TlsState, TlsStateError};
 
 //--------------------------------------------------------------------------------------------------
@@ -328,9 +329,25 @@ impl SmoltcpNetwork {
         let dns_config = config.dns.clone();
         let tls_state = self.tls_state.clone();
         let published_ports = config.ports.clone();
+        let strict = config.strict;
         let max_connections = config.max_connections;
         let secrets = self.secrets.clone();
         let outbound_proxy = self.config.outbound_proxy().cloned().map(Arc::new);
+        // SSH gateway is host-side enforcement joining the guest-visible
+        // policy with the host-side broker binding carried on the
+        // resolved config. An absent binding keeps the fail-closed stub:
+        // divert-intended flows deny. The transport identifier arrives
+        // with the binding, derived at spawn time from the leased
+        // network slot; `0` (unspecified) only when no binding exists
+        // and no divert can happen.
+        let ssh_gateway: Option<Arc<SshGatewayConfig>> =
+            config
+                .ssh
+                .clone()
+                .map(|policy| match self.config.ssh_broker() {
+                    Some(binding) => Arc::new(binding.gateway_config(policy)),
+                    None => Arc::new(SshGatewayConfig::new(policy, None, 0)),
+                });
 
         self.poll_handle = Some(
             std::thread::Builder::new()
@@ -344,10 +361,12 @@ impl SmoltcpNetwork {
                         dns_config,
                         tls_state,
                         published_ports,
+                        strict,
                         max_connections,
                         tokio_handle,
                         secrets,
                         outbound_proxy,
+                        ssh_gateway,
                     );
                 })
                 .expect("failed to spawn smoltcp poll thread"),

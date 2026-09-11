@@ -23,6 +23,11 @@ pub mod backends;
 // Re-Exports
 //--------------------------------------------------------------------------------------------------
 
+#[cfg(unix)]
+pub use backends::passthroughfs::mount_policy::{
+    CaseSensitivity, CompiledRuleSet, MountPolicyProgram, PathPolicyRule, Pattern, RuleEffect,
+    RuleOrigin, ScopeKind,
+};
 #[cfg(windows)]
 pub use backends::passthroughfs::{
     HostPermissions, PassthroughConfig, PassthroughFs, StatVirtualization,

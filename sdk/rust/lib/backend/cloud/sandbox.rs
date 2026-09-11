@@ -472,6 +472,13 @@ fn reject_dropped_cloud_create_fields(config: &SandboxConfig) -> MicrosandboxRes
         )
     };
 
+    if config.guest_cid.is_some() {
+        return Err(unsupported("guest_cid"));
+    }
+    if !config.host_vsock_listeners.is_empty() {
+        return Err(unsupported("host_vsock_listeners"));
+    }
+
     if config.spec.resources.max_cpus != config.spec.resources.cpus {
         return Err(unsupported("max_cpus"));
     }
@@ -995,6 +1002,25 @@ mod tests {
     }
 
     #[test]
+    fn cloud_create_request_refuses_host_reserved_guest_cid() {
+        let mut config = base_cloud_config();
+        config.guest_cid = Some(65_536);
+        assert_unsupported_config_field(config, "guest_cid");
+    }
+
+    #[test]
+    fn cloud_create_request_refuses_host_vsock_listener() {
+        let mut config = base_cloud_config();
+        config
+            .host_vsock_listeners
+            .push(microsandbox_runtime::launch::HostVsockListener {
+                host_socket: "/run/launch/service.sock".into(),
+                guest_port: 5000,
+            });
+        assert_unsupported_config_field(config, "host_vsock_listeners");
+    }
+
+    #[test]
     fn cloud_create_request_rejects_fields_missing_from_the_wire() {
         let cases: [(&str, fn(&mut SandboxConfig)); 8] = [
             ("max_cpus", |config| config.spec.resources.max_cpus = 2),
@@ -1092,6 +1118,7 @@ mod tests {
             host_permissions: HostPermissions::Private,
             follow_root_symlinks: false,
             quota_mib: None,
+            mount_policy: None,
         });
 
         assert_unsupported_config_field(config, "mount owner");

@@ -158,3 +158,42 @@ pub struct RelayClientDisconnected {
     /// Exclusive upper bound of the disconnected client's ID range.
     pub id_end_exclusive: u32,
 }
+
+/// Payload for `core.ssh_epoch.provision` messages.
+///
+/// Sent by the host to provision the current SSH epoch for a sandbox
+/// instance. Host-initiated; sent with a non-zero correlation ID and no
+/// frame flags.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SshEpochProvision {
+    /// Sandbox instance the epoch belongs to.
+    pub instance: String,
+
+    /// Connection identifier the epoch is bound to.
+    pub cid: u32,
+
+    /// Monotonic epoch number; newer epochs supersede older ones.
+    pub epoch: u64,
+
+    /// Unix timestamp (seconds) when the epoch was issued.
+    pub issued_at: u64,
+
+    /// Unix timestamp (seconds) before which the epoch is not valid.
+    pub not_before: u64,
+}
+
+/// Payload for `core.ssh_epoch.ack` messages.
+///
+/// Sent by the guest agent to acknowledge an SSH epoch provision.
+/// Carries no frame flags.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SshEpochAck {
+    /// Connection identifier from the provision being acknowledged.
+    pub cid: u32,
+
+    /// Epoch number being acknowledged.
+    pub epoch: u64,
+
+    /// Whether the provision was accepted.
+    pub ok: bool,
+}

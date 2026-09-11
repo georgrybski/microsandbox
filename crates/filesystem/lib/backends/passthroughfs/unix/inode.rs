@@ -220,6 +220,25 @@ pub(crate) fn vol_path(dev: u64, ino: u64) -> std::ffi::CString {
 pub(crate) fn do_lookup(fs: &PassthroughFs, parent: u64, name: &CStr) -> io::Result<Entry> {
     crate::backends::shared::name_validation::validate_name(name)?;
 
+    #[cfg(target_os = "linux")]
+    if let Some(policy) = fs.mask_policy() {
+        let Some(path) = lexical_child_path(fs, parent, name.to_bytes()) else {
+            return Err(platform::enoent());
+        };
+        let lexical =
+            super::mount_policy::LexicalPath::new(&path).map_err(|_| platform::enoent())?;
+        if policy.is_protected(&lexical) {
+            return Err(platform::enoent());
+        }
+        if matches!(
+            policy.decide(&lexical).decision,
+            super::mount_policy::Decision::Masked
+        ) && !fs.tagged_visible(parent, name.to_bytes())
+        {
+            return Err(platform::enoent());
+        }
+    }
+
     let parent_fd = get_inode_fd(fs, parent)?;
 
     #[cfg(target_os = "linux")]
@@ -227,6 +246,37 @@ pub(crate) fn do_lookup(fs: &PassthroughFs, parent: u64, name: &CStr) -> io::Res
 
     #[cfg(target_os = "macos")]
     return do_lookup_macos(fs, parent_fd.raw(), name);
+}
+
+/// Derive a mount-root-relative lexical path by walking the inode anchors
+/// (spec 22 §14 lexical path derivation).
+#[cfg(target_os = "linux")]
+pub(crate) fn lexical_child_path(fs: &PassthroughFs, parent: u64, name: &[u8]) -> Option<String> {
+    let inodes = fs.inodes.read().unwrap();
+    let mut seen = HashSet::new();
+    let mut components = build_anchor_components_locked(&inodes, parent, &mut seen).ok()?;
+    validate_component(name).ok()?;
+    components.push(name.to_vec());
+    components
+        .into_iter()
+        .map(|component| String::from_utf8(component).ok())
+        .collect::<Option<Vec<_>>>()
+        .map(|components| components.join("/"))
+}
+
+/// Derive a mount-root-relative lexical path for an inode by walking anchors
+/// (spec 22 §14 lexical path derivation).
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+pub(crate) fn lexical_inode_path(fs: &PassthroughFs, inode: u64) -> Option<String> {
+    let inodes = fs.inodes.read().unwrap();
+    let mut seen = HashSet::new();
+    let components = build_anchor_components_locked(&inodes, inode, &mut seen).ok()?;
+    components
+        .into_iter()
+        .map(|component| String::from_utf8(component).ok())
+        .collect::<Option<Vec<_>>>()
+        .map(|components| components.join("/"))
 }
 
 /// Linux lookup: open → statx(AT_EMPTY_PATH) → patched_stat (3 syscalls).
@@ -277,6 +327,14 @@ fn do_lookup_linux(
     let st = platform::statx_to_stat64(&stx);
     let mnt_id = stx.stx_mnt_id;
     let alt_key = InodeAltKey::new(st.st_ino, st.st_dev, mnt_id);
+    if let Err(err) =
+        super::read_policy::check_child(fs, parent, name.to_bytes(), st.st_mode, alt_key)
+    {
+        // SAFETY: the O_PATH fd has not been published or transferred to an
+        // owner. Failed read admission closes it before any inode is exposed.
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
     let alias = NamespaceAlias::new(parent, name.to_bytes());
     let patched = crate::backends::shared::stat_override::patched_stat(
         fd,
@@ -465,7 +523,7 @@ fn open_macos_path_for_stat(path: *const libc::c_char) -> io::Result<i32> {
 /// when the count reaches zero.
 pub(crate) fn forget_one(fs: &PassthroughFs, inode: u64, count: u64) {
     let mut inodes = fs.inodes.write().unwrap();
-    forget_one_locked(&mut inodes, inode, count);
+    forget_one_locked(fs, &mut inodes, inode, count);
 }
 
 /// Decrement the reference count under an already-held write lock.
@@ -477,6 +535,7 @@ pub(crate) fn forget_one(fs: &PassthroughFs, inode: u64, count: u64) {
 /// the refcount between our load and compare_exchange. `saturating_sub` prevents
 /// underflow if the kernel sends a forget count larger than the current refcount.
 pub(crate) fn forget_one_locked(
+    fs: &PassthroughFs,
     inodes: &mut MultikeyBTreeMap<u64, InodeAltKey, Arc<InodeData>>,
     inode: u64,
     count: u64,
@@ -492,7 +551,10 @@ pub(crate) fn forget_one_locked(
             {
                 if new == 0 {
                     #[cfg(target_os = "linux")]
-                    maybe_remove_inode_locked(inodes, inode);
+                    {
+                        evict_inode_tags(fs, &data, inode);
+                        maybe_remove_inode_locked(inodes, inode);
+                    }
 
                     #[cfg(target_os = "macos")]
                     {
@@ -603,7 +665,7 @@ fn inode_alt_key(data: &InodeData) -> InodeAltKey {
 }
 
 #[cfg(target_os = "linux")]
-fn current_anchor_alias(data: &InodeData) -> Option<NamespaceAlias> {
+pub(crate) fn current_anchor_alias(data: &InodeData) -> Option<NamespaceAlias> {
     let parent = data.anchor_parent.load(Ordering::Acquire);
     if parent == 0 {
         return None;
@@ -613,6 +675,18 @@ fn current_anchor_alias(data: &InodeData) -> Option<NamespaceAlias> {
         parent,
         name: data.anchor_name.read().unwrap().clone(),
     })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn current_anchor_alias_for_policy(
+    fs: &PassthroughFs,
+    inode: u64,
+) -> Option<NamespaceAlias> {
+    fs.inodes
+        .read()
+        .unwrap()
+        .get(&inode)
+        .and_then(|data| current_anchor_alias(data))
 }
 
 #[cfg(target_os = "linux")]
@@ -685,7 +759,7 @@ fn validate_component(component: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn secure_open_path_linux(
+pub(crate) fn secure_open_path_linux(
     fs: &PassthroughFs,
     components: &[Vec<u8>],
     flags: i32,
@@ -904,6 +978,16 @@ fn maybe_remove_inode_locked(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn evict_inode_tags(fs: &PassthroughFs, data: &InodeData, inode: u64) {
+    if let Some(tags) = fs.tags() {
+        if let Some(alias) = current_anchor_alias(data) {
+            tags.evict(alias.parent, &alias.name);
+        }
+        tags.evict_parent(inode);
+    }
+}
+
 /// Open a temporary fd via `/.vol/<dev>/<ino>` on macOS.
 ///
 /// Tries `O_RDONLY | O_DIRECTORY` first (most callers need a parent directory fd),
@@ -935,18 +1019,7 @@ pub(crate) fn open_inode_fd(fs: &PassthroughFs, inode: u64, flags: i32) -> io::R
     #[cfg(target_os = "linux")]
     {
         let inode_fd = get_inode_fd(fs, inode)?;
-        let st = platform::fstat(inode_fd.raw())?;
-        if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
-            return Err(platform::eloop());
-        }
-        let mut buf = [0u8; 20];
-        let fd_str = format_fd_cstr(inode_fd.raw(), &mut buf);
-        let reopen_flags = (flags & !libc::O_NOFOLLOW) | libc::O_CLOEXEC;
-        let fd = unsafe { libc::openat(fs.proc_self_fd.as_raw_fd(), fd_str, reopen_flags) };
-        if fd < 0 {
-            return Err(platform::linux_error(io::Error::last_os_error()));
-        }
-        Ok(fd)
+        reopen_inode_fd(fs, inode_fd.raw(), flags)
     }
 
     #[cfg(target_os = "macos")]
@@ -967,6 +1040,24 @@ pub(crate) fn open_inode_fd(fs: &PassthroughFs, inode: u64, flags: i32) -> io::R
         let path = vol_path(data.dev, data.ino);
         open_macos_inode_reopen(path.as_ptr(), flags)
     }
+}
+
+/// Reopen a pinned Linux inode after admission without resolving its name again.
+#[cfg(target_os = "linux")]
+pub(crate) fn reopen_inode_fd(fs: &PassthroughFs, inode_fd: RawFd, flags: i32) -> io::Result<i32> {
+    let st = platform::fstat(inode_fd)?;
+    if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+        return Err(platform::eloop());
+    }
+    let mut buf = [0u8; 20];
+    let fd_str = format_fd_cstr(inode_fd, &mut buf);
+    // This follows only our pinned procfd, never a real host symlink.
+    let reopen_flags = (flags & !libc::O_NOFOLLOW) | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(fs.proc_self_fd.as_raw_fd(), fd_str, reopen_flags) };
+    if fd < 0 {
+        return Err(platform::linux_error(io::Error::last_os_error()));
+    }
+    Ok(fd)
 }
 
 /// Format a file descriptor number as a null-terminated C string into a stack buffer.

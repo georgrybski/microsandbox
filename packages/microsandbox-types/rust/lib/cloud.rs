@@ -626,6 +626,7 @@ impl From<CloudVolumeMount> for VolumeMount {
                 // the protective no-follow behavior.
                 follow_root_symlinks: false,
                 quota_mib,
+                mount_policy: None,
             },
             CloudVolumeMount::Named {
                 name,
@@ -669,6 +670,9 @@ impl From<CloudVolumeMount> for VolumeMount {
 }
 
 impl From<VolumeMount> for CloudVolumeMount {
+    /// Intentionally drops `follow_root_symlinks` and `mount_policy`: the cloud
+    /// wire format does not carry host-side mount policy or symlink resolution,
+    /// which are re-derived on the host when the mount is rehydrated.
     fn from(m: VolumeMount) -> Self {
         match m {
             VolumeMount::Bind {
@@ -679,6 +683,7 @@ impl From<VolumeMount> for CloudVolumeMount {
                 host_permissions,
                 follow_root_symlinks: _,
                 quota_mib,
+                mount_policy: _,
             } => CloudVolumeMount::Bind {
                 host,
                 guest,
@@ -748,6 +753,9 @@ pub struct CloudNetworkSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secrets: Option<CloudSecretsConfig>,
 
+    /// Require hostname-based policy allows to use inspectable application authority.
+    pub strict: bool,
+
     /// Max concurrent guest connections.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_connections: Option<usize>,
@@ -759,6 +767,7 @@ impl Default for CloudNetworkSpec {
             enabled: true,
             policy: None,
             secrets: None,
+            strict: false,
             max_connections: None,
         }
     }
@@ -985,6 +994,10 @@ impl TryFrom<CloudSandboxSpec> for SandboxSpec {
             cpu_placement: CpuPlacement::Inherit,
             placement_profile: None,
             thp: TransparentHugePagePolicy::Madvise,
+            // Tenants cannot request nested virtualization over the cloud
+            // wire; a managed service applies its own host-VM policy (same
+            // posture as placement and THP above).
+            nested_virt: false,
         };
 
         // Fields not present on `CloudNetworkSpec` are defaulted here, listed
@@ -997,11 +1010,15 @@ impl TryFrom<CloudSandboxSpec> for SandboxSpec {
             policy: spec.network.policy,
             dns: None,
             tls: None,
+            strict: spec.network.strict,
             secrets: spec.network.secrets.map(Into::into),
             max_connections: spec.network.max_connections,
             rate_limiter: None,
             trust_host_cas: false,
             outbound_proxy: None,
+            // Cloud tenants cannot configure SSH divert policy; managed
+            // control planes apply their own host-side SSH handling.
+            ssh: None,
         };
         let runtime = SandboxRuntimeOptions {
             workdir: spec.runtime.workdir,
@@ -1098,6 +1115,7 @@ impl From<SandboxSpec> for CloudSandboxSpec {
                 enabled: spec.network.enabled,
                 policy: spec.network.policy,
                 secrets: spec.network.secrets.map(Into::into),
+                strict: spec.network.strict,
                 max_connections: spec.network.max_connections,
             },
             init: spec.init,

@@ -256,6 +256,7 @@ pub async fn run(args: InspectArgs) -> anyhow::Result<()> {
                         host_permissions,
                         follow_root_symlinks,
                         quota_mib,
+                        ..
                     } => {
                         let flags = mount_flags_suffix(*options);
                         let suffix = mount_policy_suffix(
