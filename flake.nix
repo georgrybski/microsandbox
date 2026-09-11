@@ -124,6 +124,14 @@
           version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
           agentd = pkgs.callPackage ./nix/packages/agentd.nix { inherit src cargoLock version; };
+          brokerd = pkgs.callPackage ./nix/packages/brokerd.nix {
+            inherit
+              rustPlatform
+              src
+              cargoLock
+              version
+              ;
+          };
           libkrunfw = inputs.libkrunfw.packages.${system}.default;
           vsockProbe = pkgs.callPackage ./nix/packages/guest-vsock-probe.nix {
             inherit src cargoLock version;
@@ -175,7 +183,7 @@
           _module.args.pkgs = pkgs;
 
           packages = {
-            inherit agentd msb;
+            inherit agentd brokerd msb;
             runtime-smoke-image = runtimeSmokeImage;
             # workestrate consumes `packages.${system}.microsandbox`.
             microsandbox = msb;
@@ -206,12 +214,15 @@
               pname = "microsandbox-ssh-termination-tests";
               inherit version src cargoLock;
               MSB_TEST_SSH = "${pkgs.openssh}/bin/ssh";
+              MSB_TEST_GIT = "${pkgs.git}/bin/git";
+              MSB_TEST_SHELL = "${pkgs.bash}/bin/bash";
               buildPhase = ''
                 runHook preBuild
                 cargo test --jobs "$NIX_BUILD_CORES" --locked --offline \
                   -p microsandbox-brokerd --lib --test divert_e2e
                 cargo test --jobs "$NIX_BUILD_CORES" --locked --offline \
-                  -p microsandbox-brokerd --test ssh_openssh -- --ignored
+                  -p microsandbox-brokerd --test ssh_openssh --test managed_openssh \
+                  --test managed_git -- --include-ignored --test-threads=1
                 runHook postBuild
               '';
               installPhase = ''

@@ -8,6 +8,7 @@
 //! reorigination.
 
 use std::fs::File;
+use std::future::Future;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
@@ -27,8 +28,12 @@ use crate::egress::open_egress_tunnel;
 use crate::epoch::{EpochState, apply_provision};
 use crate::error::{BrokerError, BrokerResult};
 use crate::keys::BrokerKey;
+use crate::policy::{Identity, PolicyError, PolicyStore, RelayContext};
 use crate::prelude::read_ssh_divert_prelude;
-use crate::ssh::{build_server_config, parse_upstream_pin, reoriginate};
+use crate::ssh::{
+    GuestAuthority, RelayOptions, TerminationHandle, build_server_config, parse_upstream_pin,
+    reoriginate, reoriginate_authorized,
+};
 use crate::vsock::{VsockListener, VsockStream};
 
 //--------------------------------------------------------------------------------------------------
@@ -48,13 +53,51 @@ pub struct Broker {
     config: BrokerConfig,
 
     /// Sealed upstream authentication key.
-    custody: Arc<BrokerKey>,
+    custody: Option<Arc<BrokerKey>>,
+
+    /// Applied multi-launch custody for the explicit managed-service mode.
+    managed: Option<Mutex<PolicyStore>>,
 
     /// Console-bound epoch state.
     epoch: Mutex<Option<EpochState>>,
 
     /// Guest-facing SSH server configuration (ephemeral host key).
     server_config: Arc<russh::server::Config>,
+}
+
+/// A relay task owned independently of the caller's polling future. Dropping
+/// this handle requests cancellation; only the task's completed native joins
+/// can retire its policy lease. There is deliberately no public abort method.
+pub struct ManagedRelay {
+    termination: TerminationHandle,
+    task: Option<tokio::task::JoinHandle<BrokerResult<()>>>,
+}
+
+impl ManagedRelay {
+    /// Wait for the independently owned relay, preserving its primary error.
+    pub async fn join(mut self) -> BrokerResult<()> {
+        self.task
+            .take()
+            .expect("owned relay task")
+            .await
+            .map_err(|_| BrokerError::Ssh("owned relay task did not complete".into()))?
+    }
+
+    /// Request cancellation without claiming native cleanup has completed.
+    pub fn terminate(&self) {
+        self.termination.terminate();
+    }
+
+    /// Cancellation capability for the task owner; never a cleanup receipt.
+    pub fn termination(&self) -> TerminationHandle {
+        self.termination.clone()
+    }
+}
+
+impl Drop for ManagedRelay {
+    fn drop(&mut self) {
+        self.termination.terminate();
+    }
 }
 
 /// Outcome of handling one console frame.
@@ -72,6 +115,78 @@ enum ConsoleOutcome {
 //--------------------------------------------------------------------------------------------------
 
 impl Broker {
+    /// Start only after the protected transport has verified the complete host
+    /// context and selected this exact original destination. `upstream` must be
+    /// an unpolled dial to that endpoint; it is polled only after signed guest
+    /// proof and exact username selection. Scanner custody is taken from the
+    /// same admitted policy, never supplied separately by a per-relay caller.
+    /// This API does not authenticate arbitrary headers or resolve DNS aliases.
+    pub async fn spawn_managed_relay<G, F, U>(
+        self: &Arc<Self>,
+        context: RelayContext,
+        guest: G,
+        upstream: F,
+    ) -> Result<ManagedRelay, PolicyError>
+    where
+        G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        F: Future<Output = BrokerResult<U>> + Send + 'static,
+        U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let identity = crate::audit::AuditIdentity::Managed(context.clone());
+        let admission = Arc::new(
+            self.managed_policy()?
+                .lock()
+                .await
+                .reserve_transport(context)?,
+        );
+        let termination = admission.termination();
+        let library = admission.library();
+        let broker = Arc::clone(self);
+        let options = RelayOptions {
+            server_config: Arc::clone(&self.server_config),
+            identity,
+            library,
+            termination: termination.clone(),
+        };
+        let task = tokio::spawn(async move {
+            let outcome = reoriginate_authorized(
+                guest,
+                upstream,
+                GuestAuthority::Managed {
+                    broker: Arc::clone(&broker),
+                    admission: Arc::clone(&admission),
+                },
+                options,
+            )
+            .await;
+            let retired = if outcome.retired {
+                if let Ok(admission) = Arc::try_unwrap(admission) {
+                    broker
+                        .managed_policy()
+                        .expect("managed broker")
+                        .lock()
+                        .await
+                        .complete_transport(admission)
+                        .is_ok()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            // Preserve the protocol failure even if retirement also failed.
+            outcome.result?;
+            if !retired {
+                return Err(BrokerError::Ssh("SSH relay retirement incomplete".into()));
+            }
+            Ok(())
+        });
+        Ok(ManagedRelay {
+            termination,
+            task: Some(task),
+        })
+    }
+
     /// Build the broker runtime from its configuration and sealed key.
     ///
     /// Mints the ephemeral guest-facing SSH host key.
@@ -79,14 +194,52 @@ impl Broker {
         let server_config = build_server_config()?;
         Ok(Arc::new(Self {
             config,
-            custody: Arc::new(key),
+            custody: Some(Arc::new(key)),
+            managed: None,
             epoch: Mutex::new(None),
             server_config,
         }))
     }
 
+    /// Construct a closed managed broker with an explicitly supplied SSH host
+    /// identity. This never opens or reads the agent console or mints a host key.
+    /// The direct management/service adapter must install material before use.
+    pub fn new_managed(
+        config: BrokerConfig,
+        server_config: Arc<russh::server::Config>,
+        incarnation: Identity,
+        max_launches: usize,
+        max_relays: usize,
+    ) -> Result<Arc<Self>, PolicyError> {
+        if server_config.keys.is_empty() {
+            return Err(PolicyError::InvalidPolicy);
+        }
+        Ok(Arc::new(Self {
+            config,
+            custody: None,
+            managed: Some(Mutex::new(PolicyStore::new(
+                incarnation,
+                max_launches,
+                max_relays,
+            )?)),
+            epoch: Mutex::new(None),
+            server_config,
+        }))
+    }
+
+    /// Applied authority shared by this broker's authenticated management
+    /// adapter and SSH admission path; absent in legacy console mode.
+    pub fn managed_policy(&self) -> Result<&Mutex<PolicyStore>, PolicyError> {
+        self.managed.as_ref().ok_or(PolicyError::StaleManagement)
+    }
+
     /// Run the broker loop until shutdown or a fatal console error.
     pub async fn run(self: &Arc<Self>, port_file: File, console: BootConsole) -> BrokerResult<()> {
+        if self.managed.is_some() {
+            return Err(BrokerError::Console(
+                "managed broker refuses legacy console control".into(),
+            ));
+        }
         let listener = VsockListener::bind(self.config.divert_port).map_err(|e| {
             BrokerError::Console(format!("bind divert port {}: {e}", self.config.divert_port))
         })?;
@@ -171,6 +324,11 @@ impl Broker {
     /// Every refusal is fail-closed with a log line: the stream is dropped
     /// without relaying a byte.
     async fn serve_connection(&self, mut stream: VsockStream) {
+        // A legacy prelude has no generation/revision/control-session fence.
+        // Do not reinterpret it as a managed admission, even from the host.
+        let Some(custody) = &self.custody else {
+            return;
+        };
         let prelude = match timeout(
             Duration::from_secs(PRELUDE_READ_TIMEOUT_SECS),
             read_ssh_divert_prelude(&mut stream, MAX_PRELUDE_BYTES),
@@ -227,7 +385,7 @@ impl Broker {
         if let Err(e) = reoriginate(
             stream,
             egress,
-            &self.custody,
+            custody,
             &pin,
             Arc::clone(&self.server_config),
             identity,
