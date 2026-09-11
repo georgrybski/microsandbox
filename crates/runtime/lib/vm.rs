@@ -565,7 +565,8 @@ fn run(config: Config) -> RuntimeResult<std::convert::Infallible> {
 
     tracing::info!(sandbox = %config.sandbox_name, "sandbox starting");
 
-    let shutdown_flush_timeout = guest_shutdown_flush_timeout(config.vm.init_path.is_some());
+    let shutdown_flush_timeout =
+        guest_shutdown_flush_timeout(&config.vm.bootstrap, config.vm.init_path.as_deref());
 
     // Create console shared state (ring buffers + wake pipes).
     let shared = Arc::new(ConsoleSharedState::new());
@@ -2426,13 +2427,14 @@ fn request_guest_shutdown_with_timeout(
     relay::push_guest_frame_until(shared, frame, timeout)
 }
 
-fn guest_shutdown_flush_timeout(has_handoff_init: bool) -> Duration {
+fn guest_shutdown_flush_timeout(bootstrap: &GuestBootstrap, init_path: Option<&Path>) -> Duration {
     let override_ms = std::env::var("MSB_SHUTDOWN_FLUSH_TIMEOUT_MS").ok();
-    guest_shutdown_flush_timeout_with_override(has_handoff_init, override_ms.as_deref())
+    guest_shutdown_flush_timeout_with_override(bootstrap, init_path, override_ms.as_deref())
 }
 
 fn guest_shutdown_flush_timeout_with_override(
-    has_handoff_init: bool,
+    bootstrap: &GuestBootstrap,
+    init_path: Option<&Path>,
     override_ms: Option<&str>,
 ) -> Duration {
     if let Some(raw) = override_ms {
@@ -2448,7 +2450,9 @@ fn guest_shutdown_flush_timeout_with_override(
         }
     }
 
-    if has_handoff_init {
+    // SDK handoff init travels in the typed bootstrap, independently of the
+    // kernel init override. Keep the historical override's longer grace too.
+    if bootstrap.handoff_init.is_some() || init_path.is_some() {
         microsandbox_protocol::HANDOFF_SHUTDOWN_FLUSH_TIMEOUT
     } else {
         microsandbox_protocol::NORMAL_SHUTDOWN_FLUSH_TIMEOUT
@@ -3035,16 +3039,20 @@ mod tests {
     };
     use super::{
         ConsoleSharedState, HostPermissions, StatVirtualization, append_block_root_env,
-        bind_rootfs_backend, encode_bootstrap_frame, guest_shutdown_flush_timeout,
-        guest_shutdown_flush_timeout_with_override, load_mount_policy, parse_mount_spec,
-        prepend_scripts_path, request_guest_shutdown, request_guest_shutdown_with_timeout,
-        thp_kernel_cmdline, validate_disk_format,
+        bind_rootfs_backend, encode_bootstrap_frame, guest_shutdown_flush_timeout_with_override,
+        load_mount_policy, parse_mount_spec, prepend_scripts_path, request_guest_shutdown,
+        request_guest_shutdown_with_timeout, thp_kernel_cmdline, validate_disk_format,
     };
 
     use microsandbox_filesystem::{Context, DynFileSystem, FsOptions};
-    use microsandbox_protocol::{bootstrap::GuestBootstrap, codec, message::MessageType};
+    use microsandbox_protocol::{
+        bootstrap::{BootstrapHandoffInit, GuestBootstrap},
+        codec,
+        message::MessageType,
+    };
     #[cfg(unix)]
     use std::io::Write;
+    use std::path::Path;
     #[cfg(unix)]
     use std::sync::Arc;
     use std::time::Duration;
@@ -3486,40 +3494,83 @@ mod tests {
         assert!(frame.is_empty());
     }
 
+    fn handoff_bootstrap() -> GuestBootstrap {
+        GuestBootstrap {
+            handoff_init: Some(BootstrapHandoffInit {
+                cmd: "/init".to_string(),
+                args: vec![],
+                cwd: None,
+                env: vec![],
+            }),
+            ..GuestBootstrap::default()
+        }
+    }
+
     #[test]
-    fn test_guest_shutdown_flush_timeout_tracks_handoff_mode() {
-        assert_eq!(
-            guest_shutdown_flush_timeout(false),
-            microsandbox_protocol::NORMAL_SHUTDOWN_FLUSH_TIMEOUT
-        );
-        assert_eq!(
-            guest_shutdown_flush_timeout(true),
-            microsandbox_protocol::HANDOFF_SHUTDOWN_FLUSH_TIMEOUT
-        );
+    fn test_guest_shutdown_flush_timeout_tracks_bootstrap_and_kernel_init() {
+        let normal = GuestBootstrap::default();
+        let handoff = handoff_bootstrap();
+        let direct_init = Some(Path::new("/custom-init"));
+        for (bootstrap, init_path, expected) in [
+            (
+                &normal,
+                None,
+                microsandbox_protocol::NORMAL_SHUTDOWN_FLUSH_TIMEOUT,
+            ),
+            (
+                &handoff,
+                None,
+                microsandbox_protocol::HANDOFF_SHUTDOWN_FLUSH_TIMEOUT,
+            ),
+            (
+                &normal,
+                direct_init,
+                microsandbox_protocol::HANDOFF_SHUTDOWN_FLUSH_TIMEOUT,
+            ),
+            (
+                &handoff,
+                direct_init,
+                microsandbox_protocol::HANDOFF_SHUTDOWN_FLUSH_TIMEOUT,
+            ),
+        ] {
+            assert_eq!(
+                guest_shutdown_flush_timeout_with_override(bootstrap, init_path, None),
+                expected
+            );
+        }
     }
 
     #[test]
     fn test_guest_shutdown_flush_timeout_accepts_ms_override() {
-        assert_eq!(
-            guest_shutdown_flush_timeout_with_override(false, Some("0")),
-            Duration::ZERO
-        );
-        assert_eq!(
-            guest_shutdown_flush_timeout_with_override(true, Some("125")),
-            Duration::from_millis(125)
-        );
+        for bootstrap in [GuestBootstrap::default(), handoff_bootstrap()] {
+            for init_path in [None, Some(Path::new("/custom-init"))] {
+                assert_eq!(
+                    guest_shutdown_flush_timeout_with_override(&bootstrap, init_path, Some("0")),
+                    Duration::ZERO
+                );
+                assert_eq!(
+                    guest_shutdown_flush_timeout_with_override(&bootstrap, init_path, Some("125")),
+                    Duration::from_millis(125)
+                );
+            }
+        }
     }
 
     #[test]
     fn test_guest_shutdown_flush_timeout_ignores_invalid_override() {
-        assert_eq!(
-            guest_shutdown_flush_timeout_with_override(false, Some("nope")),
-            microsandbox_protocol::NORMAL_SHUTDOWN_FLUSH_TIMEOUT
-        );
-        assert_eq!(
-            guest_shutdown_flush_timeout_with_override(true, Some("nope")),
-            microsandbox_protocol::HANDOFF_SHUTDOWN_FLUSH_TIMEOUT
-        );
+        for bootstrap in [GuestBootstrap::default(), handoff_bootstrap()] {
+            for init_path in [None, Some(Path::new("/custom-init"))] {
+                let expected = if bootstrap.handoff_init.is_some() || init_path.is_some() {
+                    microsandbox_protocol::HANDOFF_SHUTDOWN_FLUSH_TIMEOUT
+                } else {
+                    microsandbox_protocol::NORMAL_SHUTDOWN_FLUSH_TIMEOUT
+                };
+                assert_eq!(
+                    guest_shutdown_flush_timeout_with_override(&bootstrap, init_path, Some("nope")),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]
